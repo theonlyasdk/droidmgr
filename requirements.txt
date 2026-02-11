@@ -1,0 +1,2 @@
+# Python standard library (built-in)
+tkinter  # GUI framework (usually pre-installed with Python)
