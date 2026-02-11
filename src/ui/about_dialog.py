@@ -65,7 +65,7 @@ class AboutDialog:
         
         info = tk.Label(
             main_frame,
-            text="© 2026 droidmgr\nLicensed under GPL-3.0",
+            text="© 2026 theonlyasdk\nLicensed under MPL 2.0",
             font=('Arial', 8),
             fg='gray'
         )
