@@ -1,9 +1,11 @@
 """Initialization dialog for downloading dependencies."""
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
 import threading
 from pathlib import Path
+
+import queue
 
 from core import DependencyManager
 
@@ -28,8 +30,22 @@ class InitDialog:
         self.success = False
         self.adb_needs_download = False
         self.scrcpy_needs_download = False
+        self.scrcpy_version = "3.3.4"
+        
+        self.queue = queue.Queue()
+        self._process_queue()
         
         self._create_widgets()
+    
+    def _process_queue(self):
+        try:
+            while True:
+                task = self.queue.get_nowait()
+                task()
+        except queue.Empty:
+            pass
+        if self.dialog.winfo_exists():
+            self.dialog.after(100, self._process_queue)
     
     def _create_widgets(self):
         main_container = ttk.Frame(self.dialog, padding=20)
@@ -130,6 +146,19 @@ class InitDialog:
         )
         
         if messagebox.askyesno("Download Dependencies?", message, parent=self.dialog):
+            if self.scrcpy_needs_download:
+                version = simpledialog.askstring(
+                    "scrcpy Version",
+                    "Enter the version of scrcpy to download:",
+                    initialvalue=self.scrcpy_version,
+                    parent=self.dialog
+                )
+                if version:
+                    self.scrcpy_version = version
+                else:
+                    # User cancelled the string dialog
+                    return
+            
             self._download_dependencies()
         else:
             self._show_manual_instructions()
@@ -139,7 +168,7 @@ class InitDialog:
             try:
                 if self.adb_needs_download:
                     def adb_progress(current, total, msg):
-                        self.dialog.after(0, lambda m=msg, c=current: (
+                        self.queue.put(lambda m=msg, c=current: (
                             self._update_adb_status(m, "blue"),
                             self.adb_progress.configure(value=c)
                         ))
@@ -148,25 +177,26 @@ class InitDialog:
                         auto_download=True,
                         progress_callback=adb_progress
                     )
-                    self.dialog.after(0, lambda: self._update_adb_status("✓ Installed", "green"))
+                    self.queue.put(lambda: self._update_adb_status("✓ Installed", "green"))
                 
                 if self.scrcpy_needs_download:
                     def scrcpy_progress(current, total, msg):
-                        self.dialog.after(0, lambda m=msg, c=current: (
+                        self.queue.put(lambda m=msg, c=current: (
                             self._update_scrcpy_status(m, "blue"),
                             self.scrcpy_progress.configure(value=c)
                         ))
                     
                     self.scrcpy_path = self.dep_manager.get_scrcpy_path(
                         auto_download=True,
-                        progress_callback=scrcpy_progress
+                        progress_callback=scrcpy_progress,
+                        version=self.scrcpy_version
                     )
-                    self.dialog.after(0, lambda: self._update_scrcpy_status("✓ Installed", "green"))
+                    self.queue.put(lambda: self._update_scrcpy_status("✓ Installed", "green"))
                 
-                self.dialog.after(0, self._on_download_success)
+                self.queue.put(self._on_download_success)
                 
             except Exception as e:
-                self.dialog.after(0, lambda err=str(e): self._on_download_error(err))
+                self.queue.put(lambda err=str(e): self._on_download_error(err))
         
         self.cancel_button.config(state=tk.DISABLED)
         self.continue_button.config(state=tk.DISABLED)
@@ -198,7 +228,7 @@ class InitDialog:
         install_commands = {
             'linux': {
                 'ADB': 'sudo apt install android-tools-adb',
-                'scrcpy': 'sudo apt install scrcpy'
+                'scrcpy': 'sudo apt/dnf/paacman install scrcpy'
             },
             'darwin': {
                 'ADB': 'brew install android-platform-tools',

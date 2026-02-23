@@ -21,7 +21,6 @@ A GUI frontend for scrcpy and device manager for Android written in Python using
 <img width="900" height="572" alt="image" src="https://github.com/user-attachments/assets/c16f516f-7ea1-4ba1-866e-3328c8c92db0" />
 
 
-
 ## Installation
 
 ### Prerequisites
@@ -34,6 +33,7 @@ The application uses only Python's standard library, but requires system depende
    - Windows: Download from [scrcpy releases](https://github.com/Genymobile/scrcpy/releases)
 
 2. **ADB** - Will be downloaded automatically if not found
+3. **Python** - 3.7 or higher
 
 ### Running
 
@@ -58,15 +58,6 @@ chmod +x droidmgr.py
 4. **Select a device** from the Devices tab
 5. **Use the tabs** to manage processes, apps, or files
 6. **Click "Start Mirroring"** to begin screen mirroring
-
-## Development
-
-The codebase is designed with clean separation:
-
-- **Core modules** are UI-agnostic and can be used independently
-- **UI modules** only handle presentation and user interaction
-- **Threading** is used for long-running operations to keep UI responsive
-- **Error handling** provides user-friendly messages for common issues
 
 ## License
 

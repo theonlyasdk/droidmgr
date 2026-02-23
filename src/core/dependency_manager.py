@@ -62,12 +62,13 @@ class DependencyManager:
         
         raise RuntimeError("Failed to download and install ADB")
     
-    def get_scrcpy_path(self, auto_download=False, progress_callback=None) -> Path:
+    def get_scrcpy_path(self, auto_download=False, progress_callback=None, version: Optional[str] = None) -> Path:
         """Get the path to the scrcpy binary, downloading if necessary.
         
         Args:
             auto_download: If True, download without asking
             progress_callback: Optional callback function(current, total, status_msg)
+            version: Optional scrcpy version to download
         
         Returns:
             Path to scrcpy executable
@@ -88,7 +89,7 @@ class DependencyManager:
         if not auto_download:
             raise RuntimeError("scrcpy not found")
         
-        self._download_scrcpy(progress_callback)
+        self._download_scrcpy(progress_callback, version)
         
         if local_scrcpy.exists():
             return local_scrcpy
@@ -146,11 +147,12 @@ class DependencyManager:
         except Exception as e:
             raise RuntimeError(f"Failed to download ADB: {e}")
     
-    def _download_scrcpy(self, progress_callback=None) -> None:
+    def _download_scrcpy(self, progress_callback=None, version: Optional[str] = None) -> None:
         """Download and extract scrcpy.
         
         Args:
             progress_callback: Optional callback function(current, total, status_msg)
+            version: Optional scrcpy version to download
         """
         # First check common installation paths
         common_paths = []
@@ -189,11 +191,11 @@ class DependencyManager:
         
         # Download scrcpy
         # Note: scrcpy releases are platform-specific
-        # Using a recent stable version (v2.3.1 as of writing)
-        version = "2.3.1"
-        
+        if version is None:
+            version = "2.3.1"
+
         urls = {
-            'linux': f'https://github.com/Genymobile/scrcpy/releases/download/v{version}/scrcpy-linux-v{version}.tar.gz',
+            'linux': f'https://github.com/Genymobile/scrcpy/releases/download/v{version}/scrcpy-linux-x86_64-v{version}.tar.gz',
             'windows': f'https://github.com/Genymobile/scrcpy/releases/download/v{version}/scrcpy-win64-v{version}.zip',
         }
         

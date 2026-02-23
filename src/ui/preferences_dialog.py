@@ -148,11 +148,11 @@ class PreferencesDialog:
             self.scrcpy_path_var.set(filename)
     
     def _detect_adb(self):
-        adb_in_path = shutil.which('adb')
-        if adb_in_path:
-            self.adb_path_var.set(adb_in_path)
-            messagebox.showinfo("Success", f"ADB found at:\n{adb_in_path}", parent=self.dialog)
-        else:
+        try:
+            adb_path = self.dep_manager.get_adb_path()
+            self.adb_path_var.set(str(adb_path))
+            messagebox.showinfo("Success", f"ADB found at:\n{adb_path}", parent=self.dialog)
+        except RuntimeError:
             result = messagebox.askyesno(
                 "ADB Not Found",
                 "Could not auto-detect ADB.\n\nDo you want to download it automatically?",
@@ -162,11 +162,11 @@ class PreferencesDialog:
                 self._download_adb()
     
     def _detect_scrcpy(self):
-        scrcpy_in_path = shutil.which('scrcpy')
-        if scrcpy_in_path:
-            self.scrcpy_path_var.set(scrcpy_in_path)
-            messagebox.showinfo("Success", f"scrcpy found at:\n{scrcpy_in_path}", parent=self.dialog)
-        else:
+        try:
+            scrcpy_path = self.dep_manager.get_scrcpy_path()
+            self.scrcpy_path_var.set(str(scrcpy_path))
+            messagebox.showinfo("Success", f"scrcpy found at:\n{scrcpy_path}", parent=self.dialog)
+        except RuntimeError:
             result = messagebox.askyesno(
                 "scrcpy Not Found",
                 "Could not auto-detect scrcpy.\n\nDo you want to download it automatically?",
