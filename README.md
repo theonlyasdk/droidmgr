@@ -2,6 +2,8 @@
 
 A GUI frontend for scrcpy and device manager for Android written in Python using tkinter.
 
+> **NOTE:** This is non-production software. Please be aware of potential stability issues. For the safety of your data, I recommend you to use this with an Android emulator or a secondary/testing device.
+
 ## Features
 
 - **Device Management**: List and manage all connected Android devices
@@ -25,8 +27,6 @@ A GUI frontend for scrcpy and device manager for Android written in Python using
 
 ### Prerequisites
 
-The application uses only Python's standard library, but requires system dependencies:
-
 1. **scrcpy** - For screen mirroring
    - Linux: `sudo apt install scrcpy`
    - macOS: `brew install scrcpy`
@@ -36,8 +36,6 @@ The application uses only Python's standard library, but requires system depende
 3. **Python** - 3.7 or higher
 
 ### Running
-
-Simply execute the main entry point:
 
 ```bash
 python3 droidmgr.py
