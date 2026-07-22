@@ -1,2 +1,5 @@
-# Python standard library (built-in)
-tkinter  # GUI framework (usually pre-installed with Python)
+tkinter             # GUI framework (usually pre-installed with Python)
+# If it shows errors related to tkinter not being installed on Windows, 
+# you need to go to Control Panel > Programs > right click Python 
+# (Whatever version you got installed), click modify and then click modify 
+# installation and install it with Tk/IDLE enabled (usually under more options)
