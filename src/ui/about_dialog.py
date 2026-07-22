@@ -15,9 +15,27 @@ class AboutDialog:
         
         self._create_widgets()
         
+        # Center dialog relative to parent window
+        self.dialog.update_idletasks()
+        try:
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            dw = 400
+            dh = 550
+            cx = px + (pw // 2) - (dw // 2)
+            cy = py + (ph // 2) - (dh // 2)
+            self.dialog.geometry(f"+{max(0, cx)}+{max(0, cy)}")
+        except Exception:
+            pass
+            
         # Ensure window is visible before grabbing
         self.dialog.wait_visibility()
         self.dialog.grab_set()
+        self.dialog.bind('<Escape>', lambda e: self.dialog.destroy())
+
+
     
 
     

@@ -41,8 +41,26 @@ class ScrcpyOutputDialog(tk.Toplevel):
         self.thread = threading.Thread(target=self._read_output, daemon=True)
         self.thread.start()
         
+        # Center dialog relative to parent window
+        self.update_idletasks()
+        try:
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            dw = 600
+            dh = 400
+            cx = px + (pw // 2) - (dw // 2)
+            cy = py + (ph // 2) - (dh // 2)
+            self.geometry(f"+{max(0, cx)}+{max(0, cy)}")
+        except Exception:
+            pass
+            
         # Start queue checking
         self._check_queue()
+        self.bind('<Escape>', lambda e: self.destroy())
+
+
 
     def _read_output(self):
         try:
@@ -56,6 +74,7 @@ class ScrcpyOutputDialog(tk.Toplevel):
             self.queue.put(None) # Signal end
 
     def _check_queue(self):
+        MAX_LINES = 1000
         while True:
             try:
                 line = self.queue.get_nowait()
@@ -64,9 +83,16 @@ class ScrcpyOutputDialog(tk.Toplevel):
                     return
                 
                 self.log_text.insert(tk.END, line)
+                
+                line_count = int(self.log_text.index('end-1c').split('.')[0])
+                if line_count > MAX_LINES:
+                    lines_to_remove = line_count - MAX_LINES
+                    self.log_text.delete('1.0', f'{lines_to_remove + 1}.0')
+
                 self.log_text.see(tk.END)
             except queue.Empty:
                 break
+
         
         if self.is_running:
             self.after(100, self._check_queue)

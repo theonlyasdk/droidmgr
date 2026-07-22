@@ -57,4 +57,18 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    import signal
+    
+    def sigint_handler(signum, frame):
+        print("\nKeyboardInterrupt received. Exiting droidmgr...", flush=True)
+        sys.exit(0)
+        
+    signal.signal(signal.SIGINT, sigint_handler)
+    
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nKeyboardInterrupt received. Exiting droidmgr...", flush=True)
+        sys.exit(0)
+
+

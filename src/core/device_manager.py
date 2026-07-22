@@ -121,6 +121,16 @@ class DeviceManager:
             package: Package name
         """
         self.adb.stop_app(device_id, package)
+        
+    def uninstall_app(self, device_id: str, package: str) -> None:
+        """Uninstall an application from a device."""
+        self.adb.uninstall_app(device_id, package)
+
+    def get_installed_apps_details(self, device_id: str) -> List[Dict[str, Any]]:
+        """Get detailed list of installed applications."""
+        return self.adb.get_installed_apps_details(device_id)
+
+
     
     def list_files(self, device_id: str, path: str = '/sdcard/', show_hidden: bool = True, use_exact_sizes: bool = False) -> List[Dict[str, Any]]:
         """List files in a directory on a device.
@@ -176,7 +186,22 @@ class DeviceManager:
     def copy_file(self, device_id: str, src_path: str, dest_path: str) -> None:
         """Copy a file on a device."""
         self.adb.copy_file(device_id, src_path, dest_path)
+
+    def make_directory(self, device_id: str, path: str) -> None:
+        """Create a directory on the device."""
+        self.adb.make_directory(device_id, path)
+
+
+    def generate_llm_report(self, device_id: str, progress_callback=None) -> str:
+        """Generate a single information-dense report paragraph for LLM analysis."""
+        return self.adb.generate_llm_report(device_id, progress_callback)
+    
+    def is_directory_writable(self, device_id: str, path: str) -> bool:
+        """Check dynamically if a directory on the device is writable."""
+        return self.adb.is_directory_writable(device_id, path)
     
     def cleanup(self) -> None:
         """Cleanup all resources."""
         self.scrcpy.stop_all()
+
+

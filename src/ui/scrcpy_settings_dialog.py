@@ -79,9 +79,27 @@ class ScrcpySettingsDialog(tk.Toplevel):
         self._toggle_camera_settings()
         self._toggle_record_settings()
         
+        # Center dialog relative to parent window
+        self.update_idletasks()
+        try:
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            dw = 600
+            dh = 550
+            cx = px + (pw // 2) - (dw // 2)
+            cy = py + (ph // 2) - (dh // 2)
+            self.geometry(f"+{max(0, cx)}+{max(0, cy)}")
+        except Exception:
+            pass
+            
         # Ensure window is visible before grabbing
         self.wait_visibility()
         self.grab_set()
+        self.bind('<Escape>', lambda e: self.destroy())
+
+
 
     def _add_tooltip(self, widget, text):
         ToolTip(widget, text)

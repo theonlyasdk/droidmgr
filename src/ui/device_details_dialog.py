@@ -19,9 +19,27 @@ class DeviceDetailsDialog(tk.Toplevel):
         self._create_widgets()
         self._load_info()
         
+        # Center dialog relative to parent window
+        self.update_idletasks()
+        try:
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            dw = 650
+            dh = 600
+            cx = px + (pw // 2) - (dw // 2)
+            cy = py + (ph // 2) - (dh // 2)
+            self.geometry(f"+{max(0, cx)}+{max(0, cy)}")
+        except Exception:
+            pass
+            
         # Ensure window is drawn before grabbing focus
         self.wait_visibility()
         self.grab_set()
+        self.bind('<Escape>', lambda e: self.destroy())
+
+
     
     def _create_widgets(self):
         self.main_frame = ttk.Frame(self, padding=10)
