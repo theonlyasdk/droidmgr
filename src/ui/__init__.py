@@ -8,6 +8,33 @@ from .file_manager import FileManager
 from .scrcpy_output_dialog import ScrcpyOutputDialog
 from .device_details_dialog import DeviceDetailsDialog
 from .llm_report_dialog import LLMReportDialog, LLMReportProgressDialog
+from .wireless_dialog import WirelessADBSetupDialog, ConnectWirelessDialog
+from .dpi import (
+    enable_dpi_awareness,
+    get_dpi,
+    get_scale_factor,
+    scale_size,
+    configure_dpi_styles,
+    setup_window_dpi,
+)
 
-__all__ = ['MainWindow', 'InitDialog', 'AboutDialog', 'PreferencesDialog', 'FileManager', 'ScrcpyOutputDialog', 'DeviceDetailsDialog', 'LLMReportDialog', 'LLMReportProgressDialog']
+__all__ = [
+    'MainWindow',
+    'InitDialog',
+    'AboutDialog',
+    'PreferencesDialog',
+    'FileManager',
+    'ScrcpyOutputDialog',
+    'DeviceDetailsDialog',
+    'LLMReportDialog',
+    'LLMReportProgressDialog',
+    'WirelessADBSetupDialog',
+    'ConnectWirelessDialog',
+    'enable_dpi_awareness',
+    'get_dpi',
+    'get_scale_factor',
+    'scale_size',
+    'configure_dpi_styles',
+    'setup_window_dpi',
+]
 

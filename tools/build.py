@@ -123,6 +123,11 @@ def build_executable():
     if platform_info['icon'] and Path(platform_info['icon']).exists():
         cmd.append(f"--icon={platform_info['icon']}")
     
+    # Add high DPI manifest for Windows
+    manifest_path = project_root / 'tools' / 'app.manifest'
+    if platform_info['name'] == 'Windows' and manifest_path.exists():
+        cmd.append(f"--manifest={manifest_path}")
+    
     # Add hidden imports for dynamic imports
     hidden_imports = [
         'tkinter',

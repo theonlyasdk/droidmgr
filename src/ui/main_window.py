@@ -2,11 +2,20 @@
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+import os
 from typing import Optional
 from pathlib import Path
 import threading
+import re
+import shutil
+import zipfile
+import queue
+import tempfile
+import stat
+import json
+from pathlib import PurePosixPath
 
-from core import DeviceManager
+from core import DeviceManager, ADBDeviceOfflineError, ADBDeviceNotFoundError
 from .about_dialog import AboutDialog
 from .preferences_dialog import PreferencesDialog
 from .file_manager import FileManager
@@ -15,16 +24,21 @@ from .scrcpy_settings_dialog import ScrcpySettingsDialog
 from .scrcpy_output_dialog import ScrcpyOutputDialog
 from .device_details_dialog import DeviceDetailsDialog
 from .llm_report_dialog import LLMReportDialog, LLMReportProgressDialog
+from .wireless_dialog import ConnectWirelesslyDialog
+from .backup_dialog import BackupCancelToken, BackupOptionsDialog, BackupProgressDialog, RestoreSelectionDialog
+from .taskbar_progress import TaskbarProgress
+from .dpi import enable_dpi_awareness, setup_window_dpi, scale_size
 
 
 
 class MainWindow:
     
     def __init__(self, adb_path=None, scrcpy_path=None):
+        enable_dpi_awareness()
         self.root = tk.Tk()
         self.root.title("droidmgr - Android Device Manager")
-        self.root.geometry("900x650")
-        self.root.minsize(400, 300)  # Set minimum window size
+        setup_window_dpi(self.root, base_width=900, base_height=650, min_width=400, min_height=300)
+        self.taskbar_progress = TaskbarProgress(self.root)
         
         self.adb_path = adb_path
         self.scrcpy_path = scrcpy_path
@@ -34,6 +48,7 @@ class MainWindow:
         except Exception as e:
             messagebox.showerror("Initialization Error", 
                                f"Failed to initialize device manager:\n{e}\n\nPlease ensure scrcpy and adb are installed.")
+            self.taskbar_progress.close()
             self.root.destroy()
             return
         
@@ -47,18 +62,8 @@ class MainWindow:
         
         self._create_ui()
         
-        # Center main window on screen
-        self.root.update_idletasks()
-        try:
-            sw = self.root.winfo_screenwidth()
-            sh = self.root.winfo_screenheight()
-            ww = 900
-            wh = 650
-            cx = (sw // 2) - (ww // 2)
-            cy = (sh // 2) - (wh // 2)
-            self.root.geometry(f"900x650+{max(0, cx)}+{max(0, cy)}")
-        except Exception:
-            pass
+        # Center main window on screen with DPI-scaled geometry
+        setup_window_dpi(self.root, base_width=900, base_height=650, min_width=400, min_height=300)
             
         self._refresh_devices()
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
@@ -85,6 +90,11 @@ class MainWindow:
         device_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Device", menu=device_menu)
         device_menu.add_command(label="Toggle Mirroring", command=self._toggle_mirroring)
+        device_menu.add_command(label="Connect Wirelessly...", command=self._show_connect_wireless_dialog)
+        device_menu.add_command(label="Disconnect Wireless Device", command=self._disconnect_wireless_device)
+        device_menu.add_separator()
+        device_menu.add_command(label="Backup to archive...", command=self._backup_to_archive)
+        device_menu.add_command(label="Restore from backup...", command=self._restore_from_backup)
         device_menu.add_command(label="Generate LLM Report", command=self._generate_llm_report)
 
         
@@ -135,8 +145,8 @@ class MainWindow:
         self.device_tree.heading('#0', text='#')
         for col in columns:
             self.device_tree.heading(col, text=col)
-            self.device_tree.column(col, width=200)
-        self.device_tree.column('#0', width=50)
+            self.device_tree.column(col, width=scale_size(200, self.root))
+        self.device_tree.column('#0', width=scale_size(50, self.root))
         
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.device_tree.yview)
         self.device_tree.configure(yscrollcommand=scrollbar.set)
@@ -144,6 +154,8 @@ class MainWindow:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.device_tree.bind('<<TreeviewSelect>>', self._on_device_select)
         self.device_tree.bind('<Double-1>', self._on_device_double_click)
+        self.device_tree.bind('<Button-3>', self._show_device_context_menu)
+        self.device_tree.bind('<Button-2>', self._show_device_context_menu)
         
         self.no_devices_frame = ttk.Frame(list_frame)
         
@@ -180,6 +192,9 @@ class MainWindow:
         
         self.scrcpy_settings_btn = ttk.Button(btn_frame, text="scrcpy Settings", command=self._show_scrcpy_settings)
         self.scrcpy_settings_btn.pack(side=tk.LEFT, padx=2)
+
+        self.connect_wireless_btn = ttk.Button(btn_frame, text="Connect Wirelessly...", command=self._show_connect_wireless_dialog)
+        self.connect_wireless_btn.pack(side=tk.LEFT, padx=2)
         
         return tab
     
@@ -206,12 +221,12 @@ class MainWindow:
         self.process_tree.heading('Name', text='Process Name', command=lambda: self._sort_processes_by_column('Name'))
 
         
-        self.process_tree.column('#0', width=40)
-        self.process_tree.column('PID', width=80)
-        self.process_tree.column('User', width=120)
-        self.process_tree.column('CPU%', width=80)
-        self.process_tree.column('Memory', width=100)
-        self.process_tree.column('Name', width=350)
+        self.process_tree.column('#0', width=scale_size(40, self.root))
+        self.process_tree.column('PID', width=scale_size(80, self.root))
+        self.process_tree.column('User', width=scale_size(120, self.root))
+        self.process_tree.column('CPU%', width=scale_size(80, self.root))
+        self.process_tree.column('Memory', width=scale_size(100, self.root))
+        self.process_tree.column('Name', width=scale_size(350, self.root))
         
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.process_tree.yview)
         self.process_tree.configure(yscrollcommand=scrollbar.set)
@@ -258,9 +273,9 @@ class MainWindow:
         self.app_tree = ttk.Treeview(self.app_tree_frame, columns=columns, show='headings')
         for col in columns:
             self.app_tree.heading(col, text=col)
-        self.app_tree.column('Name', width=220)
-        self.app_tree.column('Package', width=320)
-        self.app_tree.column('Size', width=120, anchor='center')
+        self.app_tree.column('Name', width=scale_size(220, self.root))
+        self.app_tree.column('Package', width=scale_size(320, self.root))
+        self.app_tree.column('Size', width=scale_size(120, self.root), anchor='center')
         
         scrollbar_tv = ttk.Scrollbar(self.app_tree_frame, orient=tk.VERTICAL, command=self.app_tree.yview)
         self.app_tree.configure(yscrollcommand=scrollbar_tv.set)
@@ -319,22 +334,30 @@ class MainWindow:
     
     def _update_button_states(self):
         has_selection = self.selected_device is not None
-        state = tk.NORMAL if has_selection else tk.DISABLED
+        is_ready = has_selection and (
+            self.device_manager.is_device_ready(self.selected_device)
+            if hasattr(self.device_manager, 'is_device_ready') else True
+        )
+        ready_state = tk.NORMAL if is_ready else tk.DISABLED
+        sel_state = tk.NORMAL if has_selection else tk.DISABLED
         
-        self.mirror_btn.config(state=state)
+        self.mirror_btn.config(state=ready_state)
         
         if has_selection:
             is_mirroring = self.device_manager.scrcpy.is_mirroring(self.selected_device)
             self.mirror_btn.config(text="Stop Mirroring" if is_mirroring else "Start Mirroring")
         
-        self.refresh_processes_btn.config(state=state)
-        self.kill_process_btn.config(state=state)
-        self.copy_processes_btn.config(state=state)
-        self.refresh_apps_btn.config(state=state)
+        if hasattr(self, 'connect_wireless_btn'):
+            self.connect_wireless_btn.config(state=tk.NORMAL)
 
-        self.install_apk_btn.config(state=state)
+        self.refresh_processes_btn.config(state=sel_state)
+        self.kill_process_btn.config(state=ready_state)
+        self.copy_processes_btn.config(state=sel_state)
+        self.refresh_apps_btn.config(state=sel_state)
+
+        self.install_apk_btn.config(state=ready_state)
         
-        # App specific buttons depend on both device AND app selection
+        # App specific buttons depend on both device readiness AND app selection
         self._update_app_button_states()
     
     def _update_apps_view_widget(self):
@@ -365,19 +388,21 @@ class MainWindow:
 
     def _update_app_button_states(self):
         has_device = self.selected_device is not None
+        is_ready = has_device and (
+            self.device_manager.is_device_ready(self.selected_device)
+            if hasattr(self.device_manager, 'is_device_ready') else True
+        )
         has_app_selection = self._get_selected_package() is not None
         
-        device_state = tk.NORMAL if has_device else tk.DISABLED
-        app_state = tk.NORMAL if (has_device and has_app_selection) else tk.DISABLED
+        ready_state = tk.NORMAL if is_ready else tk.DISABLED
+        app_state = tk.NORMAL if (is_ready and has_app_selection) else tk.DISABLED
         
         self.start_app_btn.config(state=app_state)
         self.stop_app_btn.config(state=app_state)
         self.uninstall_app_btn.config(state=app_state)
-
-
         
-        self.file_manager.update_button_states(device_state)
-        self.scrcpy_settings_btn.config(state=device_state)
+        self.file_manager.update_button_states(ready_state)
+        self.scrcpy_settings_btn.config(state=ready_state)
     
     def _set_status(self, message):
         self.statusbar.config(text=message)
@@ -471,17 +496,29 @@ class MainWindow:
             self._refresh_devices()
             
             self._update_apps_view_widget()
-            if self.selected_device:
+            if self.selected_device and getattr(self.device_manager, 'is_device_ready', lambda d: True)(self.selected_device):
                 self.file_manager.refresh()
                 self._refresh_apps()
 
         except Exception as e:
             self._show_error("Error", f"Failed to reinitialize with new settings:\n{e}")
     
-    def _require_device(self):
+    def _require_device(self, require_ready=True):
         if not self.selected_device:
             self._show_warning("Please select a device first")
             return False
+        if require_ready and hasattr(self.device_manager, 'is_device_ready'):
+            if not self.device_manager.is_device_ready(self.selected_device):
+                status = None
+                if hasattr(self.device_manager, 'get_device_status'):
+                    status = self.device_manager.get_device_status(self.selected_device)
+                status_str = status.lower() if status else 'offline'
+                if status_str == 'unauthorized':
+                    msg = f"Device '{self.selected_device}' is unauthorized.\nPlease accept the USB debugging prompt on the device screen."
+                else:
+                    msg = f"Device '{self.selected_device}' is offline.\nPlease reconnect the USB cable or restart ADB."
+                self._show_warning(msg)
+                return False
         return True
     
     def _on_device_select(self, event):
@@ -493,10 +530,24 @@ class MainWindow:
                 self.selected_device = values[0]
                 self._set_status(f"Selected device: {self.selected_device}")
                 self._update_tab_visibility()
-                self._refresh_processes()
-                self._refresh_apps()
-                self.file_manager.set_device(self.selected_device)
-
+                self._update_button_states()
+                
+                # Update file manager device reference
+                self.file_manager.selected_device = self.selected_device
+                
+                # Only refresh the currently active tab
+                try:
+                    current_tab_id = self.notebook.select()
+                    current_tab_text = self.notebook.tab(current_tab_id, "text") if current_tab_id else ""
+                except Exception:
+                    current_tab_text = ""
+                
+                if current_tab_text == "Processes":
+                    self._refresh_processes()
+                elif current_tab_text == "Applications":
+                    self._refresh_apps()
+                elif current_tab_text == "Files":
+                    self.file_manager.refresh()
 
     def _on_tab_changed(self, event=None):
         if not self.selected_device:
@@ -513,7 +564,7 @@ class MainWindow:
             elif tab_text == "Applications":
                 self._refresh_apps()
             elif tab_text == "Files":
-                self.file_manager.set_device(self.selected_device)
+                self.file_manager.set_device(self.selected_device, force_refresh=True)
         except Exception:
             pass
 
@@ -559,7 +610,7 @@ class MainWindow:
             self._notified_device_statuses = current_statuses
 
             if problem_msgs:
-                self._show_warning("\n\n".join(problem_msgs))
+                self._set_status("; ".join(problem_msgs))
 
             for idx, device in enumerate(devices, 1):
                 mirroring = "Yes" if device.get('is_mirroring', False) else "No"
@@ -599,7 +650,7 @@ class MainWindow:
             self.has_devices = False
             self.selected_device = None
             self._update_tab_visibility()
-            self._show_error("Device Refresh Error", str(e))
+            self._set_status(f"Device refresh error: {e}")
 
         interval_sec = self.config.get('general', 'query_interval', 5)
         self.root.after(int(interval_sec) * 1000, self._refresh_devices)
@@ -637,10 +688,105 @@ class MainWindow:
             self._set_status("Starting screen mirroring...")
             threading.Thread(target=task, daemon=True).start()
     
+    def _enable_tcpip_mode(self):
+        """Open the wireless connection dialog with the USB Setup tab active."""
+        self._show_connect_wireless_dialog(initial_tab=0)
+
+    def _show_connect_wireless_dialog(self, initial_tab=None):
+        """Show unified 3-tabbed dialog to connect to an Android device wirelessly."""
+        ConnectWirelesslyDialog(
+            parent=self.root,
+            device_manager=self.device_manager,
+            selected_device=self.selected_device,
+            on_connected_callback=self._refresh_devices,
+            initial_tab=initial_tab
+        )
+
+    def _disconnect_wireless_device(self):
+        """Disconnect a connected wireless ADB device."""
+        if not self.selected_device:
+            messagebox.showinfo("Select Device", "Please select a connected wireless device to disconnect.", parent=self.root)
+            return
+
+        if ":" not in self.selected_device:
+            messagebox.showinfo(
+                "Not a Wireless Device",
+                f"Device '{self.selected_device}' is connected via USB. You can simply unplug the USB cable.",
+                parent=self.root
+            )
+            return
+
+        dev_id = self.selected_device
+        try:
+            self.device_manager.disconnect_device(dev_id)
+            self._set_status(f"Disconnected {dev_id}")
+            self._refresh_devices()
+        except Exception as e:
+            self._show_error("Disconnect Error", str(e))
+
+    def _show_device_context_menu(self, event):
+        """Show context menu for a device row in device_tree."""
+        item = self.device_tree.identify_row(event.y)
+        if item:
+            self.device_tree.selection_set(item)
+            self._on_device_select(None)
+        
+        if not self.selected_device:
+            return
+
+        menu = tk.Menu(self.root, tearoff=0)
+        is_mirroring = self.device_manager.scrcpy.is_mirroring(self.selected_device)
+        menu.add_command(
+            label="Stop Mirroring" if is_mirroring else "Start Mirroring",
+            command=self._toggle_mirroring
+        )
+        menu.add_separator()
+        if ":" not in self.selected_device:
+            menu.add_command(
+                label="Connect Wirelessly...",
+                command=self._show_connect_wireless_dialog
+            )
+        else:
+            menu.add_command(
+                label="Disconnect Wireless Device",
+                command=self._disconnect_wireless_device
+            )
+        menu.add_command(
+            label="Device Details",
+            command=lambda: DeviceDetailsDialog(self.root, self.selected_device, self.device_manager)
+        )
+        menu.add_separator()
+        menu.add_command(label="Refresh", command=self._refresh_devices)
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
     def _refresh_processes(self):
         if not self.selected_device:
             return
         
+        # Check device readiness before querying
+        if hasattr(self.device_manager, 'is_device_ready'):
+            try:
+                if not self.device_manager.is_device_ready(self.selected_device):
+                    status = None
+                    if hasattr(self.device_manager, 'get_device_status'):
+                        status = self.device_manager.get_device_status(self.selected_device)
+                    status_str = status.lower() if status else 'offline'
+                    for item in self.process_tree.get_children():
+                        self.process_tree.delete(item)
+                    if status_str == 'unauthorized':
+                        msg = "Device is unauthorized. Please accept the USB debugging prompt on your phone screen."
+                    else:
+                        msg = "Device is offline. Reconnect USB cable or restart ADB."
+                    self.system_info_label.config(text=msg)
+                    self._set_status(f"Device '{self.selected_device}' is {status_str}.")
+                    return
+            except Exception:
+                pass
+
         # Save selection and scroll position
         selected_items = self.process_tree.selection()
         selected_pids = []
@@ -744,11 +890,31 @@ class MainWindow:
                         
                     self._set_status(f"Found {len(processes)} processes")
                 self.root.after(0, update)
+            except (ADBDeviceOfflineError, ADBDeviceNotFoundError):
+                def handle_offline():
+                    for item in self.process_tree.get_children():
+                        self.process_tree.delete(item)
+                    self.system_info_label.config(text="Device is offline or disconnected.")
+                    self._set_status(f"Device '{device}' is offline or disconnected.")
+                self.root.after(0, handle_offline)
             except concurrent.futures.TimeoutError:
-                self.root.after(0, lambda: self._show_error("Process Refresh Error", "Process query timed out after 15 seconds (device unresponsive)."))
+                self.root.after(0, lambda: self._set_status("Process query timed out after 15 seconds."))
             except Exception as e:
                 msg = str(e)
-                self.root.after(0, lambda: self._show_error("Process Refresh Error", msg))
+                lower_msg = msg.lower()
+                is_offline = any(keyword in lower_msg for keyword in [
+                    'device offline', 'offline or unauthorized', 'device not found',
+                    'no devices/emulators found', 'disconnected', 'closed', 'unauthorized'
+                ])
+                if is_offline:
+                    def handle_offline():
+                        for item in self.process_tree.get_children():
+                            self.process_tree.delete(item)
+                        self.system_info_label.config(text="Device is offline or disconnected.")
+                        self._set_status(f"Device '{device}' is offline or disconnected.")
+                    self.root.after(0, handle_offline)
+                else:
+                    self.root.after(0, lambda: self._show_error("Process Refresh Error", msg))
         
         threading.Thread(target=task, daemon=True).start()
 
@@ -851,6 +1017,26 @@ class MainWindow:
         if not self.selected_device:
             return
         
+        # Check device readiness before querying
+        if hasattr(self.device_manager, 'is_device_ready'):
+            try:
+                if not self.device_manager.is_device_ready(self.selected_device):
+                    status = None
+                    if hasattr(self.device_manager, 'get_device_status'):
+                        status = self.device_manager.get_device_status(self.selected_device)
+                    status_str = status.lower() if status else 'offline'
+                    for item in self.app_tree.get_children():
+                        self.app_tree.delete(item)
+                    self.app_listbox.delete(0, tk.END)
+                    tag_text = f"[Device is {status_str}]"
+                    self.app_listbox.insert(tk.END, tag_text)
+                    self.app_tree.insert('', tk.END, values=(tag_text, "", ""))
+                    self._update_app_button_states()
+                    self._set_status(f"Device '{self.selected_device}' is {status_str}.")
+                    return
+            except Exception:
+                pass
+
         mode = self.config.get('general', 'apps_view_mode', 'compact')
         self._update_apps_view_widget()
         selected_package = self._get_selected_package()
@@ -894,9 +1080,36 @@ class MainWindow:
                         self._update_app_button_states()
                         self._set_status(f"Found {len(apps)} applications")
                     self.root.after(0, update)
+            except (ADBDeviceOfflineError, ADBDeviceNotFoundError):
+                def handle_offline():
+                    for item in self.app_tree.get_children():
+                        self.app_tree.delete(item)
+                    self.app_listbox.delete(0, tk.END)
+                    self.app_listbox.insert(tk.END, "[Device is offline]")
+                    self.app_tree.insert('', tk.END, values=("[Device is offline]", "", ""))
+                    self._update_app_button_states()
+                    self._set_status(f"Device '{self.selected_device}' is offline or disconnected.")
+                self.root.after(0, handle_offline)
             except Exception as e:
                 msg = str(e)
-                self.root.after(0, lambda: self._show_error("App Refresh Error", msg))
+                lower_msg = msg.lower()
+                is_offline = any(keyword in lower_msg for keyword in [
+                    'device offline', 'offline or unauthorized', 'device not found',
+                    'no devices/emulators found', 'disconnected', 'closed', 'unauthorized'
+                ])
+                if is_offline:
+                    def handle_offline():
+                        for item in self.app_tree.get_children():
+                            self.app_tree.delete(item)
+                        self.app_listbox.delete(0, tk.END)
+                        tag = "[Device is unauthorized]" if "unauthorized" in lower_msg else "[Device is offline]"
+                        self.app_listbox.insert(tk.END, tag)
+                        self.app_tree.insert('', tk.END, values=(tag, "", ""))
+                        self._update_app_button_states()
+                        self._set_status(f"Device '{self.selected_device}' is offline or disconnected.")
+                    self.root.after(0, handle_offline)
+                else:
+                    self.root.after(0, lambda: self._show_error("App Refresh Error", msg))
         
         threading.Thread(target=task, daemon=True).start()
 
@@ -1125,6 +1338,578 @@ class MainWindow:
                 self.root.after(0, on_error)
                 
         threading.Thread(target=task, daemon=True).start()
+
+    def _backup_to_archive(self):
+        if not self._require_device():
+            return
+        device_id = self.selected_device
+        safe_id = re.sub(r'\s+', '', device_id)
+        safe_id = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', safe_id).rstrip(' .') or 'device'
+        if re.match(r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)', safe_id, re.IGNORECASE):
+            safe_id = f'_{safe_id}'
+        options = BackupOptionsDialog(
+            self.root,
+            self.config.get('backup', 'scope', 0),
+            self.config.get('backup', 'parallelism', 4),
+        ).result
+        if options is None:
+            return
+        choice, parallelism = options
+        self.config.set('backup', 'scope', choice)
+        self.config.set('backup', 'parallelism', parallelism)
+        verify_checksums = bool(self.config.get('backup', 'verify_checksums', False))
+        exclusions = self.config.get('backup', 'exclude_paths', [])
+        if not isinstance(exclusions, list):
+            exclusions = []
+        downloads_dir = Path.home() / 'Downloads'
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+        backup_sets = [("internal storage (/storage/emulated/0)", '/storage/emulated/0', downloads_dir / f'{safe_id}_backup_progress')]
+        if choice == 1:
+            backup_sets.append(("system storage", 'system', downloads_dir / f'{safe_id}_system_backup_progress'))
+        existing_dirs = [folder for _, _, folder in backup_sets if folder.exists()]
+        if existing_dirs:
+            if not messagebox.askyesno(
+                "Replace Backup Folder?",
+                "These backup folders already exist. Replace them?\n\n" + "\n".join(str(p) for p in existing_dirs),
+                parent=self.root,
+            ):
+                return
+            try:
+                for folder in existing_dirs:
+                    shutil.rmtree(folder)
+            except OSError as exc:
+                self._show_error("Backup Error", f"Could not replace the existing folder:\n{exc}")
+                return
+
+        cancel_event = BackupCancelToken()
+        indexed_ack = threading.Event()
+        index_started = threading.Event()
+        progress_events = queue.Queue()
+        failed_by_folder = {str(folder): [] for _, _, folder in backup_sets}
+        verification_by_folder = {}
+        poll_active = [True]
+        dialog = BackupProgressDialog(self.root, f"Backing Up {device_id}", cancel_event)
+
+        def poll_progress_events():
+            index_updates = []
+
+            def flush_index_updates():
+                if index_updates:
+                    section = index_updates[-1][0]
+                    included = [item[2] for item in index_updates if item[3]]
+                    dialog.add_indexed_paths(index_updates[-1][1], included, section, index_updates[-1][2])
+                    index_updates.clear()
+
+            for _ in range(500):
+                try:
+                    event = progress_events.get_nowait()
+                except queue.Empty:
+                    break
+                stage = event[0]
+                if stage == 'index':
+                    index_updates.append((event[1], event[2], event[3], True))
+                    continue
+                if stage == 'index_skipped':
+                    index_updates.append((event[1], event[2], event[3], False))
+                    continue
+                flush_index_updates()
+                if stage == 'index_start':
+                    dialog.start_indexing(event[1])
+                    self.taskbar_progress.set_indeterminate()
+                    event[2].set()
+                elif stage == 'indexed':
+                    dialog.set_queue(event[2], event[1])
+                    self.taskbar_progress.set_value(0, len(event[2]))
+                    dialog.status.config(text=f"Estimating size for {event[1]}...")
+                    def check_space(section=event[1], root=event[4], ack=event[3]):
+                        try:
+                            estimate = self.device_manager.estimate_filesystem_size(device_id, root, cancel_event)
+                            free = shutil.disk_usage(downloads_dir).free
+                        except OSError:
+                            estimate, free = None, 0
+                        def continue_after_check():
+                            if not dialog.winfo_exists():
+                                cancel_event.set()
+                                ack.set()
+                                return
+                            if estimate is not None and estimate > free:
+                                estimate_text = BackupProgressDialog._format_byte_rate(estimate).replace('/s', '')
+                                free_text = BackupProgressDialog._format_byte_rate(free).replace('/s', '')
+                                proceed = messagebox.askyesno(
+                                    "Low Disk Space",
+                                    f"Estimated backup size: {estimate_text}\nAvailable space: {free_text}\n\nContinue anyway?",
+                                    parent=dialog,
+                                )
+                                if not proceed:
+                                    cancel_event.set()
+                            ack.set()
+                        self.root.after(0, continue_after_check)
+                    threading.Thread(target=check_space, daemon=True).start()
+                elif stage == 'download_current':
+                    dialog.set_current_download(event[1], event[2], event[3], event[4])
+                    self.taskbar_progress.set_value(event[1], event[2])
+                    dialog.update_idletasks()
+                elif stage == 'download':
+                    dialog.set_download(event[1], event[2], event[3], event[4])
+                    self.taskbar_progress.set_value(event[1], event[2])
+                    dialog.update_idletasks()
+                elif stage == 'download_rate':
+                    dialog.set_download_rate(event[1], event[2], event[3], event[4])
+                    self.taskbar_progress.set_value(event[1], event[2])
+                elif stage == 'download_failed':
+                    dialog.set_failed(event[1], event[2], event[3], event[4][0])
+                elif stage == 'verification':
+                    verification_by_folder[event[1]] = event[2]
+                    dialog.status.config(text=f"Verified {event[2].get('verified', 0):,} files; "
+                                              f"{len(event[2].get('invalid', [])):,} size/checksum errors")
+                elif stage == 'verification_start':
+                    dialog.status.config(text="Verifying downloaded file sizes and checksums...")
+                    self.taskbar_progress.set_indeterminate()
+                elif stage == 'done':
+                    poll_active[0] = False
+                    self._backup_download_done(dialog, event[1], event[2], event[3], event[4], event[5],
+                                               event[6], event[7], event[8])
+                elif stage == 'error':
+                    poll_active[0] = False
+                    self._backup_failed(dialog, event[1])
+            flush_index_updates()
+            if poll_active[0] and dialog.winfo_exists():
+                dialog.after(10 if not progress_events.empty() else 50, poll_progress_events)
+
+        dialog.after(50, poll_progress_events)
+
+        def make_progress(section, backup_dir, root_path):
+            def progress(stage, done, total, path, paths, indexed_root=root_path):
+                if stage == 'index':
+                    progress_events.put(('index', section, done, path))
+                elif stage == 'index_skipped':
+                    progress_events.put(('index_skipped', section, done, path))
+                elif stage == 'indexed':
+                    progress_events.put(('indexed', section, paths, indexed_ack, indexed_root))
+                    indexed_ack.wait()
+                elif stage == 'download_current':
+                    progress_events.put(('download_current', done, total, path, paths))
+                elif stage == 'download':
+                    progress_events.put(('download', done, total, path, paths))
+                elif stage == 'download_rate':
+                    progress_events.put(('download_rate', done, total, path, paths))
+                elif stage == 'download_failed':
+                    failed_by_folder[str(backup_dir)].append((path, paths[0]))
+                    progress_events.put(('download_failed', done, total, path, paths))
+                elif stage == 'verification':
+                    result = dict(paths)
+                    result['verified'] = done
+                    verification_by_folder[str(backup_dir)] = result
+                    progress_events.put(('verification', str(backup_dir), result))
+                elif stage == 'verification_start':
+                    progress_events.put(('verification_start',))
+            return progress
+
+        def backup_task():
+            try:
+                completed = True
+                for section, root_path, backup_dir in backup_sets:
+                    if cancel_event.is_set():
+                        completed = False
+                        break
+                    progress_events.put(('index_start', section, index_started))
+                    index_started.wait()
+                    index_started.clear()
+                    indexed_ack.clear()
+                    completed = self.device_manager.backup_filesystem(
+                        device_id, str(backup_dir), cancel_event, make_progress(section, backup_dir, root_path),
+                        root_path, parallelism, exclusions, None, verify_checksums
+                    )
+                    if not completed:
+                        break
+                progress_events.put(('done', backup_sets, cancel_event, completed, safe_id,
+                                     failed_by_folder, parallelism, verify_checksums, verification_by_folder))
+            except Exception as exc:
+                progress_events.put(('error', str(exc)))
+
+        threading.Thread(target=backup_task, daemon=True).start()
+
+    def _restore_from_backup(self):
+        if not self._require_device():
+            return
+        choose_zip = messagebox.askyesnocancel(
+            "Choose Backup Source", "Restore from a ZIP archive?\n\nChoose No to select a backup folder.", parent=self.root
+        )
+        if choose_zip is None:
+            return
+        if choose_zip:
+            archive_path = filedialog.askopenfilename(
+                parent=self.root, title="Select Backup ZIP", filetypes=(("ZIP archives", "*.zip"), ("All files", "*.*"))
+            )
+            if not archive_path:
+                return
+            source_root = Path(archive_path)
+            try:
+                with zipfile.ZipFile(source_root) as archive:
+                    remote_by_local = {}
+                    try:
+                        manifest = json.loads(archive.read('.droidmgr_backup_manifest.json').decode('utf-8'))
+                        remote_by_local = {row['local_path'].replace('\\', '/'): row['remote_path']
+                                           for row in manifest.get('files', [])}
+                    except (KeyError, ValueError, TypeError, UnicodeDecodeError):
+                        pass
+                    candidates = []
+                    for info in archive.infolist():
+                        if info.is_dir() or info.filename.endswith('.droidmgr_index.json') or info.filename.endswith('.droidmgr_backup_manifest.json'):
+                            continue
+                        member = PurePosixPath(info.filename)
+                        if member.is_absolute() or not member.parts or any(part in ('', '.', '..') for part in member.parts):
+                            continue
+                        mode = info.external_attr >> 16
+                        if stat.S_ISLNK(mode):
+                            continue
+                        remote = remote_by_local.get(member.as_posix(), '/' + member.as_posix())
+                        remote_parts = PurePosixPath(remote).parts
+                        if not remote.startswith('/') or any(part == '..' for part in remote_parts):
+                            continue
+                        candidates.append((remote, ('zip', str(source_root), info.filename)))
+            except (OSError, zipfile.BadZipFile) as exc:
+                self._show_error("Restore Error", f"Could not read this ZIP archive:\n{exc}")
+                return
+        else:
+            folder = filedialog.askdirectory(parent=self.root, title="Select Backup Folder")
+            if not folder:
+                return
+            source_root = Path(folder)
+            candidates = []
+            remote_by_local = {}
+            try:
+                manifest = json.loads((source_root / '.droidmgr_backup_manifest.json').read_text(encoding='utf-8'))
+                remote_by_local = {row['local_path'].replace('\\', '/'): row['remote_path']
+                                   for row in manifest.get('files', [])}
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            if remote_by_local:
+                for relative, remote in remote_by_local.items():
+                    if PurePosixPath(relative).is_absolute() or '..' in PurePosixPath(relative).parts:
+                        continue
+                    local_path = source_root / Path(relative)
+                    if local_path.is_file() and remote.startswith('/') and '..' not in PurePosixPath(remote).parts:
+                        candidates.append((remote, ('file', str(local_path), None)))
+            else:
+                for path in source_root.rglob('*'):
+                    if not path.is_file() or path.name.startswith('.droidmgr_'):
+                        continue
+                    relative = path.relative_to(source_root).as_posix()
+                    member = PurePosixPath(relative)
+                    if member.is_absolute() or any(part in ('', '.', '..') for part in member.parts):
+                        continue
+                    candidates.append(('/' + member.as_posix(), ('file', str(path), None)))
+        if not candidates:
+            messagebox.showinfo("No Backup Files", "No restorable files were found in that backup.", parent=self.root)
+            return
+        selected = RestoreSelectionDialog(self.root, candidates).result
+        if not selected:
+            return
+        if not messagebox.askyesno(
+            "Confirm Restore",
+            f"Copy {len(selected):,} selected files to {self.selected_device}? Existing device files at those paths may be overwritten.",
+            parent=self.root,
+        ):
+            return
+        cancel_event = BackupCancelToken()
+        dialog = BackupProgressDialog(self.root, f"Restoring to {self.selected_device}", cancel_event)
+        dialog.set_queue([remote for remote, _source in selected], "restore")
+        self.taskbar_progress.set_indeterminate()
+        self._restore_batch(dialog, self.selected_device, selected, cancel_event)
+
+    def _restore_batch(self, dialog, device_id, selected, cancel_event):
+        cancel_event.clear()
+        failures = []
+        total = len(selected)
+        dialog.set_queue([remote for remote, _source in selected], "restore")
+
+        def task():
+            completed = 0
+            for index, (remote, source) in enumerate(selected):
+                if cancel_event.is_set():
+                    break
+                pending_paths = [item[0] for item in selected[index + 1:]]
+                self.root.after(0, lambda d=completed, t=total, p=remote, pending=pending_paths:
+                                dialog.set_current_download(d, t, p, pending))
+                temp_path = None
+                try:
+                    kind, location, member = source
+                    local_path = location
+                    if kind == 'zip':
+                        with zipfile.ZipFile(location) as archive, archive.open(member) as source_file:
+                            with tempfile.NamedTemporaryFile(prefix='droidmgr-restore-', delete=False) as temp_file:
+                                temp_path = temp_file.name
+                                shutil.copyfileobj(source_file, temp_file, 1024 * 1024)
+                        local_path = temp_path
+                    self.device_manager.upload_file(device_id, local_path, remote, cancel_event)
+                    if cancel_event.is_set():
+                        break
+                    completed += 1
+                    self.root.after(0, lambda d=completed, t=total: self.taskbar_progress.set_value(d, t))
+                    self.root.after(0, lambda d=completed, t=total, p=remote, pending=[item[0] for item in selected[index + 1:]]:
+                                    dialog.set_download(d, t, p, (pending, [], 0)))
+                except Exception as exc:
+                    failures.append((remote, str(exc)))
+                    completed += 1
+                    self.root.after(0, lambda d=completed, t=total, p=remote, e=str(exc):
+                                    dialog.set_failed(d, t, p, e))
+                finally:
+                    if temp_path:
+                        try:
+                            os.unlink(temp_path)
+                        except OSError:
+                            pass
+            self.root.after(0, lambda: self._restore_batch_done(dialog, device_id, selected, failures, cancel_event))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _restore_batch_done(self, dialog, device_id, selected, failures, cancel_event):
+        if cancel_event.is_set():
+            self.taskbar_progress.clear()
+            dialog.finish("Restore canceled. Files already copied remain on the device.", close_after_ms=600)
+            return
+        if failures:
+            summary = "Some files could not be restored:\n\n" + "\n".join(
+                f"{remote}: {error}" for remote, error in failures[:30]
+            )
+            if len(failures) > 30:
+                summary += f"\n...and {len(failures) - 30} more."
+            if messagebox.askyesno("Retry Failed Files?", summary + "\n\nRetry the failed files?", parent=dialog):
+                failed_paths = {remote for remote, _error in failures}
+                self._restore_batch(dialog, device_id,
+                                    [item for item in selected if item[0] in failed_paths], cancel_event)
+                return
+            messagebox.showinfo("Restore Summary", summary, parent=dialog)
+            self.taskbar_progress.clear()
+            dialog.finish(f"Restore finished with {len(failures):,} failed files.")
+        else:
+            self.taskbar_progress.clear()
+            dialog.finish(f"Restored {len(selected):,} files to {device_id}.")
+
+    def _retry_backup_failures(self, dialog, backup_sets, failed_by_folder, cancel_event,
+                               parallelism, verify_checksums, verification_by_folder):
+        retries = {folder: list(items) for folder, items in failed_by_folder.items() if items}
+        if not retries:
+            return
+        cancel_event.clear()
+        failed_again = {str(folder): [] for _, _, folder in backup_sets}
+        for section, _remote_root, folder in backup_sets:
+            for remote, _error in retries.get(str(folder), []):
+                row = dialog._queue_indexes.get(remote)
+                if row is not None:
+                    dialog.queue.delete(row)
+                    dialog.queue.insert(row, remote)
+            paths = [remote for remote, _error in retries.get(str(folder), [])]
+            if paths:
+                dialog.set_queue(paths, section)
+                self.taskbar_progress.set_value(0, len(paths))
+
+        def retry_task():
+            try:
+                for section, root_path, folder in backup_sets:
+                    paths = [remote for remote, _error in retries.get(str(folder), [])]
+                    if not paths or cancel_event.is_set():
+                        continue
+
+                    def progress(stage, done, total, path, details):
+                        if stage == 'download':
+                            self.root.after(0, lambda d=done, t=total: self.taskbar_progress.set_value(d, t))
+                            self.root.after(0, lambda d=done, t=total, p=path, r=details:
+                                            dialog.set_download(d, t, p, r))
+                        elif stage == 'download_current':
+                            self.root.after(0, lambda d=done, t=total, p=path, r=details:
+                                            dialog.set_current_download(d, t, p, r))
+                        elif stage == 'download_failed':
+                            failed_again[str(folder)].append((path, details[0]))
+                            self.root.after(0, lambda d=done, t=total, p=path, r=details[0]:
+                                            dialog.set_failed(d, t, p, r))
+                        elif stage == 'download_rate':
+                            self.root.after(0, lambda d=done, t=total: self.taskbar_progress.set_value(d, t))
+                            self.root.after(0, lambda d=done, t=total, p=path, r=details:
+                                            dialog.set_download_rate(d, t, p, r))
+                        elif stage == 'verification':
+                            result = dict(details)
+                            result['verified'] = done
+                            result['indexed'] = verification_by_folder.get(str(folder), {}).get(
+                                'indexed', result.get('indexed', done)
+                            )
+                            self.root.after(0, lambda r=result, key=str(folder): verification_by_folder.__setitem__(key, r))
+                        elif stage == 'verification_start':
+                            self.root.after(0, self.taskbar_progress.set_indeterminate)
+
+                    self.device_manager.backup_filesystem(
+                    self.selected_device, str(folder), cancel_event, progress,
+                        root_path, parallelism, [], paths, verify_checksums
+                    )
+                remaining = [(folder, remote, error) for folder, items in failed_again.items()
+                             for remote, error in items]
+                self.root.after(0, lambda: self._retry_backup_done(
+                    dialog, backup_sets, cancel_event, failed_again, remaining, parallelism, verify_checksums
+                    , verification_by_folder
+                ))
+            except Exception as exc:
+                self.root.after(0, lambda error=str(exc): self._backup_failed(dialog, error))
+
+        threading.Thread(target=retry_task, daemon=True).start()
+
+    def _retry_backup_done(self, dialog, backup_sets, cancel_event, failed_by_folder, remaining,
+                           parallelism, verify_checksums, verification_by_folder):
+        if cancel_event.is_set():
+            self.taskbar_progress.clear()
+            dialog.finish("Retry canceled. Downloaded files were kept.", close_after_ms=600)
+            return
+        if remaining:
+            summary = "Still unable to download:\n\n" + "\n".join(
+                f"{remote}: {error}" for _folder, remote, error in remaining[:30]
+            )
+            if len(remaining) > 30:
+                summary += f"\n...and {len(remaining) - 30} more."
+            if messagebox.askyesno("Retry Failed Files?", summary + "\n\nTry these files again?", parent=dialog):
+                self._retry_backup_failures(dialog, backup_sets, failed_by_folder, cancel_event,
+                                            parallelism, verify_checksums, verification_by_folder)
+                return
+            messagebox.showinfo("Backup File Summary", summary, parent=dialog)
+        self._backup_download_done(dialog, backup_sets, cancel_event, True,
+                                   re.sub(r'\s+', '', self.selected_device or 'device'),
+                                   failed_by_folder, parallelism, verify_checksums,
+                                   verification_by_folder, allow_retry=False)
+
+    def _backup_download_done(self, dialog, backup_sets, cancel_event, completed, safe_id,
+                              failed_by_folder, parallelism, verify_checksums, verification_by_folder,
+                              allow_retry=True):
+        if not dialog.winfo_exists():
+            return
+        backup_dirs = [folder for _, _, folder in backup_sets]
+        if not completed:
+            self.taskbar_progress.clear()
+            dialog.finish("Backup canceled. Downloaded files were kept.", close_after_ms=600)
+            return
+        failures = [(folder, remote, error) for folder, items in failed_by_folder.items()
+                    for remote, error in items]
+        for folder, result in verification_by_folder.items():
+            for remote, error in result.get('invalid', []):
+                if not any(existing_remote == remote for _folder, existing_remote, _reason in failures):
+                    failures.append((folder, remote, error))
+                    failed_by_folder.setdefault(folder, []).append((remote, error))
+        verification_lines = []
+        for folder, result in verification_by_folder.items():
+            invalid = result.get('invalid', [])
+            checksum_note = " with SHA-256" if result.get('checksums') else " (file sizes)"
+            checked = BackupProgressDialog._format_byte_rate(result.get('bytes', 0)).replace('/s', '')
+            verification_lines.append(
+                f"{folder}: {result.get('verified', 0):,}/{result.get('indexed', result.get('verified', 0)):,} files verified{checksum_note}; "
+                f"{len(invalid):,} mismatches; {checked} checked"
+            )
+        if verification_lines:
+            messagebox.showinfo("Backup Verification", "\n".join(verification_lines), parent=dialog)
+        if failures:
+            summary = "Some files could not be downloaded:\n\n" + "\n".join(
+                f"{remote}: {error}" for _folder, remote, error in failures[:30]
+            )
+            if len(failures) > 30:
+                summary += f"\n...and {len(failures) - 30} more."
+            if allow_retry and messagebox.askyesno("Retry Failed Files?", summary + "\n\nRetry the failed files now?", parent=dialog):
+                self._retry_backup_failures(dialog, backup_sets, failed_by_folder, cancel_event,
+                                            parallelism, verify_checksums, verification_by_folder)
+                return
+            if not allow_retry:
+                summary += "\n\nBackup is partial. The rest of the backup is available."
+            messagebox.showinfo("Backup File Summary", summary, parent=dialog)
+        sections = [name for name, _, _ in backup_sets]
+        if not messagebox.askyesno(
+            "Create ZIP Archive?",
+            "Backup finished. Create separate ZIP archives for " + " and ".join(sections) + " and remove the staging folders?",
+            parent=dialog,
+        ):
+            self.taskbar_progress.clear()
+            dialog.finish("Backups saved to:\n" + "\n".join(str(folder) for folder in backup_dirs))
+            return
+
+        cancel_event.clear()
+        archive_paths = [
+            Path.home() / 'Downloads' / f"{safe_id}_{'internal_storage' if i == 0 else 'system_storage'}_backup.zip"
+            for i in range(len(backup_sets))
+        ]
+        existing_archives = [path for path in archive_paths if path.exists()]
+        if existing_archives and not messagebox.askyesno(
+            "Replace Archives?",
+            "These ZIP archives already exist. Replace them?\n\n" + "\n".join(str(p) for p in existing_archives),
+            parent=dialog,
+        ):
+            self.taskbar_progress.clear()
+            dialog.finish("Backups saved to:\n" + "\n".join(str(folder) for folder in backup_dirs))
+            return
+
+        def zip_task():
+            created_archives = []
+            try:
+                all_files = [path for folder in backup_dirs for path in folder.rglob('*')
+                             if path.is_file() and path.name != '.droidmgr_index.json']
+                total = len(all_files)
+                done = 0
+                for backup_dir, archive_path in zip(backup_dirs, archive_paths):
+                    if archive_path.exists():
+                        archive_path.unlink()
+                    created_archives.append(archive_path)
+                    files = [path for path in backup_dir.rglob('*')
+                             if path.is_file() and path.name != '.droidmgr_index.json']
+                    with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+                        for path in files:
+                            if cancel_event.is_set():
+                                raise InterruptedError("Archive creation canceled")
+                            arcname = path.relative_to(backup_dir).as_posix()
+                            with path.open('rb') as source, archive.open(arcname, 'w') as target:
+                                while True:
+                                    if cancel_event.is_set():
+                                        raise InterruptedError("Archive creation canceled")
+                                    chunk = source.read(1024 * 1024)
+                                    if not chunk:
+                                        break
+                                    target.write(chunk)
+                            done += 1
+                            self.root.after(0, lambda i=done, n=total, p=path: self._set_archive_progress(dialog, i, n, p))
+                if cancel_event.is_set():
+                    raise InterruptedError("Archive creation canceled")
+                for backup_dir in backup_dirs:
+                    shutil.rmtree(backup_dir)
+                self.root.after(0, lambda: self._finish_backup(dialog, "Archives saved to:\n" + "\n".join(str(p) for p in archive_paths)))
+            except InterruptedError:
+                for path in created_archives:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                self.root.after(0, lambda: self._finish_backup(dialog,
+                    "Archive canceled. Backup folders were kept.", close_after_ms=600
+                ))
+            except Exception as exc:
+                for path in created_archives:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                self.root.after(0, lambda error=str(exc): self._backup_failed(dialog, error))
+
+        dialog.status.config(text="Preparing ZIP archives...")
+        dialog.progress.configure(value=0)
+        threading.Thread(target=zip_task, daemon=True).start()
+
+    def _backup_failed(self, dialog, error):
+        self.taskbar_progress.clear()
+        if dialog.winfo_exists():
+            dialog.finish("Backup failed. Any downloaded files were kept.")
+        self._show_error("Backup Error", error)
+
+    def _set_archive_progress(self, dialog, done, total, path):
+        if dialog.winfo_exists():
+            dialog.set_archiving(done, total, str(path))
+        self.taskbar_progress.set_value(done, total)
+
+    def _finish_backup(self, dialog, message, close_after_ms=None):
+        self.taskbar_progress.clear()
+        if dialog.winfo_exists():
+            dialog.finish(message, close_after_ms=close_after_ms)
         
     def _copy_processes_list(self):
         items = self.process_tree.get_children()
@@ -1263,6 +2048,7 @@ class MainWindow:
     def _on_closing(self):
 
 
+        self.taskbar_progress.close()
         self.device_manager.cleanup()
         self.root.destroy()
     
@@ -1294,20 +2080,7 @@ class APKInstallProgressDialog(tk.Toplevel):
         self.progressbar.pack(fill=tk.X, expand=True)
         self.progressbar.start(10)
         
-        # Center dialog
-        self.update_idletasks()
-        try:
-            pw = parent.winfo_width()
-            ph = parent.winfo_height()
-            px = parent.winfo_rootx()
-            py = parent.winfo_rooty()
-            dw = 420
-            dh = 150
-            cx = px + (pw // 2) - (dw // 2)
-            cy = py + (ph // 2) - (dh // 2)
-            self.geometry(f"+{max(0, cx)}+{max(0, cy)}")
-        except Exception:
-            pass
+        setup_window_dpi(self, base_width=420, base_height=150, parent=parent)
             
         self.protocol("WM_DELETE_WINDOW", lambda: None)
         self.grab_set()

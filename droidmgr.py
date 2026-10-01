@@ -8,10 +8,22 @@ It automatically initializes and starts the UI.
 import sys
 from pathlib import Path
 
+# On Windows, ensure stdout/stderr handle UTF-8 symbols gracefully
+if sys.platform.startswith('win'):
+    try:
+        if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8')
+        if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+            sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
-from ui import MainWindow, InitDialog
+# Enable High DPI awareness before any GUI components are created
+from ui import MainWindow, InitDialog, enable_dpi_awareness
+enable_dpi_awareness()
 
 
 def main():

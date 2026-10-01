@@ -52,6 +52,20 @@ class DeviceManager:
             device['is_mirroring'] = self.scrcpy.is_mirroring(device_id)
         
         return devices
+
+    def get_device_status(self, device_id: str) -> Optional[str]:
+        """Get the current ADB status of a specific device (e.g. 'device', 'offline', 'unauthorized')."""
+        try:
+            for device in self.adb.get_devices():
+                if device['id'] == device_id:
+                    return device.get('status', '').lower()
+        except Exception:
+            pass
+        return None
+
+    def is_device_ready(self, device_id: str) -> bool:
+        """Check if device is connected and in ready ('device') state."""
+        return self.get_device_status(device_id) == 'device'
     
     def start_mirroring(self, device_id: str, **kwargs) -> subprocess.Popen:
         """Start screen mirroring for a device.
@@ -155,8 +169,20 @@ class DeviceManager:
             local_path: Local destination path
         """
         self.adb.download_file(device_id, remote_path, local_path)
+
+    def backup_filesystem(self, device_id: str, destination: str, cancel_event, progress_callback=None,
+                          remote_root: str = '/', parallelism: int = 4, exclusions=None, only_paths=None,
+                          verify_checksums=False) -> bool:
+        """Back up accessible device files after indexing the filesystem."""
+        return self.adb.backup_filesystem(
+            device_id, destination, cancel_event, progress_callback, remote_root, parallelism, exclusions,
+            only_paths, verify_checksums
+        )
+
+    def estimate_filesystem_size(self, device_id: str, remote_root: str = '/', cancel_event=None):
+        return self.adb.estimate_filesystem_size(device_id, remote_root, cancel_event)
     
-    def upload_file(self, device_id: str, local_path: str, remote_path: str) -> None:
+    def upload_file(self, device_id: str, local_path: str, remote_path: str, cancel_event=None) -> None:
         """Upload a file to a device.
         
         Args:
@@ -164,7 +190,7 @@ class DeviceManager:
             local_path: Local file path
             remote_path: Destination path on device
         """
-        self.adb.upload_file(device_id, local_path, remote_path)
+        self.adb.upload_file(device_id, local_path, remote_path, cancel_event)
     
     def delete_file(self, device_id: str, remote_path: str) -> None:
         """Delete a file on a device.
@@ -199,6 +225,26 @@ class DeviceManager:
     def is_directory_writable(self, device_id: str, path: str) -> bool:
         """Check dynamically if a directory on the device is writable."""
         return self.adb.is_directory_writable(device_id, path)
+
+    def enable_tcpip(self, device_id: str, port: int = 5555) -> str:
+        """Enable ADB over TCP/IP on the device."""
+        return self.adb.enable_tcpip(device_id, port)
+
+    def get_device_ip(self, device_id: Optional[str] = None) -> Optional[str]:
+        """Get the Wi-Fi or Hotspot IP address of the device or network."""
+        return self.adb.get_device_ip(device_id)
+
+    def connect_device(self, host: str, port: int = 5555) -> str:
+        """Connect to an ADB device over network."""
+        return self.adb.connect_device(host, port)
+
+    def pair_device(self, host: str, port: int, pairing_code: str) -> str:
+        """Pair with an Android device over Wi-Fi using a pairing code (Android 11+)."""
+        return self.adb.pair_device(host, port, pairing_code)
+
+    def disconnect_device(self, address: str) -> str:
+        """Disconnect an ADB device over network."""
+        return self.adb.disconnect_device(address)
     
     def cleanup(self) -> None:
         """Cleanup all resources."""

@@ -2,12 +2,12 @@ import tkinter as tk
 from tkinter import ttk
 import threading
 import queue
+from .dpi import setup_window_dpi
 
 class ScrcpyOutputDialog(tk.Toplevel):
     def __init__(self, parent, process, device_id, stop_callback):
         super().__init__(parent)
         self.title(f"scrcpy Output - {device_id}")
-        self.geometry("600x400")
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
         
         self.process = process
@@ -40,21 +40,7 @@ class ScrcpyOutputDialog(tk.Toplevel):
         # Start log reading thread
         self.thread = threading.Thread(target=self._read_output, daemon=True)
         self.thread.start()
-        
-        # Center dialog relative to parent window
-        self.update_idletasks()
-        try:
-            pw = parent.winfo_width()
-            ph = parent.winfo_height()
-            px = parent.winfo_rootx()
-            py = parent.winfo_rooty()
-            dw = 600
-            dh = 400
-            cx = px + (pw // 2) - (dw // 2)
-            cy = py + (ph // 2) - (dh // 2)
-            self.geometry(f"+{max(0, cx)}+{max(0, cy)}")
-        except Exception:
-            pass
+        setup_window_dpi(self, base_width=600, base_height=400, min_width=400, min_height=300, parent=parent)
             
         # Start queue checking
         self._check_queue()

@@ -2,8 +2,8 @@ import posixpath
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import threading
-from pathlib import Path
-from core import ConfigManager
+from core import ConfigManager, ADBDeviceOfflineError, ADBDeviceNotFoundError
+from .dpi import scale_size, setup_window_dpi
 
 
 class FileDetailsDialog(tk.Toplevel):
@@ -79,22 +79,7 @@ class FolderSelectorDialog(tk.Toplevel):
         self.config = ConfigManager()
         
         self._create_widgets()
-        
-        # Center dialog relative to parent window
-        self.update_idletasks()
-        try:
-            pw = parent.winfo_width()
-            ph = parent.winfo_height()
-            px = parent.winfo_rootx()
-            py = parent.winfo_rooty()
-            dw = 600
-            dh = 400
-            cx = px + (pw // 2) - (dw // 2)
-            cy = py + (ph // 2) - (dh // 2)
-            self.geometry(f"+{max(0, cx)}+{max(0, cy)}")
-        except Exception:
-            pass
-            
+        setup_window_dpi(self, base_width=600, base_height=400, parent=parent)
         self.wait_visibility()
         self.grab_set()
         self.bind('<Escape>', lambda e: self.destroy())
@@ -212,10 +197,10 @@ class FileManager:
         self.file_tree.heading('Size', text='Size')
         self.file_tree.heading('Permissions', text='Permissions')
         
-        self.file_tree.column('#0', width=80)
-        self.file_tree.column('Name', width=400)
-        self.file_tree.column('Size', width=100)
-        self.file_tree.column('Permissions', width=150)
+        self.file_tree.column('#0', width=scale_size(80, self.frame))
+        self.file_tree.column('Name', width=scale_size(400, self.frame))
+        self.file_tree.column('Size', width=scale_size(100, self.frame))
+        self.file_tree.column('Permissions', width=scale_size(150, self.frame))
         
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.file_tree.yview)
         self.file_tree.configure(yscrollcommand=scrollbar.set)
@@ -260,13 +245,18 @@ class FileManager:
         self.delete_btn = ttk.Button(btn_frame, text="Delete", command=self._delete_file, state=tk.DISABLED)
         self.delete_btn.pack(side=tk.LEFT, padx=2)
 
-    def set_device(self, device_id):
+    def set_device(self, device_id, force_refresh=False):
+        changed = (self.selected_device != device_id)
         self.selected_device = device_id
-        if device_id:
+        if not device_id:
+            self._clear_list()
+            self._update_selection_buttons()
+            return
+
+        if changed or force_refresh:
             self.refresh()
         else:
-            self._clear_list()
-        self._update_selection_buttons()
+            self._update_selection_buttons()
 
     def _clear_list(self):
         for item in self.file_tree.get_children():
@@ -277,6 +267,35 @@ class FileManager:
         if not self.selected_device:
             return
             
+        # Avoid running commands if the device is known to be offline or unauthorized
+        if hasattr(self.device_manager, 'is_device_ready'):
+            try:
+                if not self.device_manager.is_device_ready(self.selected_device):
+                    status = None
+                    if hasattr(self.device_manager, 'get_device_status'):
+                        status = self.device_manager.get_device_status(self.selected_device)
+                    status_str = status.lower() if status else 'offline'
+                    if status_str == 'unauthorized':
+                        tag_text = "[Unauthorized]"
+                        desc_text = "Device is unauthorized. Please accept the USB debugging prompt on your phone screen."
+                    else:
+                        tag_text = "[Offline]"
+                        desc_text = "Device is offline. Reconnect USB cable or restart ADB."
+
+                    def show_offline():
+                        self._clear_list()
+                        self.file_tree.insert(
+                            '', tk.END, text=tag_text,
+                            values=(desc_text, "", "")
+                        )
+                        self._set_status(f"Device '{self.selected_device}' is {status_str}.")
+                        self._update_navigation_buttons()
+                        self._update_selection_buttons()
+                    self.frame.after(0, show_offline)
+                    return
+            except Exception:
+                pass
+
         def task():
             try:
                 path = self.current_path
@@ -307,9 +326,41 @@ class FileManager:
                     self._update_selection_buttons()
                 self.frame.after(0, update)
 
+            except (ADBDeviceOfflineError, ADBDeviceNotFoundError) as e:
+                msg = str(e)
+                def handle_offline():
+                    self._clear_list()
+                    tag_text = "[Unauthorized]" if "unauthorized" in msg.lower() else "[Offline]"
+                    desc_text = "Device is unauthorized. Please accept the USB debugging prompt on your phone screen." if "unauthorized" in msg.lower() else "Device is offline. Reconnect USB cable or restart ADB."
+                    self.file_tree.insert(
+                        '', tk.END, text=tag_text,
+                        values=(desc_text, "", "")
+                    )
+                    self._set_status(f"Device '{self.selected_device}' is offline or disconnected.")
+                    self._update_navigation_buttons()
+                    self._update_selection_buttons()
+                self.frame.after(0, handle_offline)
             except Exception as e:
                 msg = str(e)
-                if "Permission denied" in msg:
+                lower_msg = msg.lower()
+                is_offline = any(keyword in lower_msg for keyword in [
+                    'device offline', 'offline or unauthorized', 'device not found',
+                    'no devices/emulators found', 'disconnected', 'closed', 'unauthorized'
+                ])
+                if is_offline:
+                    def handle_offline():
+                        self._clear_list()
+                        tag_text = "[Unauthorized]" if "unauthorized" in lower_msg else "[Offline]"
+                        desc_text = "Device is unauthorized. Please accept the USB debugging prompt on your phone screen." if "unauthorized" in lower_msg else "Device is offline. Reconnect USB cable or restart ADB."
+                        self.file_tree.insert(
+                            '', tk.END, text=tag_text,
+                            values=(desc_text, "", "")
+                        )
+                        self._set_status(f"Device '{self.selected_device}' is offline or disconnected.")
+                        self._update_navigation_buttons()
+                        self._update_selection_buttons()
+                    self.frame.after(0, handle_offline)
+                elif "Permission denied" in msg:
                     # Navigate back to previous path on permission error
                     def go_back():
                         if hasattr(self, 'previous_path') and self.previous_path:

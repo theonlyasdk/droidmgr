@@ -3,13 +3,13 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
+from .dpi import setup_window_dpi
 
 class DeviceDetailsDialog(tk.Toplevel):
     
     def __init__(self, parent, device_id, device_manager):
         super().__init__(parent)
         self.title(f"Device Details - {device_id}")
-        self.geometry("650x600")
         self.device_id = device_id
         self.device_manager = device_manager
         
@@ -19,20 +19,7 @@ class DeviceDetailsDialog(tk.Toplevel):
         self._create_widgets()
         self._load_info()
         
-        # Center dialog relative to parent window
-        self.update_idletasks()
-        try:
-            pw = parent.winfo_width()
-            ph = parent.winfo_height()
-            px = parent.winfo_rootx()
-            py = parent.winfo_rooty()
-            dw = 650
-            dh = 600
-            cx = px + (pw // 2) - (dw // 2)
-            cy = py + (ph // 2) - (dh // 2)
-            self.geometry(f"+{max(0, cx)}+{max(0, cy)}")
-        except Exception:
-            pass
+        setup_window_dpi(self, base_width=650, base_height=600, min_width=500, min_height=450, parent=parent)
             
         # Ensure window is drawn before grabbing focus
         self.wait_visibility()

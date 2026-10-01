@@ -2,6 +2,7 @@
 
 import tkinter as tk
 from tkinter import ttk
+from .dpi import setup_window_dpi
 
 
 class AboutDialog:
@@ -9,26 +10,10 @@ class AboutDialog:
     def __init__(self, parent):
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("About droidmgr")
-        self.dialog.geometry("400x550")
-        self.dialog.minsize(400, 500)
         self.dialog.transient(parent)
         
         self._create_widgets()
-        
-        # Center dialog relative to parent window
-        self.dialog.update_idletasks()
-        try:
-            pw = parent.winfo_width()
-            ph = parent.winfo_height()
-            px = parent.winfo_rootx()
-            py = parent.winfo_rooty()
-            dw = 400
-            dh = 550
-            cx = px + (pw // 2) - (dw // 2)
-            cy = py + (ph // 2) - (dh // 2)
-            self.dialog.geometry(f"+{max(0, cx)}+{max(0, cy)}")
-        except Exception:
-            pass
+        setup_window_dpi(self.dialog, base_width=400, base_height=550, min_width=400, min_height=500, parent=parent)
             
         # Ensure window is visible before grabbing
         self.dialog.wait_visibility()

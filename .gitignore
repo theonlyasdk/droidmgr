@@ -30,6 +30,7 @@ MANIFEST
 #  Usually these files are written by a python script, and contain the bin/
 #  directory corresponding to the Python interpreter
 *.manifest
+!tools/app.manifest
 *.spec
 
 # Installer logs

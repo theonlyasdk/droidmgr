@@ -8,6 +8,7 @@ from pathlib import Path
 import queue
 
 from core import DependencyManager
+from .dpi import enable_dpi_awareness, setup_window_dpi
 
 
 class InitDialog:
@@ -19,10 +20,10 @@ class InitDialog:
         Args:
             parent: Parent window (optional)
         """
+        enable_dpi_awareness()
         self.dialog = tk.Toplevel() if parent else tk.Tk()
         self.dialog.title("droidmgr - Initializing Dependencies")
-        self.dialog.geometry("500x400")
-        self.dialog.minsize(450, 400)
+        setup_window_dpi(self.dialog, base_width=500, base_height=400, min_width=450, min_height=400, parent=parent)
         
         self.dep_manager = DependencyManager()
         self.adb_path = None

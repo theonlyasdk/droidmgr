@@ -2,7 +2,8 @@ import json
 import os
 from pathlib import Path
 
-CURRENT_CONFIG_VERSION = 1
+CURRENT_CONFIG_VERSION = 2
+DEFAULT_BACKUP_EXCLUSIONS = ['/storage/emulated/0/Android']
 
 
 class ConfigManager:
@@ -31,6 +32,12 @@ class ConfigManager:
                 'show_hidden': False,
                 'use_exact_sizes': False,
                 'confirm_rename': True
+            },
+            'backup': {
+                'exclude_paths': list(DEFAULT_BACKUP_EXCLUSIONS),
+                'scope': 0,
+                'parallelism': 4,
+                'verify_checksums': False,
             },
             'paths': {
                 'adb': '',
@@ -104,7 +111,11 @@ class ConfigManager:
             general = settings.setdefault('general', {})
             general.setdefault('query_interval', 5)
             general.setdefault('apps_view_mode', 'compact')
-            settings['config_version'] = 1
+        if from_version < 2:
+            backup = settings.setdefault('backup', {})
+            if not backup.get('exclude_paths'):
+                backup['exclude_paths'] = list(DEFAULT_BACKUP_EXCLUSIONS)
+        settings['config_version'] = CURRENT_CONFIG_VERSION
         return settings
 
     def _validate(self):
@@ -127,6 +138,16 @@ class ConfigManager:
                 self.settings.setdefault('general', {})['apps_view_mode'] = 'compact'
         except Exception:
             self.settings.setdefault('general', {})['apps_view_mode'] = 'compact'
+
+        backup = self.settings.setdefault('backup', {})
+        if backup.get('scope') not in (0, 1):
+            backup['scope'] = 0
+        if backup.get('parallelism') not in (1, 2, 4, 8):
+            backup['parallelism'] = 4
+        if not isinstance(backup.get('verify_checksums'), bool):
+            backup['verify_checksums'] = False
+        if not isinstance(backup.get('exclude_paths'), list):
+            backup['exclude_paths'] = list(DEFAULT_BACKUP_EXCLUSIONS)
 
         # Validate paths (must be strings)
         for path_key in ('adb', 'scrcpy'):

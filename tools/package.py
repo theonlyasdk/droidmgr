@@ -191,6 +191,11 @@ def build_executable(use_upx: bool = True, strip: bool = True) -> bool:
     if info["icon"] and Path(info["icon"]).exists():
         cmd.append(f"--icon={info['icon']}")
 
+    # Add high DPI manifest for Windows
+    manifest_path = PROJECT_ROOT / "tools" / "app.manifest"
+    if info["platform_tag"].startswith("win") and manifest_path.exists():
+        cmd.append(f"--manifest={manifest_path}")
+
     # Hidden imports
     for imp in HIDDEN_IMPORTS:
         cmd.extend(["--hidden-import", imp])

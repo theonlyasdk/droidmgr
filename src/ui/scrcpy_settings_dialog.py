@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import re
 from core import ConfigManager
+from .dpi import setup_window_dpi
 
 class ToolTip:
     def __init__(self, widget, text):
@@ -79,20 +80,7 @@ class ScrcpySettingsDialog(tk.Toplevel):
         self._toggle_camera_settings()
         self._toggle_record_settings()
         
-        # Center dialog relative to parent window
-        self.update_idletasks()
-        try:
-            pw = parent.winfo_width()
-            ph = parent.winfo_height()
-            px = parent.winfo_rootx()
-            py = parent.winfo_rooty()
-            dw = 600
-            dh = 550
-            cx = px + (pw // 2) - (dw // 2)
-            cy = py + (ph // 2) - (dh // 2)
-            self.geometry(f"+{max(0, cx)}+{max(0, cy)}")
-        except Exception:
-            pass
+        setup_window_dpi(self, base_width=600, base_height=550, min_width=500, min_height=450, parent=parent)
             
         # Ensure window is visible before grabbing
         self.wait_visibility()
@@ -235,8 +223,8 @@ class ScrcpySettingsDialog(tk.Toplevel):
             # Create a simple selection dialog
             top = tk.Toplevel(self)
             top.title("Select Camera")
-            top.geometry("450x400")
             top.transient(self)
+            setup_window_dpi(top, base_width=450, base_height=400, parent=self)
             top.grab_set()
             
             main = ttk.Frame(top, padding=10)

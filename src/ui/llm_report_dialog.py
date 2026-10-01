@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
 from typing import Optional, Callable
+from .dpi import setup_window_dpi
 
 
 class LLMReportProgressDialog(tk.Toplevel):
@@ -12,7 +13,6 @@ class LLMReportProgressDialog(tk.Toplevel):
     def __init__(self, parent, title: str = "Generating LLM Report"):
         super().__init__(parent)
         self.title(title)
-        self.geometry("520x130")
         self.resizable(False, False)
         self.transient(parent)
 
@@ -20,16 +20,7 @@ class LLMReportProgressDialog(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._create_widgets()
-
-        # Center window relative to parent
-        self.update_idletasks()
-        try:
-            px = parent.winfo_rootx() + (parent.winfo_width() // 2) - (520 // 2)
-            py = parent.winfo_rooty() + (parent.winfo_height() // 2) - (130 // 2)
-            self.geometry(f"+{max(0, px)}+{max(0, py)}")
-        except Exception:
-            pass
-
+        setup_window_dpi(self, base_width=520, base_height=130, parent=parent)
         self.wait_visibility()
         self.grab_set()
         self.bind('<Escape>', lambda e: self.destroy())
@@ -86,22 +77,10 @@ class LLMReportDialog(tk.Toplevel):
     def __init__(self, parent, device_id: str, report_text: str):
         super().__init__(parent)
         self.title(f"LLM Device Report - {device_id}")
-        self.geometry("750x500")
-        self.minsize(500, 350)
         self.transient(parent)
-
         self.report_text = report_text
         self._create_widgets()
-
-        # Center window relative to parent
-        self.update_idletasks()
-        try:
-            px = parent.winfo_rootx() + (parent.winfo_width() // 2) - (750 // 2)
-            py = parent.winfo_rooty() + (parent.winfo_height() // 2) - (500 // 2)
-            self.geometry(f"+{max(0, px)}+{max(0, py)}")
-        except Exception:
-            pass
-
+        setup_window_dpi(self, base_width=750, base_height=500, min_width=500, min_height=350, parent=parent)
         self.wait_visibility()
         self.grab_set()
         self.bind('<Escape>', lambda e: self.destroy())
