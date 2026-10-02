@@ -56,6 +56,7 @@ class ConfigManager:
             'capture': {
                 'screenshot_dir': '',
                 'record_dir': '',
+                'apk_dir': '',
                 'record_time_limit': 30,
                 'record_bit_rate': '',
                 'record_size': '',
@@ -195,7 +196,7 @@ class ConfigManager:
 
         # Validate capture settings (screenshot/recording defaults)
         capture = self.settings.setdefault('capture', {})
-        for key in ('screenshot_dir', 'record_dir', 'record_bit_rate', 'record_size'):
+        for key in ('screenshot_dir', 'record_dir', 'apk_dir', 'record_bit_rate', 'record_size'):
             if not isinstance(capture.get(key), str):
                 capture[key] = ''
         try:

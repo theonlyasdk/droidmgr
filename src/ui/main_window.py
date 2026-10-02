@@ -26,6 +26,7 @@ from .device_details_dialog import DeviceDetailsDialog
 from .logcat_view import LogcatView
 from .shell_view import ShellView
 from .capture import take_screenshot, record_screen
+from .apk_extract import extract_apk
 from .llm_report_dialog import LLMReportDialog, LLMReportProgressDialog
 from .wireless_dialog import ConnectWirelesslyDialog
 from .backup_dialog import BackupCancelToken, BackupOptionsDialog, BackupProgressDialog, RestoreSelectionDialog
@@ -358,6 +359,9 @@ class MainWindow:
         self.install_apk_btn = ttk.Button(btn_frame, text="Install APK", command=self._install_apk)
         self.install_apk_btn.pack(side=tk.LEFT, padx=2)
         
+        self.extract_apk_btn = ttk.Button(btn_frame, text="Extract APK", command=self._extract_apk)
+        self.extract_apk_btn.pack(side=tk.LEFT, padx=2)
+        
         self.start_app_btn = ttk.Button(btn_frame, text="Start App", command=self._start_app)
         self.start_app_btn.pack(side=tk.LEFT, padx=2)
         
@@ -455,6 +459,7 @@ class MainWindow:
         self.start_app_btn.config(state=app_state)
         self.stop_app_btn.config(state=app_state)
         self.uninstall_app_btn.config(state=app_state)
+        self.extract_apk_btn.config(state=app_state)
         
         self.file_manager.update_button_states(ready_state)
         self.scrcpy_settings_btn.config(state=ready_state)
@@ -662,6 +667,17 @@ class MainWindow:
             return
         record_screen(self.root, self.device_manager, self.selected_device,
                       self._set_status, self._show_error, self._show_info)
+
+    def _extract_apk(self):
+        """Applications > Extract APK: pull the selected package off the device."""
+        if not self._require_device():
+            return
+        package = self._get_selected_package()
+        if not package:
+            self._show_warning("Please select an application first")
+            return
+        extract_apk(self.root, self.device_manager, self.selected_device, package,
+                    self._set_status, self._show_error, self._show_info)
 
 
     def _on_device_double_click(self, event):

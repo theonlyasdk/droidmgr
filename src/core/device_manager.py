@@ -275,6 +275,15 @@ class DeviceManager:
         """Ask an on-device screenrecord to stop and finalize the MP4."""
         return self.adb.stop_screenrecord(device_id)
 
+    def get_apk_paths(self, device_id: str, package: str) -> List[Dict[str, str]]:
+        """List the APK files behind an installed package."""
+        return self.adb.get_apk_paths(device_id, package)
+
+    def extract_apk(self, device_id: str, package: str, destination: str,
+                    version: str = '') -> Dict[str, Any]:
+        """Pull an installed package's APK, and its splits, to a local folder."""
+        return self.adb.extract_apk(device_id, package, destination, version)
+
     def cleanup(self) -> None:
         """Cleanup all resources."""
         self.scrcpy.stop_all()

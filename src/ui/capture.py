@@ -42,7 +42,12 @@ def _timestamp() -> str:
 
 
 def _default_dir(kind: str) -> Path:
-    folder = 'Pictures' if kind == 'screenshot' else 'Videos'
+    if kind == 'screenshot':
+        folder = 'Pictures'
+    elif kind == 'record':
+        folder = 'Videos'
+    else:
+        folder = 'Downloads'
     return Path.home() / folder / 'droidmgr'
 
 
@@ -68,6 +73,28 @@ def _format_duration(seconds: float) -> str:
 
 
 # -- screenshot ------------------------------------------------------------
+
+
+def remember_folder(root, config, key, label, saved_path, set_status, show_info,
+                    note: str = '') -> None:
+    """Announce a saved file and offer to remember its folder as the default.
+
+    `key` is the `capture` config key holding the remembered folder, so each
+    feature keeps its own default: screenshot_dir, record_dir, apk_dir.
+    `note` is appended to the dialog when there is something extra to say.
+    """
+    saved_path = str(saved_path)
+    folder = str(Path(saved_path).parent)
+    set_status(f"{label} saved to {saved_path}")
+    if str(config.get('capture', key, '')) == folder:
+        show_info(f"{label} saved to:\n{saved_path}{note}")
+        return
+    if messagebox.askyesno(
+            f"{label} Saved",
+            f"Saved to:\n{saved_path}\n\nRemember '{folder}' as the default "
+            f"{label.lower()} folder?{note}",
+            parent=root):
+        config.set('capture', key, folder)
 
 
 def take_screenshot(root, device_manager, device_id, set_status, show_error, show_info) -> None:
@@ -106,16 +133,7 @@ def take_screenshot(root, device_manager, device_id, set_status, show_error, sho
 
 
 def _on_screenshot_saved(root, path, config, set_status, show_info) -> None:
-    folder = str(Path(path).parent)
-    set_status(f"Screenshot saved to {path}")
-    if str(config.get('capture', 'screenshot_dir', '')) == folder:
-        show_info(f"Screenshot saved to:\n{path}")
-        return
-    if messagebox.askyesno(
-            "Screenshot Saved",
-            f"Saved to:\n{path}\n\nRemember '{folder}' as the default screenshot folder?",
-            parent=root):
-        config.set('capture', 'screenshot_dir', folder)
+    remember_folder(root, config, 'screenshot_dir', 'Screenshot', path, set_status, show_info)
 
 
 # -- screen recording ------------------------------------------------------

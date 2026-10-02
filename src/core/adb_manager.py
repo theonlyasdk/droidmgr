@@ -14,6 +14,8 @@ import json
 import hashlib
 import posixpath
 import shlex
+import tempfile
+import zipfile
 from .audit_logger import AuditLogger
 from . import apk_icon
 
@@ -596,6 +598,87 @@ class ADBManager:
                 explanation = friendly_messages.get(code, code)
                 error_reason = f"{code}: {explanation}"
             raise RuntimeError(f"Installation failed: {error_reason}")
+
+
+    def get_apk_paths(self, device_id: str, package: str) -> List[Dict[str, str]]:
+        """List the APK files behind an installed package using `pm path`.
+
+        Returns one entry per file, in `pm path` order: the base APK comes
+        first, then any splits. Each entry is
+        {'split': '' for base.apk or the split name without its extension,
+         'name': the on-device file name, 'path': the on-device path}.
+        """
+        _validate_package(package)
+        output = self._run_command(['shell', 'pm', 'path', package], device_id)
+
+        entries: List[Dict[str, str]] = []
+        for line in output.splitlines():
+            line = line.strip()
+            if not line.startswith('package:'):
+                continue
+            remote_path = line.split(':', 1)[1].strip()
+            if not remote_path:
+                continue
+            name = posixpath.basename(remote_path)
+            stem = name[:-4] if name.lower().endswith('.apk') else name
+            entries.append({
+                'split': '' if stem == 'base' else stem,
+                'name': name,
+                'path': remote_path,
+            })
+
+        if not entries:
+            raise ADBCommandError(
+                f"'pm path {package}' reported no APK files. "
+                "The app may be disabled, or not installed for the current user."
+            )
+        return entries
+
+
+    def extract_apk(self, device_id: str, package: str, destination: str,
+                    version: str = '') -> Dict[str, Any]:
+        """Pull every APK behind an installed package into a local folder.
+
+        A package with only a base APK is written as <package>_<version>.apk.
+        A split package is bundled into <package>_<version>.apks, a zip holding
+        base.apk plus each split_<name>.apk, which is what split-installers
+        such as SAI expect. Returns {'path', 'members', 'is_split'}.
+        """
+        _validate_package(package)
+        AuditLogger.log(device_id, "EXTRACT_APK", f"{package} -> {destination}")
+
+        if not version:
+            try:
+                version = self.get_app_info(device_id, package).get('version_name', '') or ''
+            except Exception:
+                version = ''
+        version = version.strip()
+        # Version names such as "1.2.3 beta" are legal in a filename, but the
+        # space makes the result awkward to type, so collapse whitespace runs.
+        version = re.sub(r'\s+', '_', version)
+        stem = f"{package}_{self._safe_ntfs_component(version)}" if version else package
+
+        entries = self.get_apk_paths(device_id, package)
+        target = Path(destination)
+        target.mkdir(parents=True, exist_ok=True)
+
+        if len(entries) == 1 and not entries[0]['split']:
+            local_path = target / f"{stem}.apk"
+            self.download_file(device_id, entries[0]['path'], str(local_path))
+            return {'path': str(local_path), 'members': [entries[0]['name']], 'is_split': False}
+
+        archive = target / f"{stem}.apks"
+        members: List[str] = []
+        # Pull into a scratch folder so the chosen destination only ever gains
+        # the finished file, never the loose base.apk / split_*.apk.
+        with tempfile.TemporaryDirectory(prefix='droidmgr-apk-') as scratch_dir:
+            with zipfile.ZipFile(archive, 'w', zipfile.ZIP_STORED) as bundle:
+                for entry in entries:
+                    scratch = Path(scratch_dir) / entry['name']
+                    self.download_file(device_id, entry['path'], str(scratch))
+                    bundle.write(scratch, arcname=entry['name'])
+                    members.append(entry['name'])
+        return {'path': str(archive), 'members': members, 'is_split': True}
 
 
 

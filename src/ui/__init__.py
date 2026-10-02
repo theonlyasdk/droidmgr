@@ -15,6 +15,7 @@ from .capture import (
     ScreenRecordDialog,
     ScreenRecordProgressDialog,
 )
+from .apk_extract import extract_apk
 from .llm_report_dialog import LLMReportDialog, LLMReportProgressDialog
 from .wireless_dialog import WirelessADBSetupDialog, ConnectWirelessDialog
 from .dpi import (
@@ -40,6 +41,7 @@ __all__ = [
     'record_screen',
     'ScreenRecordDialog',
     'ScreenRecordProgressDialog',
+    'extract_apk',
     'LLMReportDialog',
     'LLMReportProgressDialog',
     'WirelessADBSetupDialog',
