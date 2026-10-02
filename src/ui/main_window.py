@@ -23,6 +23,8 @@ from .app_info_dialog import AppInfoDialog, ProcessInfoDialog
 from .scrcpy_settings_dialog import ScrcpySettingsDialog
 from .scrcpy_output_dialog import ScrcpyOutputDialog
 from .device_details_dialog import DeviceDetailsDialog
+from .forward_dialog import ForwardDialog
+from .file_drop import enable_file_drop
 from .logcat_view import LogcatView
 from .shell_view import ShellView
 from .capture import take_screenshot, record_screen
@@ -201,6 +203,8 @@ class MainWindow:
         menubar.add_cascade(label="Tools", menu=tools_menu)
         tools_menu.add_command(label="Take Screenshot", command=self._take_screenshot)
         tools_menu.add_command(label="Record Screen...", command=self._record_screen)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Port Forwarding...", command=self._show_forward_dialog)
 
         
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -402,6 +406,12 @@ class MainWindow:
         self.app_tree.bind('<<TreeviewSelect>>', self._on_app_selection_change)
         self.app_tree.bind('<Double-1>', self._show_app_info)
         self.app_tree.bind('<Return>', self._show_app_info)
+
+        # Dropping APKs from Explorer installs them, when the platform supports it.
+        self.drop_supported = enable_file_drop(list_frame, self._on_files_dropped)
+        if self.drop_supported:
+            ttk.Label(list_frame, text="Drop .apk files here to install them",
+                      foreground='gray').pack(anchor='w', padx=4, pady=(2, 0))
 
 
 
@@ -1552,62 +1562,92 @@ class MainWindow:
 
 
 
-    def _install_apk(self):
+    def _on_files_dropped(self, paths):
+        """Install APKs dropped from Explorer onto the applications list."""
+        self._install_apk_paths(paths)
+
+    def _show_forward_dialog(self):
+        """Open the port forward manager for the selected device."""
         if not self._require_device():
             return
-        
+        ForwardDialog(self.root, self.selected_device, self.device_manager, self._set_status)
+
+    def _install_apk(self):
+        """Ask for an APK file and install it."""
+        if not self._require_device():
+            return
+
         apk_path = filedialog.askopenfilename(
             title="Select APK file",
             filetypes=[("APK files", "*.apk"), ("All files", "*.*")]
         )
-        
-        if not apk_path:
-            return
-        
-        path = Path(apk_path)
-        if not path.exists() or not path.is_file():
-            self._show_error("Invalid File", f"The selected file does not exist or is invalid:\n{apk_path}")
-            return
-            
-        if path.suffix.lower() != '.apk':
-            self._show_error("Invalid File", f"Selected file does not have a .apk extension:\n{apk_path}")
+
+        if apk_path:
+            self._install_apk_paths([apk_path])
+
+    def _install_apk_paths(self, paths):
+        """Install one or more APK files in turn, from the picker or a drop."""
+        if not self._require_device():
             return
 
-        file_size_mb = 0.0
-        try:
-            file_size_bytes = path.stat().st_size
-            file_size_mb = file_size_bytes / (1024 * 1024)
-            if file_size_mb > 500:
-                msg = (
-                    f"The selected APK file is very large ({file_size_mb:.1f} MB).\n\n"
-                    "Installing large applications over ADB may take several minutes.\n\n"
-                    "Do you want to proceed with the installation?"
-                )
-                if not messagebox.askyesno("Large File Warning", msg, icon=messagebox.WARNING):
-                    return
-        except Exception as e:
-            self._show_error("File Access Error", f"Failed to access file:\n{e}")
+        apks = [Path(p) for p in paths if Path(p).suffix.lower() == '.apk']
+        if not apks:
+            self._show_error("No APKs", "None of the selected files are .apk files.")
             return
 
+        sizes = []
+        for path in apks:
+            if not path.exists() or not path.is_file():
+                self._show_error("Invalid File", f"This file does not exist or is invalid:\n{path}")
+                return
+            sizes.append(path.stat().st_size / (1024 * 1024))
+
+        biggest_index = sizes.index(max(sizes))
+        if sizes[biggest_index] > 500:
+            msg = (
+                f"{apks[biggest_index].name} is very large ({sizes[biggest_index]:.1f} MB).\n\n"
+                "Installing large applications over ADB may take several minutes.\n\n"
+                "Do you want to proceed with the installation?"
+            )
+            if not messagebox.askyesno("Large File Warning", msg, icon=messagebox.WARNING):
+                return
+
+        total_mb = sum(sizes)
+        label = apks[0].name if len(apks) == 1 else f"{len(apks)} APKs"
         progress_dialog = None
-        if file_size_mb > 50:
-            progress_dialog = APKInstallProgressDialog(self.root, path.name, file_size_mb)
+        if total_mb > 50:
+            progress_dialog = APKInstallProgressDialog(self.root, label, total_mb)
+        device_id = self.selected_device
 
         def task():
-            try:
-                self.device_manager.adb.install_apk(self.selected_device, str(path))
-                if progress_dialog:
-                    self.root.after(0, progress_dialog.close)
-                self.root.after(0, lambda: self._show_info("APK installed successfully"))
-                self.root.after(0, lambda: self._refresh_apps())
-            except Exception as e:
-                if progress_dialog:
-                    self.root.after(0, progress_dialog.close)
-                msg = str(e)
-                self.root.after(0, lambda: self._show_error("Install APK Error", msg))
-        
-        self._set_status(f"Installing {path.name}...")
+            installed, failures = [], []
+            for path, size_mb in zip(apks, sizes):
+                try:
+                    self.device_manager.adb.install_apk(device_id, str(path))
+                    installed.append(path.name)
+                except Exception as e:
+                    failures.append(f"{path.name}: {e}")
+            if progress_dialog:
+                self.root.after(0, progress_dialog.close)
+            self.root.after(0, lambda: self._on_apks_installed(installed, failures))
+
+        self._set_status(f"Installing {label}...")
         threading.Thread(target=task, daemon=True).start()
+
+    def _on_apks_installed(self, installed, failures):
+        """Report the outcome of a batch install."""
+        if failures:
+            details = '\n'.join(failures)
+            if installed:
+                succeeded = '\n'.join(f'  {name}' for name in installed)
+                details = f"Installed:\n{succeeded}\n\nFailed:\n{details}"
+            self._show_error("Install APK Error", details)
+        elif len(installed) > 1:
+            names = '\n'.join(installed)
+            self._show_info(f"Installed {len(installed)} APKs:\n{names}")
+        else:
+            self._show_info("APK installed successfully")
+        self._refresh_apps()
 
 
     

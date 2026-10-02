@@ -164,6 +164,22 @@ class DeviceManager:
         """Ask the adb server to re-establish device connections."""
         return self.adb.reconnect_devices(offline)
 
+    def list_forwards(self, reverse: bool = False) -> List[Dict[str, str]]:
+        """List all port forwards (or reverse forwards) known to the adb server."""
+        return self.adb.list_forwards(reverse)
+
+    def add_forward(self, device_id: str, local: str, remote: str, reverse: bool = False) -> str:
+        """Forward a host port to a device port, or the reverse."""
+        return self.adb.add_forward(device_id, local, remote, reverse)
+
+    def remove_forward(self, device_id: str, local: str, reverse: bool = False) -> str:
+        """Remove a forward by its local endpoint."""
+        return self.adb.remove_forward(device_id, local, reverse)
+
+    def remove_all_forwards(self, device_id: Optional[str] = None, reverse: bool = False) -> str:
+        """Remove all forwards, for one device or for all of them."""
+        return self.adb.remove_all_forwards(device_id, reverse)
+
 
     
     def list_files(self, device_id: str, path: str = '/sdcard/', show_hidden: bool = True, use_exact_sizes: bool = False) -> List[Dict[str, Any]]:

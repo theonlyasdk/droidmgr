@@ -7,6 +7,8 @@ from .preferences_dialog import PreferencesDialog
 from .file_manager import FileManager
 from .scrcpy_output_dialog import ScrcpyOutputDialog
 from .device_details_dialog import DeviceDetailsDialog
+from .forward_dialog import ForwardDialog
+from .file_drop import enable_file_drop
 from .logcat_view import LogcatView
 from .shell_view import ShellView
 from .capture import (
@@ -35,6 +37,8 @@ __all__ = [
     'FileManager',
     'ScrcpyOutputDialog',
     'DeviceDetailsDialog',
+    'ForwardDialog',
+    'enable_file_drop',
     'LogcatView',
     'ShellView',
     'take_screenshot',

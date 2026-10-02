@@ -14,7 +14,7 @@ class APKInstallProgressDialog(tk.Toplevel):
         self.resizable(False, False)
         self.transient(parent)
         
-        frame = ttk.Frame(self, padx=20, pady=20)
+        frame = ttk.Frame(self, padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
         
         ttk.Label(
