@@ -98,6 +98,18 @@ class DeviceManager:
         """
         return self.adb.get_running_processes(device_id)
     
+    def sample_process_load(self, device_id: str, timeout: int = 20):
+        """Take one reading of the device's CPU and memory load.
+        
+        Args:
+            device_id: Device ID
+            timeout: Seconds to allow for the 'top' run
+            
+        Returns:
+            Dict with the process list, the device CPU summary and its memory summary
+        """
+        return self.adb.sample_process_load(device_id, timeout)
+    
     def kill_process(self, device_id: str, pid: str) -> None:
         """Kill a process on a device.
         

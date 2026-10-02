@@ -7,6 +7,7 @@ from .preferences_dialog import PreferencesDialog
 from .file_manager import FileManager
 from .scrcpy_output_dialog import ScrcpyOutputDialog
 from .device_details_dialog import DeviceDetailsDialog
+from .process_graph import ProcessHistoryWindow
 from .forward_dialog import ForwardDialog
 from .file_drop import enable_file_drop
 from .logcat_view import LogcatView
@@ -38,6 +39,7 @@ __all__ = [
     'FileManager',
     'ScrcpyOutputDialog',
     'DeviceDetailsDialog',
+    'ProcessHistoryWindow',
     'ForwardDialog',
     'enable_file_drop',
     'LogcatView',

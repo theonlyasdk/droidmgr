@@ -25,6 +25,7 @@ from .app_info_dialog import AppInfoDialog, ProcessInfoDialog
 from .scrcpy_settings_dialog import ScrcpySettingsDialog
 from .scrcpy_output_dialog import ScrcpyOutputDialog
 from .device_details_dialog import DeviceDetailsDialog
+from .process_graph import ProcessHistoryWindow
 from .forward_dialog import ForwardDialog
 from .file_drop import enable_file_drop
 from .logcat_view import LogcatView
@@ -393,10 +394,34 @@ class MainWindow:
         self.kill_process_btn = ttk.Button(btn_frame, text="Kill Process", command=self._kill_process)
         self.kill_process_btn.pack(side=tk.LEFT, padx=2)
         
+        self.process_graph_btn = ttk.Button(btn_frame, text="Process History", command=self._open_process_graph)
+        self.process_graph_btn.pack(side=tk.LEFT, padx=2)
+        
         self.copy_processes_btn = ttk.Button(btn_frame, text="Copy Process List", command=self._copy_processes_list)
         self.copy_processes_btn.pack(side=tk.RIGHT, padx=2)
         
         return tab
+    
+    
+    def _open_process_graph(self):
+        """Open the process history window, or point the open one at this device."""
+        if not self._require_device():
+            return
+        
+        window = getattr(self, 'process_history_window', None)
+        if window is not None and window.winfo_exists():
+            # Only reset when the device is a different one, so that clicking
+            # the button again just brings the window forward instead of
+            # throwing away the history it is holding.
+            if window.device_id != self.selected_device:
+                window.set_device(self.selected_device)
+            window.deiconify()
+            window.lift()
+            window.focus_force()
+            return
+        
+        self.process_history_window = ProcessHistoryWindow(
+            self.root, self.selected_device, self.device_manager)
 
     
     def _create_apps_tab(self):
@@ -714,6 +739,15 @@ class MainWindow:
                 
                 # Update file manager device reference
                 self.file_manager.selected_device = self.selected_device
+                
+                # An open history window follows the selection too. It is a
+                # window of its own rather than a tab, so nothing else reaches
+                # it, and without this it would keep graphing the device that
+                # was selected before.
+                window = getattr(self, 'process_history_window', None)
+                if (window is not None and window.winfo_exists()
+                        and window.device_id != self.selected_device):
+                    window.set_device(self.selected_device)
                 
                 # Only refresh the currently active tab
                 try:
