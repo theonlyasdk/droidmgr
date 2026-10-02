@@ -38,7 +38,7 @@ class AboutDialog:
         
         version = tk.Label(
             main_frame,
-            text="Version 0.1.0",
+            text="Version 1.0.0",
             font=('Arial', 10)
         )
         version.pack()

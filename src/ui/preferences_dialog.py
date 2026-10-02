@@ -248,7 +248,7 @@ class PreferencesDialog:
         info_frame = ttk.LabelFrame(tab, text="Application Information", padding=10)
         info_frame.pack(fill=tk.X, padx=10, pady=10)
         
-        ttk.Label(info_frame, text="Version: 0.1.0").pack(anchor=tk.W, pady=2)
+        ttk.Label(info_frame, text="Version: 1.0.0").pack(anchor=tk.W, pady=2)
         
         dir_frame = ttk.Frame(info_frame)
         dir_frame.pack(fill=tk.X, anchor=tk.W, pady=(10, 2))
