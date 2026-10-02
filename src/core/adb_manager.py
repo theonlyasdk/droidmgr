@@ -1909,6 +1909,95 @@ class ADBManager:
                 "Please verify the path in Preferences > External Tools."
             )
 
+    def capture_screenshot(self, device_id: str) -> bytes:
+        """Capture the current screen as PNG bytes (`adb exec-out screencap -p`).
+
+        Uses exec-out so the raw PNG stream is returned untouched, with no CRLF
+        translation that would corrupt the image.
+        """
+        if not device_id or not device_id.strip():
+            raise ValueError("Device ID cannot be empty.")
+        data = self._run_exec_out(['screencap', '-p'], device_id, timeout=30)
+        if not data.startswith(b'\x89PNG'):
+            raise ADBCommandError(
+                "Screen capture did not return a PNG image. "
+                "The device may have refused the request."
+            )
+        return data
+
+    def start_screenrecord(self, device_id: str, remote_path: str, time_limit: int = 180,
+                           bit_rate: Optional[str] = None,
+                           size: Optional[str] = None) -> subprocess.Popen:
+        """Start `adb shell screenrecord`, writing the video to a device path.
+
+        Args:
+            device_id: Device ID / serial number
+            remote_path: Absolute on-device path for the .mp4 file
+            time_limit: Maximum duration in seconds (Android caps this at 180)
+            bit_rate: Video bit rate (e.g. '8M'); device default when omitted
+            size: Size limit as WIDTHxHEIGHT (e.g. '1280x720'); device default when omitted
+
+        Returns:
+            A running subprocess.Popen. The recording keeps going until the time
+            limit is reached, or until stop_screenrecord() finalizes it.
+        """
+        if not device_id or not device_id.strip():
+            raise ValueError("Device ID cannot be empty.")
+        if not remote_path or not remote_path.strip():
+            raise ValueError("Remote recording path cannot be empty.")
+
+        args = ['shell', 'screenrecord']
+        if time_limit:
+            args.extend(['--time-limit', str(int(time_limit))])
+        if bit_rate:
+            args.extend(['--bit-rate', str(bit_rate)])
+        if size:
+            args.extend(['--size', str(size)])
+        args.append(remote_path)
+
+        cmd = [self.adb_path, '-s', device_id] + args
+        try:
+            return subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            raise ADBNotFoundError(
+                f"ADB executable not found at '{self.adb_path}'. "
+                "Please verify the path in Preferences > External Tools."
+            )
+
+    def stop_screenrecord(self, device_id: str) -> bool:
+        """Ask an on-device screenrecord to stop so it finalizes the MP4.
+
+        Terminating the local adb client would leave the device-side encoder
+        running and the file unfinalized, so SIGINT is sent to the device process
+        instead. screenrecord flushes and closes the file on SIGINT.
+
+        Returns:
+            True when the signal was delivered, False when the device-side
+            process could not be found or signalled.
+        """
+        if not device_id or not device_id.strip():
+            raise ValueError("Device ID cannot be empty.")
+        try:
+            output = self._run_command(['shell', 'pidof screenrecord'], device_id)
+        except ADBError:
+            return False
+        pids = [token for token in output.split() if token.isdigit()]
+        if not pids:
+            return False
+        try:
+            self._run_command(['shell', 'kill', '-INT'] + pids, device_id)
+        except ADBError:
+            return False
+        return True
+
 
 def _looks_like_unzip_error(data: bytes) -> bool:
     if not data:

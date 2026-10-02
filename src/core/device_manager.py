@@ -261,7 +261,20 @@ class DeviceManager:
     def start_shell_session(self, device_id: str, allocate_tty: bool = True):
         """Start an interactive `adb shell` session for a device."""
         return self.adb.start_shell_session(device_id, allocate_tty)
-    
+
+    def capture_screenshot(self, device_id: str) -> bytes:
+        """Capture the current screen as PNG bytes."""
+        return self.adb.capture_screenshot(device_id)
+
+    def start_screenrecord(self, device_id: str, remote_path: str, time_limit: int = 180,
+                           bit_rate: Optional[str] = None, size: Optional[str] = None):
+        """Start `adb shell screenrecord`, writing the video to a device path."""
+        return self.adb.start_screenrecord(device_id, remote_path, time_limit, bit_rate, size)
+
+    def stop_screenrecord(self, device_id: str) -> bool:
+        """Ask an on-device screenrecord to stop and finalize the MP4."""
+        return self.adb.stop_screenrecord(device_id)
+
     def cleanup(self) -> None:
         """Cleanup all resources."""
         self.scrcpy.stop_all()

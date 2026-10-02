@@ -25,6 +25,7 @@ from .scrcpy_output_dialog import ScrcpyOutputDialog
 from .device_details_dialog import DeviceDetailsDialog
 from .logcat_view import LogcatView
 from .shell_view import ShellView
+from .capture import take_screenshot, record_screen
 from .llm_report_dialog import LLMReportDialog, LLMReportProgressDialog
 from .wireless_dialog import ConnectWirelesslyDialog
 from .backup_dialog import BackupCancelToken, BackupOptionsDialog, BackupProgressDialog, RestoreSelectionDialog
@@ -102,6 +103,8 @@ class MainWindow:
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Tools", menu=tools_menu)
         tools_menu.add_command(label="Open Shell", command=self._open_shell_tab)
+        tools_menu.add_command(label="Take Screenshot", command=self._take_screenshot)
+        tools_menu.add_command(label="Record Screen...", command=self._record_screen)
 
         
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -623,6 +626,20 @@ class MainWindow:
         self.notebook.select(self.shell_tab)
         self.shell_view.set_device(self.selected_device)
         self.shell_view.focus_input()
+
+    def _take_screenshot(self):
+        """Tools > Take Screenshot: one click, then a save dialog."""
+        if not self._require_device():
+            return
+        take_screenshot(self.root, self.device_manager, self.selected_device,
+                        self._set_status, self._show_error, self._show_info)
+
+    def _record_screen(self):
+        """Tools > Record Screen: parameter dialog, then record, pull and open."""
+        if not self._require_device():
+            return
+        record_screen(self.root, self.device_manager, self.selected_device,
+                      self._set_status, self._show_error, self._show_info)
 
 
     def _on_device_double_click(self, event):

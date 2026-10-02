@@ -9,6 +9,8 @@ DEFAULT_SHELL_PRESETS = [
     {'name': 'IP Address', 'command': 'ip addr'},
     {'name': 'Properties', 'command': 'getprop'},
 ]
+# Android's screenrecord refuses to record for longer than this.
+MAX_RECORD_SECONDS = 180
 
 
 class ConfigManager:
@@ -50,6 +52,13 @@ class ConfigManager:
             },
             'shell': {
                 'presets': [dict(p) for p in DEFAULT_SHELL_PRESETS],
+            },
+            'capture': {
+                'screenshot_dir': '',
+                'record_dir': '',
+                'record_time_limit': 30,
+                'record_bit_rate': '',
+                'record_size': '',
             },
             'scrcpy': {
                 'video_bit_rate': '8M',
@@ -183,6 +192,20 @@ class ConfigManager:
             else:
                 print(f"Warning: Dropping malformed shell preset {item!r}.")
         shell['presets'] = cleaned
+
+        # Validate capture settings (screenshot/recording defaults)
+        capture = self.settings.setdefault('capture', {})
+        for key in ('screenshot_dir', 'record_dir', 'record_bit_rate', 'record_size'):
+            if not isinstance(capture.get(key), str):
+                capture[key] = ''
+        try:
+            limit = capture.get('record_time_limit')
+            if isinstance(limit, bool) or not isinstance(limit, (int, float)):
+                raise ValueError
+            capture['record_time_limit'] = max(1, min(int(limit), MAX_RECORD_SECONDS))
+        except (TypeError, ValueError):
+            print("Warning: Invalid capture.record_time_limit in config. Reverting to default 30.")
+            capture['record_time_limit'] = 30
 
 
     def _deep_merge(self, base, update):

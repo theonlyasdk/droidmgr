@@ -9,6 +9,12 @@ from .scrcpy_output_dialog import ScrcpyOutputDialog
 from .device_details_dialog import DeviceDetailsDialog
 from .logcat_view import LogcatView
 from .shell_view import ShellView
+from .capture import (
+    take_screenshot,
+    record_screen,
+    ScreenRecordDialog,
+    ScreenRecordProgressDialog,
+)
 from .llm_report_dialog import LLMReportDialog, LLMReportProgressDialog
 from .wireless_dialog import WirelessADBSetupDialog, ConnectWirelessDialog
 from .dpi import (
@@ -30,6 +36,10 @@ __all__ = [
     'DeviceDetailsDialog',
     'LogcatView',
     'ShellView',
+    'take_screenshot',
+    'record_screen',
+    'ScreenRecordDialog',
+    'ScreenRecordProgressDialog',
     'LLMReportDialog',
     'LLMReportProgressDialog',
     'WirelessADBSetupDialog',
