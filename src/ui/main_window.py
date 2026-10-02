@@ -365,10 +365,7 @@ class MainWindow:
     
     def _update_button_states(self):
         has_selection = self.selected_device is not None
-        is_ready = has_selection and (
-            self.device_manager.is_device_ready(self.selected_device)
-            if hasattr(self.device_manager, 'is_device_ready') else True
-        )
+        is_ready = has_selection and self.device_manager.is_device_ready(self.selected_device)
         ready_state = tk.NORMAL if is_ready else tk.DISABLED
         sel_state = tk.NORMAL if has_selection else tk.DISABLED
         
@@ -419,10 +416,7 @@ class MainWindow:
 
     def _update_app_button_states(self):
         has_device = self.selected_device is not None
-        is_ready = has_device and (
-            self.device_manager.is_device_ready(self.selected_device)
-            if hasattr(self.device_manager, 'is_device_ready') else True
-        )
+        is_ready = has_device and self.device_manager.is_device_ready(self.selected_device)
         has_app_selection = self._get_selected_package() is not None
         
         ready_state = tk.NORMAL if is_ready else tk.DISABLED
@@ -523,10 +517,8 @@ class MainWindow:
         try:
             self.device_manager = DeviceManager(self.adb_path, self.scrcpy_path)
             self.file_manager.device_manager = self.device_manager
-            if hasattr(self, 'logcat_view'):
-                self.logcat_view.device_manager = self.device_manager
-            if hasattr(self, 'shell_view'):
-                self.shell_view.device_manager = self.device_manager
+            self.logcat_view.device_manager = self.device_manager
+            self.shell_view.device_manager = self.device_manager
             self._set_status("Preferences updated")
             self._refresh_devices()
             
@@ -542,7 +534,7 @@ class MainWindow:
         if not self.selected_device:
             self._show_warning("Please select a device first")
             return False
-        if require_ready and hasattr(self.device_manager, 'is_device_ready'):
+        if require_ready:
             if not self.device_manager.is_device_ready(self.selected_device):
                 status = None
                 if hasattr(self.device_manager, 'get_device_status'):
@@ -717,15 +709,13 @@ class MainWindow:
                     self.device_tree.selection_set(children[curr_idx])
             else:
                 self.selected_device = None
-                if hasattr(self, 'logcat_view'):
-                    self.logcat_view.set_device(None)
+                self.logcat_view.set_device(None)
                 self._update_tab_visibility()
 
         except Exception as e:
             self.has_devices = False
             self.selected_device = None
-            if hasattr(self, 'logcat_view'):
-                self.logcat_view.set_device(None)
+            self.logcat_view.set_device(None)
             self._update_tab_visibility()
             self._set_status(f"Device refresh error: {e}")
 
@@ -845,24 +835,23 @@ class MainWindow:
             return
         
         # Check device readiness before querying
-        if hasattr(self.device_manager, 'is_device_ready'):
-            try:
-                if not self.device_manager.is_device_ready(self.selected_device):
-                    status = None
-                    if hasattr(self.device_manager, 'get_device_status'):
-                        status = self.device_manager.get_device_status(self.selected_device)
-                    status_str = status.lower() if status else 'offline'
-                    for item in self.process_tree.get_children():
-                        self.process_tree.delete(item)
-                    if status_str == 'unauthorized':
-                        msg = "Device is unauthorized. Please accept the USB debugging prompt on your phone screen."
-                    else:
-                        msg = "Device is offline. Reconnect USB cable or restart ADB."
-                    self.system_info_label.config(text=msg)
-                    self._set_status(f"Device '{self.selected_device}' is {status_str}.")
-                    return
-            except Exception:
-                pass
+        try:
+            if not self.device_manager.is_device_ready(self.selected_device):
+                status = None
+                if hasattr(self.device_manager, 'get_device_status'):
+                    status = self.device_manager.get_device_status(self.selected_device)
+                status_str = status.lower() if status else 'offline'
+                for item in self.process_tree.get_children():
+                    self.process_tree.delete(item)
+                if status_str == 'unauthorized':
+                    msg = "Device is unauthorized. Please accept the USB debugging prompt on your phone screen."
+                else:
+                    msg = "Device is offline. Reconnect USB cable or restart ADB."
+                self.system_info_label.config(text=msg)
+                self._set_status(f"Device '{self.selected_device}' is {status_str}.")
+                return
+        except Exception:
+            pass
 
         # Save selection and scroll position
         selected_items = self.process_tree.selection()
@@ -1095,24 +1084,23 @@ class MainWindow:
             return
         
         # Check device readiness before querying
-        if hasattr(self.device_manager, 'is_device_ready'):
-            try:
-                if not self.device_manager.is_device_ready(self.selected_device):
-                    status = None
-                    if hasattr(self.device_manager, 'get_device_status'):
-                        status = self.device_manager.get_device_status(self.selected_device)
-                    status_str = status.lower() if status else 'offline'
-                    for item in self.app_tree.get_children():
-                        self.app_tree.delete(item)
-                    self.app_listbox.delete(0, tk.END)
-                    tag_text = f"[Device is {status_str}]"
-                    self.app_listbox.insert(tk.END, tag_text)
-                    self.app_tree.insert('', tk.END, values=(tag_text, "", ""))
-                    self._update_app_button_states()
-                    self._set_status(f"Device '{self.selected_device}' is {status_str}.")
-                    return
-            except Exception:
-                pass
+        try:
+            if not self.device_manager.is_device_ready(self.selected_device):
+                status = None
+                if hasattr(self.device_manager, 'get_device_status'):
+                    status = self.device_manager.get_device_status(self.selected_device)
+                status_str = status.lower() if status else 'offline'
+                for item in self.app_tree.get_children():
+                    self.app_tree.delete(item)
+                self.app_listbox.delete(0, tk.END)
+                tag_text = f"[Device is {status_str}]"
+                self.app_listbox.insert(tk.END, tag_text)
+                self.app_tree.insert('', tk.END, values=(tag_text, "", ""))
+                self._update_app_button_states()
+                self._set_status(f"Device '{self.selected_device}' is {status_str}.")
+                return
+        except Exception:
+            pass
 
         mode = self.config.get('general', 'apps_view_mode', 'compact')
         self._update_apps_view_widget()
@@ -2135,16 +2123,14 @@ class MainWindow:
 
 
         self.taskbar_progress.close()
-        if hasattr(self, 'logcat_view'):
-            try:
-                self.logcat_view.destroy()
-            except Exception:
-                pass
-        if hasattr(self, 'shell_view'):
-            try:
-                self.shell_view.destroy()
-            except Exception:
-                pass
+        try:
+            self.logcat_view.destroy()
+        except Exception:
+            pass
+        try:
+            self.shell_view.destroy()
+        except Exception:
+            pass
         self.device_manager.cleanup()
         self.root.destroy()
     
