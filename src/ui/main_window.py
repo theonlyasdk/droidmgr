@@ -33,6 +33,32 @@ from .taskbar_progress import TaskbarProgress
 from .dpi import enable_dpi_awareness, setup_window_dpi, scale_size
 
 
+_OFFLINE_ERROR_KEYWORDS = [
+    'device offline', 'offline or unauthorized', 'device not found',
+    'no devices/emulators found', 'disconnected', 'closed', 'unauthorized'
+]
+
+_MEMORY_UNITS = {
+    'B': 1,
+    'KB': 1024,
+    'MB': 1024 * 1024,
+    'GB': 1024 * 1024 * 1024
+}
+
+
+def _is_offline_error(msg: str) -> bool:
+    """Whether an exception message describes an unreachable or unauthorized device."""
+    lower_msg = msg.lower()
+    return any(keyword in lower_msg for keyword in _OFFLINE_ERROR_KEYWORDS)
+
+
+def _parse_memory(val: str) -> int:
+    """Parse a process memory string such as '12.5 MB' into a byte count."""
+    parts = str(val).split()
+    num = float(parts[0])
+    unit = parts[1].upper() if len(parts) > 1 else 'B'
+    return int(num * _MEMORY_UNITS.get(unit, 1))
+
 
 class MainWindow:
     
@@ -892,17 +918,7 @@ class MainWindow:
                                 return 0.0
                         elif col == 'Memory':
                             try:
-                                val = proc.get('mem', '0 MB')
-                                parts = val.split()
-                                num = float(parts[0])
-                                unit = parts[1].upper() if len(parts) > 1 else 'B'
-                                multiplier = {
-                                    'B': 1,
-                                    'KB': 1024,
-                                    'MB': 1024 * 1024,
-                                    'GB': 1024 * 1024 * 1024
-                                }.get(unit, 1)
-                                return num * multiplier
+                                return _parse_memory(proc.get('mem', '0 MB'))
                             except Exception:
                                 return 0.0
                         elif col == 'User':
@@ -967,12 +983,7 @@ class MainWindow:
                 self.root.after(0, lambda: self._set_status("Process query timed out after 15 seconds."))
             except Exception as e:
                 msg = str(e)
-                lower_msg = msg.lower()
-                is_offline = any(keyword in lower_msg for keyword in [
-                    'device offline', 'offline or unauthorized', 'device not found',
-                    'no devices/emulators found', 'disconnected', 'closed', 'unauthorized'
-                ])
-                if is_offline:
+                if _is_offline_error(msg):
                     def handle_offline():
                         for item in self.process_tree.get_children():
                             self.process_tree.delete(item)
@@ -1167,11 +1178,7 @@ class MainWindow:
             except Exception as e:
                 msg = str(e)
                 lower_msg = msg.lower()
-                is_offline = any(keyword in lower_msg for keyword in [
-                    'device offline', 'offline or unauthorized', 'device not found',
-                    'no devices/emulators found', 'disconnected', 'closed', 'unauthorized'
-                ])
-                if is_offline:
+                if _is_offline_error(msg):
                     def handle_offline():
                         for item in self.app_tree.get_children():
                             self.app_tree.delete(item)
@@ -2091,16 +2098,7 @@ class MainWindow:
                     return 0.0
             elif col == 'Memory':
                 try:
-                    parts = val.split()
-                    num = float(parts[0])
-                    unit = parts[1].upper() if len(parts) > 1 else 'B'
-                    multiplier = {
-                        'B': 1,
-                        'KB': 1024,
-                        'MB': 1024 * 1024,
-                        'GB': 1024 * 1024 * 1024
-                    }.get(unit, 1)
-                    return num * multiplier
+                    return _parse_memory(val)
                 except Exception:
                     return 0.0
             else:
