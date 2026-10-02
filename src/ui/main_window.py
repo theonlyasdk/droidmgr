@@ -3,7 +3,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import os
-from typing import Optional
+from typing import List, Optional
 from pathlib import Path
 import threading
 import re
@@ -46,6 +46,25 @@ _MEMORY_UNITS = {
     'MB': 1024 * 1024,
     'GB': 1024 * 1024 * 1024
 }
+
+CORE_SYSTEM_PACKAGES = {
+    'com.android.settings', 'com.android.systemui', 'com.android.launcher',
+    'com.android.launcher3', 'com.google.android.apps.nexuslauncher',
+    'com.google.android.gms', 'com.android.vending', 'com.android.packageinstaller',
+    'com.google.android.packageinstaller', 'com.android.phone', 'com.android.providers.telephony',
+    'com.android.shell', 'com.android.bluetooth', 'com.android.camera2', 'com.android.keychain',
+    'com.android.location.fused', 'com.android.nfc', 'com.android.se', 'com.android.inputmethod.latin'
+}
+
+SYSTEM_APP_PATHS = ('/system', '/product', '/vendor', '/system_ext', '/odm', '/apex')
+
+
+def _looks_like_system_package(package: str, app_path: str = '') -> bool:
+    """Whether a package sits in a system image or is a known core app."""
+    if app_path and app_path.startswith(SYSTEM_APP_PATHS):
+        return True
+    return (package in CORE_SYSTEM_PACKAGES
+            or package.startswith(('com.android.', 'com.google.android.')))
 
 
 def _is_offline_error(msg: str) -> bool:
@@ -319,7 +338,8 @@ class MainWindow:
         # 1. Compact View Frame (Listbox)
         self.app_listbox_frame = ttk.Frame(list_frame)
         scrollbar_lb = ttk.Scrollbar(self.app_listbox_frame, orient=tk.VERTICAL)
-        self.app_listbox = tk.Listbox(self.app_listbox_frame, yscrollcommand=scrollbar_lb.set)
+        self.app_listbox = tk.Listbox(self.app_listbox_frame, yscrollcommand=scrollbar_lb.set,
+                                      selectmode=tk.MULTIPLE)
         scrollbar_lb.configure(command=self.app_listbox.yview)
         self.app_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar_lb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -330,7 +350,8 @@ class MainWindow:
         # 2. Detailed View Frame (Treeview)
         self.app_tree_frame = ttk.Frame(list_frame)
         columns = ('Name', 'Package', 'Size')
-        self.app_tree = ttk.Treeview(self.app_tree_frame, columns=columns, show='headings')
+        self.app_tree = ttk.Treeview(self.app_tree_frame, columns=columns, show='headings',
+                                     selectmode='extended')
         for col in columns:
             self.app_tree.heading(col, text=col)
         self.app_tree.column('Name', width=scale_size(220, self.root))
@@ -433,20 +454,45 @@ class MainWindow:
             self.app_tree_frame.pack_forget()
             self.app_listbox_frame.pack(fill=tk.BOTH, expand=True)
 
-    def _get_selected_package(self) -> Optional[str]:
+    def _get_selected_packages(self) -> List[str]:
+        """Every selected package, in the order the rows appear in the view."""
         mode = self.config.get('general', 'apps_view_mode', 'compact')
         if mode == 'detailed':
-            selection = self.app_tree.selection()
-            if selection:
-                item = self.app_tree.item(selection[0])
-                values = item['values']
+            selected = set(self.app_tree.selection())
+            packages = []
+            for item_id in self.app_tree.get_children(''):
+                if item_id not in selected:
+                    continue
+                values = self.app_tree.item(item_id, 'values')
+                if values and len(values) >= 2 and values[1]:
+                    packages.append(values[1])
+            return packages
+        return [self.app_listbox.get(index) for index in self.app_listbox.curselection()]
+
+    def _get_selected_package(self) -> Optional[str]:
+        """The package the single-app actions act on.
+
+        With several rows selected this is the focused one, so Ctrl+clicking a
+        pile of apps and then hitting Start still does something predictable.
+        """
+        packages = self._get_selected_packages()
+        if not packages:
+            return None
+
+        focused = None
+        mode = self.config.get('general', 'apps_view_mode', 'compact')
+        if mode == 'detailed':
+            focus_id = self.app_tree.focus()
+            if focus_id:
+                values = self.app_tree.item(focus_id, 'values')
                 if values and len(values) >= 2:
-                    return values[1]
+                    focused = values[1]
         else:
-            selection = self.app_listbox.curselection()
-            if selection:
-                return self.app_listbox.get(selection[0])
-        return None
+            focus_index = self.app_listbox.focus()
+            if focus_index is not None:
+                focused = self.app_listbox.get(focus_index)
+
+        return focused if focused in packages else packages[0]
 
     def _update_app_button_states(self):
         has_device = self.selected_device is not None
@@ -1141,7 +1187,7 @@ class MainWindow:
 
         mode = self.config.get('general', 'apps_view_mode', 'compact')
         self._update_apps_view_widget()
-        selected_package = self._get_selected_package()
+        selected_packages = set(self._get_selected_packages())
         
         yview_tree = self.app_tree.yview()
         yview_lb = self.app_listbox.yview()
@@ -1154,18 +1200,18 @@ class MainWindow:
                         for item in self.app_tree.get_children():
                             self.app_tree.delete(item)
                         
-                        target_id = None
+                        target_ids = []
                         for app in apps_details:
                             item_id = self.app_tree.insert(
                                 '', tk.END,
                                 values=(app['name'], app['package'], app['size'])
                             )
-                            if selected_package and app['package'] == selected_package:
-                                target_id = item_id
-                                
-                        if target_id:
-                            self.app_tree.selection_set(target_id)
-                            self.app_tree.focus(target_id)
+                            if app['package'] in selected_packages:
+                                target_ids.append(item_id)
+
+                        if target_ids:
+                            self.app_tree.selection_set(target_ids)
+                            self.app_tree.focus(target_ids[0])
                             
                         if yview_tree:
                             self.app_tree.yview_moveto(yview_tree[0])
@@ -1180,10 +1226,11 @@ class MainWindow:
                         for app in apps:
                             self.app_listbox.insert(tk.END, app)
                             
-                        if selected_package and selected_package in apps:
-                            idx = apps.index(selected_package)
-                            self.app_listbox.selection_set(idx)
-                            self.app_listbox.activate(idx)
+                        if selected_packages:
+                            indices = sorted(apps.index(pkg) for pkg in selected_packages if pkg in apps)
+                            if indices:
+                                self.app_listbox.selection_set(indices)
+                                self.app_listbox.activate(indices[0])
                             
                         if yview_lb:
                             self.app_listbox.yview_moveto(yview_lb[0])
@@ -1222,6 +1269,9 @@ class MainWindow:
 
     def _on_app_selection_change(self, event):
         self._update_app_button_states()
+        count = len(self._get_selected_packages())
+        if count > 1:
+            self._set_status(f"{count} applications selected")
 
     def _show_app_info(self, event=None):
         package = self._get_selected_package()
@@ -1277,37 +1327,84 @@ class MainWindow:
     def _uninstall_app(self):
         if not self._require_device():
             return
-            
-        package = self._get_selected_package()
-        if not package:
+
+        packages = self._get_selected_packages()
+        if not packages:
             self._show_warning("Please select an application to uninstall")
             return
 
         device_id = self.selected_device
-        
-        # Fetch app details for path and system app classification
+
+        if len(packages) > 1:
+            self._confirm_bulk_uninstall(packages)
+        else:
+            if not self._confirm_single_uninstall(device_id, packages[0]):
+                return
+
+        self._set_status(f"Uninstalling {len(packages)} "
+                         f"application{'s' if len(packages) > 1 else ''}...")
+
+        def task():
+            failed = []
+            for package in packages:
+                try:
+                    self.device_manager.uninstall_app(device_id, package)
+                except Exception:
+                    failed.append(package)
+            self.root.after(0, self._refresh_apps)
+            if failed:
+                detail = '\n'.join(failed)
+                self.root.after(0, lambda: self._show_error(
+                    "Uninstall Error",
+                    f"{len(failed)} of {len(packages)} could not be uninstalled:\n{detail}"))
+            elif len(packages) == 1:
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Success", f"Successfully uninstalled {packages[0]}"))
+            else:
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Success", f"Successfully uninstalled {len(packages)} applications"))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _confirm_bulk_uninstall(self, packages: List[str]) -> bool:
+        """One confirmation for a multi-app uninstall, with a system-app warning."""
+        risky = [pkg for pkg in packages if _looks_like_system_package(pkg)]
+        if risky:
+            listed = '\n'.join(risky[:10])
+            if len(risky) > 10:
+                listed += f"\n  ... and {len(risky) - 10} more"
+            if not messagebox.askyesno(
+                    "Warning - System Applications",
+                    f"{len(risky)} of the {len(packages)} selected applications look like "
+                    f"system or core apps:\n\n{listed}\n\n"
+                    "Uninstalling them can break core functionality, cause boot loops, "
+                    "or disable system services.\n\nDo you want to proceed?",
+                    icon=messagebox.WARNING):
+                return False
+            if not messagebox.askyesno(
+                    "Critical Confirmation",
+                    "You selected system or core applications. Your device may become "
+                    "unusable.\n\nAre you ABSOLUTELY sure you want to proceed?",
+                    icon=messagebox.WARNING):
+                return False
+
+        listed = '\n'.join(f"  - {pkg}" for pkg in packages[:10])
+        if len(packages) > 10:
+            listed += f"\n  ... and {len(packages) - 10} more"
+        return messagebox.askyesno(
+            "Confirm Uninstall",
+            f"Are you sure you want to uninstall {len(packages)} applications?\n\n{listed}")
+
+    def _confirm_single_uninstall(self, device_id: str, package: str) -> bool:
+        """The original per-app checks, including the exact install path."""
         app_path = ""
-        is_system_app = False
         try:
             info = self.device_manager.adb.get_app_info(device_id, package)
             app_path = info.get('path', '')
         except Exception:
             pass
 
-        CORE_SYSTEM_PACKAGES = {
-            'com.android.settings', 'com.android.systemui', 'com.android.launcher',
-            'com.android.launcher3', 'com.google.android.apps.nexuslauncher',
-            'com.google.android.gms', 'com.android.vending', 'com.android.packageinstaller',
-            'com.google.android.packageinstaller', 'com.android.phone', 'com.android.providers.telephony',
-            'com.android.shell', 'com.android.bluetooth', 'com.android.camera2', 'com.android.keychain',
-            'com.android.location.fused', 'com.android.nfc', 'com.android.se', 'com.android.inputmethod.latin'
-        }
-
-        if app_path.startswith(('/system', '/product', '/vendor', '/system_ext', '/odm', '/apex')) or \
-           package in CORE_SYSTEM_PACKAGES or \
-           package.startswith(('com.android.', 'com.google.android.')):
-            is_system_app = True
-
+        is_system_app = _looks_like_system_package(package, app_path)
         app_type = "System Application" if is_system_app else "User Application"
         path_display = app_path if app_path else "Unknown"
 
@@ -1321,7 +1418,7 @@ class MainWindow:
                 "Do you want to proceed?"
             )
             if not messagebox.askyesno("Warning - System Application", msg1, icon=messagebox.WARNING):
-                return
+                return False
 
             msg2 = (
                 f"This is a system application ({package}).\n\n"
@@ -1329,7 +1426,7 @@ class MainWindow:
                 "Are you ABSOLUTELY sure you want to proceed and uninstall this application?"
             )
             if not messagebox.askyesno("Critical Confirmation", msg2, icon=messagebox.WARNING):
-                return
+                return False
         else:
             msg = (
                 f"Are you sure you want to uninstall this application?\n\n"
@@ -1338,20 +1435,8 @@ class MainWindow:
                 f"Install Path: {path_display}"
             )
             if not messagebox.askyesno("Confirm Uninstall", msg):
-                return
-
-        self._set_status(f"Uninstalling {package}...")
-        
-        def task():
-            try:
-                self.device_manager.uninstall_app(device_id, package)
-                self.root.after(0, self._refresh_apps)
-                self.root.after(0, lambda: messagebox.showinfo("Success", f"Successfully uninstalled {package}"))
-            except Exception as e:
-                msg = str(e)
-                self.root.after(0, lambda: self._show_error("Uninstall Error", msg))
-                
-        threading.Thread(target=task, daemon=True).start()
+                return False
+        return True
 
 
 
