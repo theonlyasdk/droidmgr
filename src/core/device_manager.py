@@ -144,6 +144,10 @@ class DeviceManager:
         """Get detailed list of installed applications."""
         return self.adb.get_installed_apps_details(device_id)
 
+    def get_health_stats(self, device_id: str) -> Dict[str, Any]:
+        """Get battery, storage, temperature, uptime and WiFi in one pass."""
+        return self.adb.get_health_stats(device_id)
+
 
     
     def list_files(self, device_id: str, path: str = '/sdcard/', show_hidden: bool = True, use_exact_sizes: bool = False) -> List[Dict[str, Any]]:

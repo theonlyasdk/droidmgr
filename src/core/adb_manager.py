@@ -140,6 +140,186 @@ def _display_app_name(package: str) -> str:
     return segments[-1].replace('_', ' ').replace('-', ' ').strip().title()
 
 
+# Reads the device state that a health dashboard shows, one entry per source.
+UNAVAILABLE = 'Unavailable'
+
+_BATTERY_STATUS = {1: 'Unknown', 2: 'Charging', 3: 'Discharging', 4: 'Not charging', 5: 'Full'}
+_BATTERY_HEALTH = {1: 'Unknown', 2: 'Good', 3: 'Overheating', 4: 'Dead',
+                   5: 'Over voltage', 6: 'Unspecified failure', 7: 'Cold'}
+_THERMAL_STATUS = {0: 'None', 1: 'Light throttling', 2: 'Moderate throttling',
+                   3: 'Severe throttling', 4: 'Critical', 5: 'Emergency',
+                   6: 'Shutdown imminent'}
+
+_WIFI_SSID = re.compile(r'SSID:\s*([^,\n]+)')
+_WIFI_RSSI = re.compile(r'RSSI:\s*(-?\d+)')
+_WIFI_STATE = re.compile(r'[Ss]upplicant state:\s*(\w+)')
+_WIFI_ON = re.compile(r'wi-?fi\s+is\s+enabled', re.I)
+_WIFI_OFF = re.compile(r'wi-?fi\s+is\s+disabled', re.I)
+
+# A thermal entry holds mName and mValue in either order, and different Android
+# releases disagree on which comes first. '[^{}]*?' keeps the two inside the same
+# entry so a sensor cannot pick up its neighbour's reading.
+_THERMAL_ENTRY = re.compile(
+    r'mName=([^\s,}]+)[^{}]*?mValue=(-?\d+(?:\.\d+)?)'
+    r'|mValue=(-?\d+(?:\.\d+)?)[^{}]*?mName=([^\s,}]+)')
+
+
+def _parse_battery_dump(output: str) -> Dict[str, Any]:
+    """Pull level, charging state, health and temperature out of 'dumpsys battery'."""
+    fields = {}
+    for line in output.splitlines():
+        if ':' not in line:
+            continue
+        key, _, value = line.partition(':')
+        fields[key.strip().lower()] = value.strip()
+
+    def as_int(key: str) -> Optional[int]:
+        try:
+            return int(fields.get(key, ''))
+        except ValueError:
+            return None
+
+    powered = [label for key, label in (('ac powered', 'AC'), ('usb powered', 'USB'),
+                                         ('wireless powered', 'Wireless'))
+               if fields.get(key) == 'true']
+    level = as_int('level')
+    temperature = as_int('temperature')
+
+    return {
+        'level': level,
+        'status': _BATTERY_STATUS.get(as_int('status'), UNAVAILABLE),
+        'health': _BATTERY_HEALTH.get(as_int('health'), UNAVAILABLE),
+        # dumpsys reports temperature in tenths of a degree Celsius
+        'temperature': round(temperature / 10, 1) if temperature is not None else None,
+        'voltage': as_int('voltage'),
+        'technology': fields.get('technology') or UNAVAILABLE,
+        'powered_by': ', '.join(powered) if powered else 'None',
+    }
+
+
+def _df_field_to_bytes(text: str) -> int:
+    """Convert one 'df' size column to bytes, for both the 1K-block and -h forms."""
+    text = text.strip()
+    if not text:
+        return 0
+    units = {'K': 1024, 'M': 1024 ** 2, 'G': 1024 ** 3, 'T': 1024 ** 4}
+    suffix = text[-1].upper()
+    if suffix.isdigit():
+        return int(text) * 1024
+    multiplier = units.get(suffix)
+    if multiplier is None:
+        return 0
+    try:
+        return int(float(text[:-1]) * multiplier)
+    except ValueError:
+        return 0
+
+
+def _parse_df(output: str) -> Dict[str, Any]:
+    """Pull the primary user storage figures out of 'df' output.
+
+    toybox wraps long filesystem names onto a second line, so fields are
+    gathered across lines until a row's use% column turns up.
+    """
+    rows = []
+    buffer: List[str] = []
+    for line in output.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if fields[0].lower().startswith('filesystem'):
+            buffer = []
+            continue
+        buffer.extend(fields)
+        if len(buffer) < 6 or not buffer[4].endswith('%'):
+            continue
+        try:
+            percent = int(buffer[4].rstrip('%'))
+        except ValueError:
+            buffer = []
+            continue
+        rows.append({
+            'mount': buffer[5],
+            'total': _df_field_to_bytes(buffer[1]),
+            'used': _df_field_to_bytes(buffer[2]),
+            'free': _df_field_to_bytes(buffer[3]),
+            'percent': percent,
+        })
+        buffer = []
+
+    if not rows:
+        return {}
+    # /data holds installed apps and user media; / is the fallback.
+    for preferred in ('/data', '/', '/storage/emulated/0'):
+        for row in rows:
+            if row['mount'] == preferred:
+                return row
+    return rows[0]
+
+
+def _parse_thermal_dump(output: str) -> Dict[str, Any]:
+    """Pull sensor temperatures out of 'dumpsys thermalservice'.
+
+    The dump layout is rearranged between Android releases, so sensors are
+    matched by key name wherever they appear rather than by line position.
+    """
+    sensors: Dict[str, float] = {}
+    for match in _THERMAL_ENTRY.finditer(output):
+        name = match.group(1) or match.group(4)
+        value = match.group(2) or match.group(3)
+        sensors[name] = float(value)
+    if not sensors:
+        return {}
+
+    def pick(*needles: str) -> Optional[float]:
+        for name, value in sensors.items():
+            if any(needle in name.upper() for needle in needles):
+                return value
+        return None
+
+    status = re.search(r'^\s*Thermal Status:\s*(\d+)', output, re.M)
+    return {
+        'cpu': pick('CPU', 'CPUS', 'SOC'),
+        'battery': pick('BATTERY'),
+        'skin': pick('SKIN'),
+        'max': max(sensors.values()),
+        'status': _THERMAL_STATUS.get(int(status.group(1)), UNAVAILABLE) if status else UNAVAILABLE,
+    }
+
+
+def _parse_uptime(output: str) -> float:
+    """Seconds of uptime from /proc/uptime."""
+    try:
+        return float(output.split()[0])
+    except (IndexError, ValueError):
+        return 0.0
+
+
+def _parse_wifi_status(output: str) -> Dict[str, Any]:
+    """Pull SSID, signal and state out of 'cmd wifi status' or 'dumpsys wifi'."""
+    text = output.strip()
+    enabled = None
+    if _WIFI_ON.search(text):
+        enabled = True
+    elif _WIFI_OFF.search(text):
+        enabled = False
+
+    ssid = _WIFI_SSID.search(text)
+    rssi = _WIFI_RSSI.search(text)
+    state = _WIFI_STATE.search(text)
+
+    name = ssid.group(1).strip().strip('"') if ssid else ''
+    if name.startswith('<'):
+        name = ''
+
+    return {
+        'enabled': enabled,
+        'ssid': name,
+        'rssi': int(rssi.group(1)) if rssi else None,
+        'state': state.group(1) if state else '',
+    }
+
+
 
 
 
@@ -1433,6 +1613,45 @@ class ADBManager:
             clean_lines = [l.strip() for l in output.splitlines() if l.strip() and not l.startswith('Filesystem')]
             info['summary'] = " | ".join(clean_lines[:5])
         return info
+
+    def get_health_stats(self, device_id: str) -> Dict[str, Any]:
+        """Battery, storage, temperature, uptime and WiFi in one pass.
+
+        The five readings are independent, so their adb calls run concurrently.
+        A device that refuses one of them still reports the rest: each section
+        comes back empty or filled with UNAVAILABLE rather than raising.
+        """
+        jobs = {
+            'battery': lambda: self._run_command(['shell', 'dumpsys', 'battery'], device_id, timeout=15),
+            'storage': lambda: self._run_command(['shell', 'df'], device_id, timeout=15),
+            'thermal': lambda: self._run_command(['shell', 'dumpsys', 'thermalservice'], device_id, timeout=15),
+            'uptime': lambda: self._run_command(['shell', 'cat', '/proc/uptime'], device_id, timeout=15),
+            'wifi': lambda: self._run_command(['shell', 'cmd', 'wifi', 'status'], device_id, timeout=15),
+        }
+
+        raw: Dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            futures = {name: pool.submit(job) for name, job in jobs.items()}
+            for name, future in futures.items():
+                try:
+                    raw[name] = future.result()
+                except Exception:
+                    raw[name] = ''
+
+        # 'cmd wifi status' only exists from Android 10; older builds need the dump.
+        if not _WIFI_SSID.search(raw['wifi']):
+            try:
+                raw['wifi'] = self._run_command(['shell', 'dumpsys', 'wifi'], device_id, timeout=15)
+            except Exception:
+                pass
+
+        return {
+            'battery': _parse_battery_dump(raw['battery']),
+            'storage': _parse_df(raw['storage']),
+            'thermal': _parse_thermal_dump(raw['thermal']),
+            'uptime': _parse_uptime(raw['uptime']),
+            'wifi': _parse_wifi_status(raw['wifi']),
+        }
 
     def get_battery_info(self, device_id: str) -> str:
         """Fetch battery level and charging status."""
