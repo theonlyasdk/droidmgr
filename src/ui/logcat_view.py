@@ -144,6 +144,19 @@ class LogcatView:
         self.log_text.tag_configure('E', foreground='#cc0000')
         self.log_text.tag_configure('F', foreground='#cc0000', font=('Monospace', 9, 'bold'))
 
+        # Right-click context menu
+        self.log_menu = tk.Menu(self.log_text, tearoff=0)
+        self.log_menu.add_command(label="Copy", command=self._copy_selection)
+        self.log_menu.add_command(label="Copy All", command=self._copy_all)
+        self.log_menu.add_command(label="Select All", command=self._select_all)
+        self.log_menu.add_separator()
+        self.log_menu.add_command(label="Pause", command=self._toggle_pause)
+        self._pause_menu_index = self.log_menu.index('end')
+        self.log_menu.add_command(label="Export...", command=self._export)
+        self.log_menu.add_separator()
+        self.log_menu.add_command(label="Clear", command=self.clear)
+        self.log_text.bind('<Button-3>', self._show_log_menu)
+
     # -- device lifecycle ----------------------------------------------
 
     def set_device(self, device_id, force_refresh=False, autostart=False):
@@ -390,6 +403,42 @@ class LogcatView:
             self._refilter()
         else:
             self._update_status()
+
+    def _show_log_menu(self, event):
+        try:
+            self.log_menu.entryconfig(
+                self._pause_menu_index,
+                label="Resume" if self.paused else "Pause")
+            self.log_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.log_menu.grab_release()
+
+    def _copy_selection(self):
+        try:
+            text = self.log_text.get('sel.first', 'sel.end')
+        except tk.TclError:
+            self._set_status("No log text selected")
+            return
+        self._copy_to_clipboard(text)
+        count = text.count('\n') + 1
+        self._set_status(f"Copied {count} line{'' if count == 1 else 's'} to clipboard")
+
+    def _copy_all(self):
+        self._select_all()
+        self._copy_selection()
+
+    def _select_all(self):
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.tag_add('sel', '1.0', tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+        self.log_text.see('1.0')
+
+    def _copy_to_clipboard(self, text):
+        self.log_text.clipboard_clear()
+        self.log_text.clipboard_append(text)
+        # Tk owns the clipboard while the app runs; update() makes it persist
+        # after the widget is garbage collected on exit.
+        self.log_text.update()
 
     def clear(self):
         with self.buffer_lock:
