@@ -85,6 +85,17 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{size:.1f} GB"
 
 
+def _app_sort_key(app: dict, col: str):
+    """Sort key for one app entry, keyed by the app list's column name.
+
+    Sorting happens on the raw values rather than the rendered cells so that
+    Size orders by exact bytes instead of the rounded '4.6 MB' text.
+    """
+    if col == 'Size':
+        return app.get('size_bytes', 0)
+    return str(app.get(col.lower(), '') or '').lower()
+
+
 def _parse_memory(val: str) -> int:
     """Parse a process memory string such as '12.5 MB' into a byte count."""
     parts = str(val).split()
@@ -348,11 +359,14 @@ class MainWindow:
         list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
         # Applications list
+        self.app_sort_col = 'Name'
+        self.app_sort_reverse = False
         columns = ('Name', 'Package', 'Type', 'Size')
         self.app_tree = ttk.Treeview(list_frame, columns=columns, show='headings',
                                      selectmode='extended')
         for col in columns:
-            self.app_tree.heading(col, text=col)
+            self.app_tree.heading(col, text=col,
+                                  command=lambda c=col: self._sort_apps_by_column(c))
         self.app_tree.column('Name', width=scale_size(200, self.root))
         self.app_tree.column('Package', width=scale_size(300, self.root))
         self.app_tree.column('Type', width=scale_size(80, self.root), anchor='center')
@@ -1179,6 +1193,13 @@ class MainWindow:
         def task():
             try:
                 apps_details = self.device_manager.get_installed_apps_details(self.selected_device)
+
+                # Re-apply the column sort so a refresh does not snap back to name order
+                sort_col = getattr(self, 'app_sort_col', None)
+                if sort_col:
+                    apps_details.sort(key=lambda app: _app_sort_key(app, sort_col),
+                                      reverse=self.app_sort_reverse)
+
                 def update():
                     for item in self.app_tree.get_children():
                         self.app_tree.delete(item)
@@ -2187,6 +2208,39 @@ class MainWindow:
             self.process_tree.move(k, '', index)
             
         self._set_status(f"Sorted processes by {col} ({'descending' if self.process_sort_reverse else 'ascending'})")
+
+    def _sort_apps_by_column(self, col):
+        """Sort the applications list by a heading click, toggling the direction."""
+        if getattr(self, 'app_sort_col', None) == col:
+            self.app_sort_reverse = not self.app_sort_reverse
+        else:
+            self.app_sort_col = col
+            # Biggest first for Size, alphabetical for everything else
+            self.app_sort_reverse = col == 'Size'
+
+        self._apply_app_sort()
+        direction = 'descending' if self.app_sort_reverse else 'ascending'
+        self._set_status(f"Sorted applications by {col} ({direction})")
+
+    def _apply_app_sort(self):
+        """Reorder the rows already listed, without re-querying the device."""
+        col = getattr(self, 'app_sort_col', None)
+        if not col:
+            return
+
+        def row_key(item_id):
+            val = self.app_tree.set(item_id, col)
+            if col == 'Size':
+                try:
+                    return _parse_memory(val)
+                except Exception:
+                    return 0
+            return val.lower()
+
+        items = [(row_key(item_id), item_id) for item_id in self.app_tree.get_children('')]
+        items.sort(key=lambda pair: pair[0], reverse=self.app_sort_reverse)
+        for index, (_, item_id) in enumerate(items):
+            self.app_tree.move(item_id, '', index)
 
 
         
