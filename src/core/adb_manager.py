@@ -19,6 +19,126 @@ import zipfile
 from .audit_logger import AuditLogger
 from . import apk_icon
 
+# An app installed under one of these paths is part of the system image.
+SYSTEM_APP_PATHS = ('/system', '/product', '/vendor', '/system_ext', '/odm', '/apex')
+
+# Package ids that name their app something other than the last dotted segment.
+# The device does not expose an app's label without parsing the APK's resources,
+# so well-known apps are listed here and everything else is guessed from its id.
+_KNOWN_APP_NAMES = {
+    'com.android.settings': 'Settings',
+    'com.android.systemui': 'System UI',
+    'com.android.chrome': 'Chrome',
+    'com.android.vending': 'Google Play Store',
+    'com.android.packageinstaller': 'Package Installer',
+    'com.android.permissioncontroller': 'Permission Controller',
+    'com.android.shell': 'Shell',
+    'com.android.phone': 'Phone',
+    'com.android.dialer': 'Phone',
+    'com.android.mms': 'Messages',
+    'com.android.camera2': 'Camera',
+    'com.android.gallery3d': 'Gallery',
+    'com.android.documentsui': 'Files',
+    'com.android.contacts': 'Contacts',
+    'com.android.deskclock': 'Clock',
+    'com.android.calendar': 'Calendar',
+    'com.android.camera': 'Camera',
+    'com.android.email': 'Email',
+    'com.google.android.youtube': 'YouTube',
+    'com.google.android.apps.maps': 'Google Maps',
+    'com.google.android.keep': 'Google Keep',
+    'com.google.android.calculator': 'Calculator',
+    'com.google.android.calendar': 'Calendar',
+    'com.google.android.contacts': 'Contacts',
+    'com.google.android.deskclock': 'Clock',
+    'com.google.android.dialer': 'Phone',
+    'com.google.android.apps.photos': 'Google Photos',
+    'com.google.android.apps.docs': 'Google Drive',
+    'com.google.android.apps.messaging': 'Messages',
+    'com.google.android.gm': 'Gmail',
+    'com.google.android.googlequicksearchbox': 'Google Search',
+    'com.google.android.apps.youtube.creator': 'YouTube Studio',
+    'com.google.android.filemanager': 'Files',
+    'com.google.android.apps.drive': 'Google Drive',
+    'com.google.android.music': 'Google Play Music',
+    'com.google.android.videos': 'Google TV',
+    'com.google.android.apps.podcasts': 'Google Podcasts',
+    'com.google.android.apps.books': 'Google Play Books',
+    'com.google.android.apps.tachyon': 'Device Info HW',
+    'com.google.android.gms': 'Google Play Services',
+    'com.google.android.googlequicksearch': 'Google Search',
+    'com.google.android.apps.translate': 'Google Translate',
+    'com.google.android.apps.snapchat': 'Snapchat',
+    'com.whatsapp': 'WhatsApp',
+    'com.whatsapp.w4b': 'WhatsApp Business',
+    'com.facebook.katana': 'Facebook',
+    'com.facebook.orca': 'Messenger',
+    'com.facebook.system': 'Facebook App Manager',
+    'com.instagram.android': 'Instagram',
+    'org.telegram.messenger': 'Telegram',
+    'org.telegram.messenger.web': 'Telegram Web',
+    'com.twitter.android': 'X (Twitter)',
+    'com.linkedin.android': 'LinkedIn',
+    'com.reddit.frontpage': 'Reddit',
+    'com.pinterest': 'Pinterest',
+    'com.snapchat.android': 'Snapchat',
+    'com.zhiliaoapp.musically': 'TikTok',
+    'com.spotify.music': 'Spotify',
+    'com.netflix.mediaclient': 'Netflix',
+    'com.amazon.mShop.android.shopping': 'Amazon Shopping',
+    'com.amazon.mShop.android.hardwarereview': 'Amazon Reviews',
+    'com.amazon.avod': 'Prime Video',
+    'com.ubercab': 'Uber',
+    'com.airbnb.android': 'Airbnb',
+    'com.duolingo': 'Duolingo',
+    'com.slack': 'Slack',
+    'com.discord': 'Discord',
+    'org.thoughtworks.secureshell': 'Termux',
+    'com.termux': 'Termux',
+    'org.mozilla.firefox': 'Firefox',
+    'org.mozilla.klar': 'Firefox Focus',
+    'org.chromium.chrome': 'Chromium',
+    'org.videolan.vlc': 'VLC',
+    'notion.id': 'Notion',
+    'app.zophop': 'Chalo',
+    'com.obsidian': 'Obsidian',
+    'com.microsoft.teams': 'Microsoft Teams',
+    'com.microsoft.office.outlook': 'Outlook',
+    'com.microsoft.office.word': 'Word',
+    'com.microsoft.office.excel': 'Excel',
+    'com.microsoft.office.powerpoint': 'PowerPoint',
+    'com.microsoft.office.onenote': 'OneNote',
+    'com.dropbox.android': 'Dropbox',
+    'com.paypal.android.p2pmobile': 'PayPal',
+}
+
+# Trailing package segments that say nothing about which app this is. Dropping
+# them stops com.instagram.android from being shown as just "Android".
+_GENERIC_PACKAGE_SEGMENTS = {
+    'app', 'apps', 'android', 'mobile', 'client', 'application', 'main',
+    'helper', 'service', 'services', 'provider', 'receiver', 'activity',
+    'ui', 'core', 'common', 'base', 'util', 'utils',
+}
+
+
+def _display_app_name(package: str) -> str:
+    """Best-effort display name for a package id.
+
+    The real label lives in the APK's resource table, which adb cannot report,
+    so this falls back to the most distinctive part of the package id.
+    """
+    known = _KNOWN_APP_NAMES.get(package)
+    if known:
+        return known
+
+    segments = [seg for seg in package.split('.') if seg]
+    while len(segments) > 1 and segments[-1].lower() in _GENERIC_PACKAGE_SEGMENTS:
+        segments.pop()
+    if not segments:
+        return package
+
+    return segments[-1].replace('_', ' ').replace('-', ' ').strip().title()
+
 
 
 
@@ -468,69 +588,59 @@ class ADBManager:
         
         return sorted(apps)
 
-    # APK size for every installed package in a single shell round trip. 'stat -c'
-    # is missing on older Android builds, so the bytes are counted with 'wc -c'.
+    # APK sizes come from one 'ls -l' over shell globs. The device expands the
+    # globs and ls reports every APK in a single process, so a device with 200
+    # apps costs one fork instead of one 'wc' and one 'tr' per APK. The globs
+    # are deliberately non-overlapping, since ls prints a repeated path twice.
     _APK_SIZE_SCRIPT = (
-        "pm list packages -f | sed -n 's/^package://p' | "
-        "while IFS= read -r line; do "
-        'case "$line" in *=*) apk=${line#*=} ;; *) continue ;; esac; '
-        'echo "$(wc -c < "$apk" 2>/dev/null | tr -d " ") $line"; '
-        "done"
+        'ls -l '
+        '/data/app/*/*/*.apk '
+        '/system/*/*/*.apk '
+        '/product/*/*/*.apk '
+        '/vendor/*/*/*.apk '
+        '/system_ext/*/*/*.apk '
+        '/odm/*/*/*.apk '
+        '2>/dev/null'
     )
 
-    def _get_apk_sizes(self, device_id: str) -> Dict[str, int]:
-        """APK size in bytes per package, from one batched shell call.
+    def _get_apk_sizes(self, device_id: str, apps: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Total APK bytes per package, from one batched shell call.
 
-        Packages whose APK cannot be read are left out of the map; callers
-        should treat a missing entry as zero rather than as a failure.
+        Every APK sitting beside a package's base APK is added in, so split
+        files count too and the total matches the figure the Play Store shows.
+        A package whose APK was not listed comes back as zero.
         """
-        sizes: Dict[str, int] = {}
         try:
             output = self._run_command(['shell', self._APK_SIZE_SCRIPT], device_id)
         except Exception:
-            return sizes
+            return {}
 
+        by_dir: Dict[str, int] = {}
+        seen_paths = set()
         for line in output.split('\n'):
-            size_str, _, path_and_pkg = line.strip().partition(' ')
-            if not size_str or '=' not in path_and_pkg:
+            # -rw-r--r-- 1 root root 4812345 2024-01-31 09:12 /data/app/.../base.apk
+            fields = line.split()
+            if len(fields) < 8 or not fields[0].startswith('-'):
                 continue
+            path = fields[-1]
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
             try:
-                sizes[path_and_pkg.rsplit('=', 1)[1]] = int(size_str)
+                size = int(fields[4])
             except ValueError:
                 continue
-        return sizes
+            directory = os.path.dirname(path)
+            by_dir[directory] = by_dir.get(directory, 0) + size
+
+        return {app['package']: by_dir.get(os.path.dirname(app['path']), 0)
+                for app in apps}
 
     def get_installed_apps_details(self, device_id: str) -> List[Dict[str, Any]]:
         """Get installed apps with package, formatted name, path, type and APK size."""
         try:
             output = self._run_command(['shell', 'pm', 'list', 'packages', '-f'], device_id)
             apps = []
-            
-            known_names = {
-                'com.android.settings': 'Settings',
-                'com.android.systemui': 'System UI',
-                'com.google.android.youtube': 'YouTube',
-                'org.telegram.messenger': 'Telegram',
-                'notion.id': 'Notion',
-                'app.zophop': 'Chalo',
-                'com.android.chrome': 'Chrome',
-                'com.google.android.apps.maps': 'Google Maps',
-                'com.google.android.keep': 'Google Keep',
-                'com.whatsapp': 'WhatsApp',
-                'com.instagram.android': 'Instagram',
-                'com.facebook.katana': 'Facebook',
-                'com.twitter.android': 'X (Twitter)',
-                'com.spotify.music': 'Spotify',
-                'com.netflix.mediaclient': 'Netflix',
-                'com.google.android.gms': 'Google Play Services',
-                'com.android.vending': 'Google Play Store',
-                'com.google.android.calculator': 'Calculator',
-                'com.google.android.calendar': 'Calendar',
-                'com.google.android.contacts': 'Contacts',
-                'com.google.android.deskclock': 'Clock',
-                'com.google.android.dialer': 'Phone',
-                'com.google.android.apps.photos': 'Google Photos',
-            }
 
             for line in output.split('\n'):
                 line = line.strip()
@@ -538,23 +648,16 @@ class ADBManager:
                     line = line.replace('package:', '')
                     if '=' in line:
                         path, package = line.rsplit('=', 1)
-                        if package in known_names:
-                            name = known_names[package]
-                        else:
-                            parts = package.split('.')
-                            raw_name = parts[-1] if len(parts[-1]) > 2 else (parts[-2] if len(parts) > 1 else package)
-                            name = raw_name.replace('_', ' ').replace('-', ' ').title()
-                            
-                        is_system = path.startswith(('/system', '/product', '/vendor', '/system_ext'))
+                        is_system = path.startswith(SYSTEM_APP_PATHS)
                         apps.append({
                             'package': package,
-                            'name': name,
+                            'name': _display_app_name(package),
                             'path': path,
                             'is_system': is_system,
                             'type': 'System' if is_system else 'User'
                         })
 
-            sizes = self._get_apk_sizes(device_id)
+            sizes = self._get_apk_sizes(device_id, apps)
             for app in apps:
                 app['size_bytes'] = sizes.get(app['package'], 0)
 
@@ -562,7 +665,7 @@ class ADBManager:
             return apps
         except Exception:
             pkgs = self.get_installed_apps(device_id)
-            return [{'package': p, 'name': p.split('.')[-1].title(), 'path': '',
+            return [{'package': p, 'name': _display_app_name(p), 'path': '',
                      'is_system': False, 'type': 'Unknown', 'size_bytes': 0} for p in pkgs]
 
     
