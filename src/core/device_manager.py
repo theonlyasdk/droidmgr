@@ -135,6 +135,15 @@ class DeviceManager:
             package: Package name
         """
         self.adb.stop_app(device_id, package)
+
+    def clear_app_data(self, device_id: str, package: str) -> None:
+        """Clear an application's data and cache on a device.
+
+        Args:
+            device_id: Device ID
+            package: Package name
+        """
+        self.adb.clear_app_data(device_id, package)
         
     def uninstall_app(self, device_id: str, package: str) -> None:
         """Uninstall an application from a device."""

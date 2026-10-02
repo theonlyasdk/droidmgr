@@ -1049,6 +1049,18 @@ class ADBManager:
         AuditLogger.log(device_id, "STOP_APP", package)
         self._run_command(['shell', 'am', 'force-stop', package], device_id)
 
+    def clear_app_data(self, device_id: str, package: str) -> None:
+        """Delete an application's stored data, which takes its cache with it.
+
+        Android offers no way to clear one app's cache on its own: the cache
+        directory belongs to the app's uid, and the only shell-reachable route
+        to it is 'pm clear', which empties the whole data directory. Some ROMs
+        withhold CLEAR_APP_USER_DATA from the shell user, and this raises.
+        """
+        _validate_package(package)
+        AuditLogger.log(device_id, "CLEAR_APP_DATA", package)
+        self._run_command(['shell', 'pm', 'clear', package], device_id)
+
     
     def list_files(self, device_id: str, path: str = '/sdcard/', show_hidden: bool = True, use_exact_sizes: bool = False) -> List[Dict[str, Any]]:
         if not path.strip():

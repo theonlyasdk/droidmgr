@@ -42,6 +42,16 @@ _OFFLINE_ERROR_KEYWORDS = [
     'no devices/emulators found', 'disconnected', 'closed', 'unauthorized'
 ]
 
+# The permission names a device quotes when it refuses to let adb wipe an app.
+_CLEAR_DENIED_KEYWORDS = ['clear_app_user_data', 'clear_app_cache']
+
+_CLEAR_DENIED_MESSAGE = (
+    "This device does not let apps be cleared over adb.\n\n"
+    "Its Android build withholds android.permission.CLEAR_APP_USER_DATA from the "
+    "shell user, so the request is refused. Reaching app data on such a device "
+    "needs root."
+)
+
 _MEMORY_UNITS = {
     'B': 1,
     'KB': 1024,
@@ -88,6 +98,12 @@ def _is_offline_error(msg: str) -> bool:
     """Whether an exception message describes an unreachable or unauthorized device."""
     lower_msg = msg.lower()
     return any(keyword in lower_msg for keyword in _OFFLINE_ERROR_KEYWORDS)
+
+
+def _is_clear_denied(msg: str) -> bool:
+    """Whether an exception message is the device refusing to wipe an app."""
+    lower_msg = msg.lower()
+    return any(keyword in lower_msg for keyword in _CLEAR_DENIED_KEYWORDS)
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -448,6 +464,9 @@ class MainWindow:
         self.uninstall_app_btn = ttk.Button(btn_frame, text="Uninstall App", command=self._uninstall_app)
         self.uninstall_app_btn.pack(side=tk.LEFT, padx=2)
 
+        self.clear_cache_btn = ttk.Button(btn_frame, text="Clear Cache", command=self._clear_app_cache)
+        self.clear_cache_btn.pack(side=tk.LEFT, padx=2)
+
         
         return tab
     
@@ -554,6 +573,7 @@ class MainWindow:
         self.start_app_btn.config(state=app_state)
         self.stop_app_btn.config(state=app_state)
         self.uninstall_app_btn.config(state=app_state)
+        self.clear_cache_btn.config(state=app_state)
         self.extract_apk_btn.config(state=app_state)
         
         self.file_manager.update_button_states(ready_state)
@@ -1456,6 +1476,69 @@ class MainWindow:
             self._show_info(f"Stopped {package}")
         except Exception as e:
             self._show_error("Stop App Error", str(e))
+
+    def _clear_app_cache(self):
+        if not self._require_device():
+            return
+
+        packages = self._get_selected_packages()
+        if not packages:
+            self._show_warning("Please select one or more applications to clear")
+            return
+
+        if not self._confirm_clear_cache(packages):
+            return
+
+        device_id = self.selected_device
+        self._set_status(f"Clearing data for {len(packages)} "
+                         f"application{'s' if len(packages) > 1 else ''}...")
+
+        def task():
+            cleared = []
+            failed = {}
+            for package in packages:
+                try:
+                    self.device_manager.clear_app_data(device_id, package)
+                    cleared.append(package)
+                except Exception as e:
+                    failed[package] = str(e)
+            self.root.after(0, self._refresh_apps)
+            self.root.after(0, lambda: self._report_clear_cache(cleared, failed))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _confirm_clear_cache(self, packages: List[str]) -> bool:
+        """Confirm a clear, spelling out that an app's data goes with its cache."""
+        listed = '\n'.join(f"  - {pkg}" for pkg in packages[:10])
+        if len(packages) > 10:
+            listed += f"\n  ... and {len(packages) - 10} more"
+        count = len(packages)
+        return messagebox.askyesno(
+            "Confirm Clear Cache",
+            "Android cannot clear one app's cache on its own: its cache sits inside "
+            "the app's own data directory, which only this operation can reach.\n\n"
+            f"So the {count} selected application{'s' if count != 1 else ''} will also "
+            "lose their stored data. Each will be signed out, its settings reset and "
+            "anything it downloaded removed. What is not held by an account is lost.\n\n"
+            f"{listed}\n\nClear data now?",
+            icon=messagebox.WARNING)
+
+    def _report_clear_cache(self, cleared: List[str], failed: Dict[str, str]):
+        """Say what was cleared, and give the reason for anything that was not."""
+        total = len(cleared) + len(failed)
+        if not failed:
+            self._show_info(f"Cleared data for {total} "
+                            f"application{'s' if total != 1 else ''}")
+            return
+        if not cleared and all(_is_clear_denied(msg) for msg in failed.values()):
+            self._show_error("Clear Cache Denied", _CLEAR_DENIED_MESSAGE)
+            return
+        detail = '\n'.join(f'  - {pkg}: {msg}'
+                           for pkg, msg in list(failed.items())[:10])
+        if len(failed) > 10:
+            detail += f"\n  ... and {len(failed) - 10} more"
+        self._show_error("Clear Cache Error",
+                         f"{len(failed)} of {total} could not be cleared:\n{detail}")
 
     def _uninstall_app(self):
         if not self._require_device():
