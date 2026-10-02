@@ -3,7 +3,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import os
-from typing import List, Optional
+from typing import Dict, List, Optional
 from pathlib import Path
 import threading
 import re
@@ -471,6 +471,19 @@ class MainWindow:
                 focused = values[1]
 
         return focused if focused in packages else packages[0]
+
+    def _get_visible_app_types(self) -> Dict[str, str]:
+        """Package -> Type column value for every app currently listed.
+
+        The type comes from the install path the device reports, so unlike the
+        name heuristic it holds for any package, vendor ones included.
+        """
+        types: Dict[str, str] = {}
+        for item_id in self.app_tree.get_children(''):
+            values = self.app_tree.item(item_id, 'values')
+            if values and len(values) >= 3 and values[1]:
+                types[values[1]] = values[2]
+        return types
 
     def _update_app_button_states(self):
         has_device = self.selected_device is not None
@@ -1316,7 +1329,12 @@ class MainWindow:
 
     def _confirm_bulk_uninstall(self, packages: List[str]) -> bool:
         """One confirmation for a multi-app uninstall, with a system-app warning."""
-        risky = [pkg for pkg in packages if _looks_like_system_package(pkg)]
+        # A listed app is judged by the install path the device reports, which
+        # catches vendor system apps the name heuristic would miss. The name
+        # check stays on as a floor for core packages.
+        types = self._get_visible_app_types()
+        risky = [pkg for pkg in packages
+                 if types.get(pkg) == 'System' or _looks_like_system_package(pkg)]
         if risky:
             listed = '\n'.join(risky[:10])
             if len(risky) > 10:
