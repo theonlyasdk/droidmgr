@@ -23,6 +23,8 @@ from .app_info_dialog import AppInfoDialog, ProcessInfoDialog
 from .scrcpy_settings_dialog import ScrcpySettingsDialog
 from .scrcpy_output_dialog import ScrcpyOutputDialog
 from .device_details_dialog import DeviceDetailsDialog
+from .logcat_view import LogcatView
+from .shell_view import ShellView
 from .llm_report_dialog import LLMReportDialog, LLMReportProgressDialog
 from .wireless_dialog import ConnectWirelesslyDialog
 from .backup_dialog import BackupCancelToken, BackupOptionsDialog, BackupProgressDialog, RestoreSelectionDialog
@@ -97,6 +99,10 @@ class MainWindow:
         device_menu.add_command(label="Restore from backup...", command=self._restore_from_backup)
         device_menu.add_command(label="Generate LLM Report", command=self._generate_llm_report)
 
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+        tools_menu.add_command(label="Open Shell", command=self._open_shell_tab)
+
         
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
@@ -119,7 +125,27 @@ class MainWindow:
             self._show_error,
             self._require_device
         )
-        
+
+        # Initialize Logcat Viewer
+        self.logcat_tab = ttk.Frame(self.notebook)
+        self.logcat_view = LogcatView(
+            self.logcat_tab,
+            self.device_manager,
+            self._set_status,
+            self._show_error,
+            self._require_device
+        )
+
+        # Initialize Interactive Shell
+        self.shell_tab = ttk.Frame(self.notebook)
+        self.shell_view = ShellView(
+            self.shell_tab,
+            self.device_manager,
+            self._set_status,
+            self._show_error,
+            self._require_device
+        )
+
         self.notebook.add(self.devices_tab, text="Devices")
         self.notebook.bind('<<NotebookTabChanged>>', self._on_tab_changed)
 
@@ -321,6 +347,8 @@ class MainWindow:
                 self.notebook.add(self.processes_tab, text="Processes")
                 self.notebook.add(self.apps_tab, text="Applications")
                 self.notebook.add(self.files_tab, text="Files")
+                self.notebook.add(self.logcat_tab, text="Logcat")
+                self.notebook.add(self.shell_tab, text="Shell")
             elif not self.selected_device:
                 while self.notebook.index('end') > 1:
                     self.notebook.forget(1)
@@ -492,6 +520,10 @@ class MainWindow:
         try:
             self.device_manager = DeviceManager(self.adb_path, self.scrcpy_path)
             self.file_manager.device_manager = self.device_manager
+            if hasattr(self, 'logcat_view'):
+                self.logcat_view.device_manager = self.device_manager
+            if hasattr(self, 'shell_view'):
+                self.shell_view.device_manager = self.device_manager
             self._set_status("Preferences updated")
             self._refresh_devices()
             
@@ -548,6 +580,15 @@ class MainWindow:
                     self._refresh_apps()
                 elif current_tab_text == "Files":
                     self.file_manager.refresh()
+                    self.logcat_view.set_device(self.selected_device)
+                elif current_tab_text == "Logcat":
+                    self.logcat_view.set_device(
+                        self.selected_device, force_refresh=True, autostart=True)
+                elif current_tab_text == "Shell":
+                    self.shell_view.set_device(self.selected_device)
+                else:
+                    self.logcat_view.set_device(self.selected_device)
+                    self.shell_view.set_device(self.selected_device)
 
     def _on_tab_changed(self, event=None):
         if not self.selected_device:
@@ -565,8 +606,23 @@ class MainWindow:
                 self._refresh_apps()
             elif tab_text == "Files":
                 self.file_manager.set_device(self.selected_device, force_refresh=True)
+            elif tab_text == "Logcat":
+                self.logcat_view.set_device(
+                    self.selected_device, force_refresh=True, autostart=True)
+            elif tab_text == "Shell":
+                self.shell_view.set_device(self.selected_device)
         except Exception:
             pass
+
+    def _open_shell_tab(self):
+        """Focus the Shell tab (Tools > Open Shell)."""
+        if not self._require_device():
+            return
+        if self.shell_tab not in self.notebook.tabs():
+            return
+        self.notebook.select(self.shell_tab)
+        self.shell_view.set_device(self.selected_device)
+        self.shell_view.focus_input()
 
 
     def _on_device_double_click(self, event):
@@ -644,11 +700,15 @@ class MainWindow:
                     self.device_tree.selection_set(children[curr_idx])
             else:
                 self.selected_device = None
+                if hasattr(self, 'logcat_view'):
+                    self.logcat_view.set_device(None)
                 self._update_tab_visibility()
 
         except Exception as e:
             self.has_devices = False
             self.selected_device = None
+            if hasattr(self, 'logcat_view'):
+                self.logcat_view.set_device(None)
             self._update_tab_visibility()
             self._set_status(f"Device refresh error: {e}")
 
@@ -2058,6 +2118,16 @@ class MainWindow:
 
 
         self.taskbar_progress.close()
+        if hasattr(self, 'logcat_view'):
+            try:
+                self.logcat_view.destroy()
+            except Exception:
+                pass
+        if hasattr(self, 'shell_view'):
+            try:
+                self.shell_view.destroy()
+            except Exception:
+                pass
         self.device_manager.cleanup()
         self.root.destroy()
     

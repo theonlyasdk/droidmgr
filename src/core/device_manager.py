@@ -245,6 +245,22 @@ class DeviceManager:
     def disconnect_device(self, address: str) -> str:
         """Disconnect an ADB device over network."""
         return self.adb.disconnect_device(address)
+
+    def get_logcat(self, device_id: str):
+        """Start streaming `adb logcat -v brief` for a device."""
+        return self.adb.get_logcat(device_id)
+
+    def clear_logcat(self, device_id: str) -> None:
+        """Clear the on-device logcat buffers (`adb logcat -c`)."""
+        self.adb.clear_logcat(device_id)
+
+    def run_shell_command(self, device_id: str, command: str, timeout: int = 30):
+        """Run a single shell command on a device, returning (returncode, stdout, stderr)."""
+        return self.adb.run_shell_command(device_id, command, timeout)
+
+    def start_shell_session(self, device_id: str, allocate_tty: bool = True):
+        """Start an interactive `adb shell` session for a device."""
+        return self.adb.start_shell_session(device_id, allocate_tty)
     
     def cleanup(self) -> None:
         """Cleanup all resources."""

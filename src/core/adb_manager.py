@@ -69,7 +69,8 @@ class ADBManager:
             text = text[:497] + '...'
         return text
 
-    def _run_command(self, args: List[str], device_id: Optional[str] = None) -> str:
+    def _run_command(self, args: List[str], device_id: Optional[str] = None,
+                     timeout: Optional[int] = None) -> str:
         cmd = [self.adb_path]
         
         if device_id:
@@ -82,11 +83,14 @@ class ADBManager:
                 cmd,
                 capture_output=True,
                 text=True,
-                check=True
+                check=True,
+                timeout=timeout
             )
             return result.stdout.strip()
         except FileNotFoundError:
             raise ADBNotFoundError(f"ADB executable not found at '{self.adb_path}'. Please verify the path in Preferences > External Tools.")
+        except subprocess.TimeoutExpired:
+            raise ADBCommandError(f"ADB command timed out: {' '.join(args)}")
         except subprocess.CalledProcessError as e:
 
             stderr = e.stderr.strip() if e.stderr else (e.stdout.strip() if e.stdout else str(e))
@@ -1804,6 +1808,106 @@ class ADBManager:
         if not address:
             raise ValueError("Device address cannot be empty.")
         return self._run_command(['disconnect', address])
+
+    def get_logcat(self, device_id: str) -> subprocess.Popen:
+        """Start streaming `adb logcat -v brief` for a device.
+
+        Args:
+            device_id: Device ID / serial number
+
+        Returns:
+            A running subprocess.Popen with line-buffered text stdout.
+            Caller is responsible for terminating the process.
+        """
+        if not device_id or not device_id.strip():
+            raise ValueError("Device ID cannot be empty.")
+        cmd = [self.adb_path, '-s', device_id, 'logcat', '-v', 'brief']
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            raise ADBNotFoundError(
+                f"ADB executable not found at '{self.adb_path}'. "
+                "Please verify the path in Preferences > External Tools."
+            )
+        return process
+
+    def clear_logcat(self, device_id: str) -> None:
+        """Clear the on-device logcat buffers (`adb logcat -c`)."""
+        if not device_id or not device_id.strip():
+            raise ValueError("Device ID cannot be empty.")
+        self._run_command(['logcat', '-c'], device_id)
+
+    def run_shell_command(self, device_id: str, command: str, timeout: int = 30) -> Tuple[int, str, str]:
+        """Run a single shell command on a device and return (returncode, stdout, stderr).
+
+        The whole command string is handed to the device shell verbatim, so pipes,
+        redirections and quoting work as typed. Unlike `_run_command`, a non-zero exit
+        status is reported as a result instead of raised, because shell utilities such
+        as `grep` fail legitimately and the caller shows the exit code inline.
+
+        Args:
+            device_id: Device ID / serial number
+            command: Command line to run through the device shell
+            timeout: Seconds to wait before giving up
+
+        Returns:
+            Tuple of (returncode, stdout, stderr). stderr carries the sanitized
+            ADB error message when the command failed.
+        """
+        if not device_id or not device_id.strip():
+            raise ValueError("Device ID cannot be empty.")
+        if not command or not command.strip():
+            return 0, '', ''
+        try:
+            stdout = self._run_command(['shell', command], device_id, timeout=timeout)
+            return 0, stdout, ''
+        except ADBCommandError as exc:
+            # A failed shell command is data, not a control-flow error: the device
+            # itself is reachable, it just returned non-zero (or timed out).
+            return 1, '', str(exc)
+
+    def start_shell_session(self, device_id: str, allocate_tty: bool = True) -> subprocess.Popen:
+        """Start an interactive `adb shell` session for a device.
+
+        Args:
+            device_id: Device ID / serial number
+            allocate_tty: Request a pty (`-t`) so the device shell behaves
+                interactively. Disable for adb builds that reject the flag.
+
+        Returns:
+            A running subprocess.Popen with pipes attached to stdin/stdout and
+            stderr merged into stdout (as a terminal would).
+            Caller is responsible for terminating the process.
+        """
+        if not device_id or not device_id.strip():
+            raise ValueError("Device ID cannot be empty.")
+        cmd = [self.adb_path, '-s', device_id, 'shell']
+        if allocate_tty:
+            cmd.append('-t')
+        try:
+            return subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            raise ADBNotFoundError(
+                f"ADB executable not found at '{self.adb_path}'. "
+                "Please verify the path in Preferences > External Tools."
+            )
 
 
 def _looks_like_unzip_error(data: bytes) -> bool:

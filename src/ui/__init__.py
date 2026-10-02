@@ -7,6 +7,8 @@ from .preferences_dialog import PreferencesDialog
 from .file_manager import FileManager
 from .scrcpy_output_dialog import ScrcpyOutputDialog
 from .device_details_dialog import DeviceDetailsDialog
+from .logcat_view import LogcatView
+from .shell_view import ShellView
 from .llm_report_dialog import LLMReportDialog, LLMReportProgressDialog
 from .wireless_dialog import WirelessADBSetupDialog, ConnectWirelessDialog
 from .dpi import (
@@ -26,6 +28,8 @@ __all__ = [
     'FileManager',
     'ScrcpyOutputDialog',
     'DeviceDetailsDialog',
+    'LogcatView',
+    'ShellView',
     'LLMReportDialog',
     'LLMReportProgressDialog',
     'WirelessADBSetupDialog',

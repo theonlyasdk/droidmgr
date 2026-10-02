@@ -4,6 +4,11 @@ from pathlib import Path
 
 CURRENT_CONFIG_VERSION = 2
 DEFAULT_BACKUP_EXCLUSIONS = ['/storage/emulated/0/Android']
+DEFAULT_SHELL_PRESETS = [
+    {'name': 'Battery', 'command': 'dumpsys battery'},
+    {'name': 'IP Address', 'command': 'ip addr'},
+    {'name': 'Properties', 'command': 'getprop'},
+]
 
 
 class ConfigManager:
@@ -42,6 +47,9 @@ class ConfigManager:
             'paths': {
                 'adb': '',
                 'scrcpy': ''
+            },
+            'shell': {
+                'presets': [dict(p) for p in DEFAULT_SHELL_PRESETS],
             },
             'scrcpy': {
                 'video_bit_rate': '8M',
@@ -159,7 +167,24 @@ class ConfigManager:
             except Exception:
                 self.settings.setdefault('paths', {})[path_key] = ''
 
-                
+        # Validate shell presets (list of {'name': str, 'command': str})
+        shell = self.settings.setdefault('shell', {})
+        presets = shell.get('presets')
+        if not isinstance(presets, list):
+            print("Warning: Invalid shell.presets in config. Reverting to defaults.")
+            presets = list(DEFAULT_SHELL_PRESETS)
+        cleaned = []
+        for item in presets:
+            if isinstance(item, dict):
+                name = item.get('name')
+                command = item.get('command')
+                if isinstance(name, str) and isinstance(command, str) and name.strip() and command.strip():
+                    cleaned.append({'name': name, 'command': command})
+            else:
+                print(f"Warning: Dropping malformed shell preset {item!r}.")
+        shell['presets'] = cleaned
+
+
     def _deep_merge(self, base, update):
         for key, value in update.items():
             if key in base and isinstance(base[key], dict) and isinstance(value, dict):

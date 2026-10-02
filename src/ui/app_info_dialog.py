@@ -102,16 +102,30 @@ class AppInfoDialog(tk.Toplevel):
             package = self.app_info['package']
             cache_dir = os.path.join(tempfile.gettempdir(), 'droidmgr_icons')
             icon_path = self.device_manager.adb.extract_app_icon(self.device_id, package, cache_dir)
-            
+
             if icon_path and os.path.exists(icon_path):
-                self.after(0, lambda: self._update_icon_ui(icon_path))
+                self.after(0, lambda p=icon_path: self._update_icon_ui(p))
             else:
-                self.after(0, lambda: self.icon_label.config(text="No Icon Found"))
-        except Exception as e:
-            self.after(0, lambda: self.icon_label.config(text="Failed to load"))
+                self.after(0, lambda: self._set_icon_text_safe("No Icon Found"))
+        except Exception:
+            self.after(0, lambda: self._set_icon_text_safe("Failed to load"))
+
+    def _set_icon_text_safe(self, text):
+        try:
+            if not self.winfo_exists():
+                return
+            if not self.icon_label.winfo_exists():
+                return
+            self.icon_label.config(text=text)
+        except tk.TclError:
+            pass
 
     def _update_icon_ui(self, icon_path):
         try:
+            if not self.winfo_exists():
+                return
+            if not self.icon_label.winfo_exists():
+                return
             self.icon_image = tk.PhotoImage(file=icon_path)
             w = self.icon_image.width()
             h = self.icon_image.height()
@@ -127,8 +141,8 @@ class AppInfoDialog(tk.Toplevel):
                     self.icon_image = self.icon_image.subsample(factor)
                     
             self.icon_label.config(image=self.icon_image, text="")
-        except Exception as e:
-            self.icon_label.config(text="Display Error")
+        except (Exception, tk.TclError):
+            self._set_icon_text_safe("Display Error")
 
 
 
