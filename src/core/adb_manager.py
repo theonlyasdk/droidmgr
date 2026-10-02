@@ -150,7 +150,7 @@ _THERMAL_STATUS = {0: 'None', 1: 'Light throttling', 2: 'Moderate throttling',
                    3: 'Severe throttling', 4: 'Critical', 5: 'Emergency',
                    6: 'Shutdown imminent'}
 
-_WIFI_SSID = re.compile(r'SSID:\s*([^,\n]+)')
+_WIFI_SSID = re.compile(r'SSID:\s*(.*?)(?=,\s|\s+\w+:|$)')
 _WIFI_RSSI = re.compile(r'RSSI:\s*(-?\d+)')
 _WIFI_STATE = re.compile(r'[Ss]upplicant state:\s*(\w+)')
 _WIFI_ON = re.compile(r'wi-?fi\s+is\s+enabled', re.I)
@@ -338,6 +338,147 @@ def _parse_diskstats(output: str) -> Dict[str, int]:
             names = []
 
     return sizes
+
+
+# A bugreport opens with plain 'Key: value' lines before the dumpsys body. These
+# are the ones worth quoting back to the user, mapped to the name used for them.
+_BUGREPORT_HEADER_FIELDS = {
+    'build': 'Build',
+    'fingerprint': 'Build fingerprint',
+    'bootloader': 'Bootloader',
+    'radio': 'Radio',
+    'network': 'Network',
+    'kernel': 'Kernel',
+    'uptime': 'Uptime',
+    'format': 'Bugreport format version',
+}
+
+# dumpstate writes down whatever it could not gather, which is what explains a
+# gap in a report, so those lines are worth surfacing rather than burying.
+_DUMPSTATE_PROBLEM_MARKERS = (
+    'Failed to find', 'No such file or directory', 'failed', 'Permission denied')
+
+# The header sits within the first few kilobytes while the report itself runs to
+# tens of megabytes, so only the head of it is ever read.
+_BUGREPORT_HEADER_BYTES = 8192
+
+# dumpstate's own log runs to about a hundred kilobytes on a busy device.
+_DUMPSTATE_LOG_BYTES = 65536
+
+
+def _human_bytes(num_bytes: float) -> str:
+    """Render a byte count as a short human-readable size such as '12.4 MB'."""
+    size = float(num_bytes or 0)
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if size < 1024 or unit == 'GB':
+            return f"{int(size)} B" if unit == 'B' else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def _format_elapsed(seconds: float) -> str:
+    """Render a duration the way a stopwatch would: '45s', '2m 57s', '1h 04m'."""
+    total = int(round(seconds or 0))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def _parse_bugreport_header(text: str) -> Dict[str, str]:
+    """Pull the opening 'Key: value' lines out of a bugreport's header."""
+    fields: Dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition(':')
+        if not separator:
+            continue
+        label = key.strip()
+        for name, wanted in _BUGREPORT_HEADER_FIELDS.items():
+            if label == wanted and name not in fields:
+                fields[name] = value.strip().strip("'")
+        if len(fields) == len(_BUGREPORT_HEADER_FIELDS):
+            break
+    return fields
+
+
+def _parse_dumpstate_log(text: str) -> List[str]:
+    """The lines where dumpstate records what it could not collect."""
+    notes: List[str] = []
+    for line in text.splitlines():
+        note = line.strip()
+        if not note or note in notes:
+            continue
+        if any(marker in note for marker in _DUMPSTATE_PROBLEM_MARKERS):
+            notes.append(note)
+        if len(notes) >= 6:
+            break
+    return notes
+
+
+def _summarise_bugreport_archive(path: str) -> Dict[str, Any]:
+    """Describe what a bugreport zip holds, without unpacking it.
+
+    The entry list is read from the central directory and only a few kilobytes
+    of two small text members are decompressed, so this stays cheap on a report
+    that unpacks to tens of megabytes. Anything unreadable leaves the briefing
+    short rather than failing a collection that already succeeded.
+    """
+    summary: Dict[str, Any] = {
+        'entries': 0,
+        'uncompressed': 0,
+        'sections': [],
+        'main_report': '',
+        'header': {},
+        'tombstones': 0,
+        'anr_traces': 0,
+        'largest': [],
+        'collection_notes': [],
+    }
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+            names = [info.filename.replace('\\', '/') for info in infos]
+            summary['entries'] = len(infos)
+            summary['uncompressed'] = sum(info.file_size for info in infos)
+
+            counts: Dict[str, int] = {}
+            for name in names:
+                section = name.split('/')[0] + ('/' if '/' in name else '')
+                counts[section] = counts.get(section, 0) + 1
+            summary['sections'] = sorted(counts.items(), key=lambda item: -item[1])
+
+            for name in names:
+                lowered = name.lower()
+                if 'tombstone' in lowered:
+                    summary['tombstones'] += 1
+                if '/anr/' in lowered or lowered.endswith('traces.txt'):
+                    summary['anr_traces'] += 1
+                base = name.rsplit('/', 1)[-1]
+                if base.startswith('bugreport-') and base.endswith('.txt'):
+                    summary['main_report'] = name
+
+            ranked = sorted(zip(names, infos), key=lambda pair: -pair[1].file_size)
+            summary['largest'] = [(name, info.file_size) for name, info in ranked[:5]]
+
+            if summary['main_report']:
+                with archive.open(summary['main_report']) as handle:
+                    head = handle.read(_BUGREPORT_HEADER_BYTES)
+                summary['header'] = _parse_bugreport_header(
+                    head.decode('utf-8', 'replace'))
+
+            if 'dumpstate_log.txt' in names:
+                with archive.open('dumpstate_log.txt') as handle:
+                    log = handle.read(_DUMPSTATE_LOG_BYTES)
+                summary['collection_notes'] = _parse_dumpstate_log(
+                    log.decode('utf-8', 'replace'))
+    except Exception:
+        pass
+
+    return summary
 
 
 def _parse_forward_list(output: str) -> List[Dict[str, str]]:
@@ -1782,6 +1923,179 @@ class ADBManager:
 
         update_p(100, "Report generation complete.")
         return report_paragraph
+
+    # A bugreport bundles a full dumpstate collection on the device and then
+    # pulls it back, which takes minutes rather than seconds on a typical phone
+    # and reports nothing along the way. Half an hour is far past any normal
+    # run, so anything past it is a device that has stopped answering.
+    BUGREPORT_TIMEOUT = 1800
+
+    def collect_bugreport(self, device_id: str, output_path: str) -> str:
+        """Collect a bugreport from a device into a zip at output_path.
+
+        Returns the path written. The command reports its own progress on the
+        way out, but there is nothing structured to hand back before it lands.
+        """
+        AuditLogger.log(device_id, "COLLECT_BUGREPORT",
+                        os.path.basename(output_path))
+        self._run_command(['bugreport', output_path], device_id,
+                          timeout=self.BUGREPORT_TIMEOUT)
+        if not os.path.isfile(output_path):
+            raise RuntimeError(
+                f"adb finished but wrote no bugreport at {output_path}")
+        return output_path
+
+    def get_adb_version(self) -> str:
+        """The adb build in use, which belongs in anything filed as a bug."""
+        try:
+            first = self._run_command(['version']).strip().splitlines()[0]
+            return first.replace('Android Debug Bridge version', '').strip()
+        except Exception:
+            return UNAVAILABLE
+
+    def build_bugreport_briefing(self, device_id: str, zip_path: str,
+                                 elapsed_seconds: float) -> str:
+        """Write the summary shown beside a collected bugreport.
+
+        The archive figures are read out of the report itself rather than
+        guessed, and the readings taken alongside it describe the device as it
+        stood at the moment of collection, which is usually what a bug report
+        is really asking about.
+        """
+        archive = _summarise_bugreport_archive(zip_path)
+
+        try:
+            health = self.get_health_stats(device_id)
+        except Exception:
+            health = {}
+        try:
+            info = self.get_detailed_device_info(device_id)
+        except Exception:
+            info = {}
+
+        import datetime
+
+        lines: List[str] = []
+        rows: List[str] = []
+
+        def row(label: str, value) -> None:
+            rows.append(f"  {label:<14} {value}")
+
+        def heading(title: str) -> None:
+            lines.append('')
+            lines.append(title)
+            lines.append('-' * len(title))
+
+        def section(title: str) -> None:
+            if rows:
+                heading(title)
+                lines.extend(rows)
+                rows.clear()
+
+        def degrees(value) -> str:
+            return UNAVAILABLE if value is None else f"{value} C"
+
+        def clip(text: str, limit: int = 118) -> str:
+            text = ' '.join(str(text).split())
+            return text if len(text) <= limit else text[:limit - 3] + '...'
+
+        lines.append('BUG REPORT BRIEFING')
+        lines.append('=' * 60)
+        try:
+            when = datetime.datetime.fromtimestamp(os.path.getmtime(zip_path))
+        except OSError:
+            when = datetime.datetime.now()
+        row('Device', device_id)
+        row('Collected', when.strftime('%Y-%m-%d %H:%M:%S'))
+        row('Took', _format_elapsed(elapsed_seconds))
+        row('adb', self.get_adb_version())
+        row('Archive', os.path.basename(zip_path))
+        try:
+            on_disk = _human_bytes(os.path.getsize(zip_path))
+        except OSError:
+            on_disk = UNAVAILABLE
+        row('Size', f"{on_disk} on disk, {_human_bytes(archive['uncompressed'])} "
+                    f"in {archive['entries']} files")
+        row('Held at', zip_path)
+        section('COLLECTION')
+
+        battery = health.get('battery') or {}
+        storage = health.get('storage') or {}
+        thermal = health.get('thermal') or {}
+        wifi = health.get('wifi') or {}
+
+        if info:
+            row('Model', f"{info.get('manufacturer', '?')} {info.get('model', '?')}".strip())
+            row('Android', f"{info.get('android_version', '?')} "
+                           f"({info.get('build_id', '?')})")
+            row('CPU', info.get('cpu', UNAVAILABLE))
+            row('RAM', info.get('ram', UNAVAILABLE))
+        if health.get('uptime'):
+            row('Uptime', _format_elapsed(health['uptime']))
+        if battery:
+            level = battery.get('level')
+            row('Battery', f"{level}%, {battery.get('status', '?')}, "
+                           f"{battery.get('temperature', '?')} C, "
+                           f"{battery.get('health', '?')}"
+                           + (f", on {battery['powered_by']}"
+                              if battery.get('powered_by') not in (None, '', 'None') else ''))
+        if storage:
+            row('Storage', f"{_human_bytes(storage.get('free', 0))} free of "
+                           f"{_human_bytes(storage.get('total', 0))} "
+                           f"({storage.get('percent', '?')}% used) on "
+                           f"{storage.get('mount', '?')}")
+        if thermal:
+            # Android names its "no throttling" status 'None', which reads like
+            # a missing value in a sentence.
+            state = thermal.get('status') or UNAVAILABLE
+            if state == 'None':
+                state = 'no throttling'
+            row('Temperature', f"CPU {degrees(thermal.get('cpu'))}, "
+                               f"battery {degrees(thermal.get('battery'))}, "
+                               f"peak {degrees(thermal.get('max'))} ({state})")
+        if wifi:
+            row('WiFi', f"{wifi.get('ssid') or 'not connected'} "
+                        f"[{wifi.get('state') or UNAVAILABLE}]")
+        section('DEVICE AT COLLECTION')
+
+        header = archive['header']
+        for label, key in (('Build', 'build'), ('Fingerprint', 'fingerprint'),
+                           ('Radio', 'radio'), ('Bootloader', 'bootloader'),
+                           ('Kernel', 'kernel'), ('Uptime', 'uptime'),
+                           ('Format', 'format')):
+            if header.get(key):
+                row(label, clip(header[key]))
+        section('AS THE REPORT SEES IT')
+
+        heading('WHAT THE ARCHIVE HOLDS')
+        for name, count in archive['sections']:
+            lines.append(f"  {count:>5}  {name}")
+        if archive['tombstones']:
+            lines.append('')
+            lines.append(f"  Includes {archive['tombstones']} tombstone file(s), "
+                         f"each one a native crash worth reading first.")
+        if archive['anr_traces']:
+            lines.append(f"  Includes {archive['anr_traces']} ANR trace file(s): "
+                         f"the app was not responding.")
+        if archive['largest']:
+            lines.append('')
+            lines.append('  Largest members:')
+            for name, size in archive['largest']:
+                lines.append(f"    {_human_bytes(size):>10}  {name}")
+
+        if archive['collection_notes']:
+            heading('COLLECTION GAPS')
+            lines.append('  dumpstate could not collect:')
+            for note in archive['collection_notes']:
+                lines.append(f"    - {note}")
+
+        heading('NOTE')
+        lines.append('  A bugreport can hold personal data: account names, contact')
+        lines.append('  labels, message text and file listings. Read it before you')
+        lines.append('  share it, and prefer the main .txt over the whole archive')
+        lines.append('  when a report will do.')
+
+        return '\n'.join(lines)
 
     def is_directory_writable(self, device_id: str, path: str) -> bool:
         """Check dynamically if a directory on the device is writable."""

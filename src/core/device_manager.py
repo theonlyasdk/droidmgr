@@ -266,6 +266,27 @@ class DeviceManager:
     def generate_llm_report(self, device_id: str, progress_callback=None) -> str:
         """Generate a single information-dense report paragraph for LLM analysis."""
         return self.adb.generate_llm_report(device_id, progress_callback)
+
+    def collect_bugreport(self, device_id: str, output_path: str) -> str:
+        """Collect a bugreport from a device into a zip at output_path.
+
+        Args:
+            device_id: Device ID
+            output_path: Host path the zip is written to
+        """
+        return self.adb.collect_bugreport(device_id, output_path)
+
+    def build_bugreport_briefing(self, device_id: str, zip_path: str,
+                                 elapsed_seconds: float) -> str:
+        """Summarise a collected bugreport for the user to read.
+
+        Args:
+            device_id: Device ID
+            zip_path: Host path of the collected zip
+            elapsed_seconds: How long the collection took
+        """
+        return self.adb.build_bugreport_briefing(device_id, zip_path,
+                                                 elapsed_seconds)
     
     def is_directory_writable(self, device_id: str, path: str) -> bool:
         """Check dynamically if a directory on the device is writable."""

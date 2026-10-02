@@ -13,6 +13,8 @@ import queue
 import tempfile
 import stat
 import json
+import time
+import datetime
 from pathlib import PurePosixPath
 
 from core import DeviceManager, ADBDeviceOfflineError, ADBDeviceNotFoundError
@@ -30,6 +32,7 @@ from .shell_view import ShellView
 from .capture import take_screenshot, record_screen
 from .apk_extract import extract_apk
 from .llm_report_dialog import LLMReportDialog, LLMReportProgressDialog
+from .bugreport_dialog import BugReportDialog, BugReportProgressDialog
 from .wireless_dialog import ConnectWirelesslyDialog
 from .backup_dialog import BackupCancelToken, BackupOptionsDialog, BackupProgressDialog, RestoreSelectionDialog
 from .taskbar_progress import TaskbarProgress
@@ -214,6 +217,7 @@ class MainWindow:
         device_menu.add_command(label="Restore from backup...", command=self._restore_from_backup)
         device_menu.add_separator()
         device_menu.add_command(label="Generate LLM Report", command=self._generate_llm_report)
+        device_menu.add_command(label="Collect Bug Report...", command=self._collect_bugreport)
 
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Tools", menu=tools_menu)
@@ -1795,6 +1799,57 @@ class MainWindow:
                     self._show_error("LLM Report Generation Error", err_msg)
                 self.root.after(0, on_error)
                 
+        threading.Thread(target=task, daemon=True).start()
+
+    def _collect_bugreport(self):
+        """Gather a bugreport from the device and brief the user on it."""
+        if not self._require_device():
+            return
+
+        device_id = self.selected_device
+        stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        safe_id = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', device_id).strip() or 'device'
+        working_copy = os.path.join(
+            tempfile.gettempdir(), f'bugreport-{safe_id}-{stamp}.zip')
+
+        # adb appends to a report it finds already there, so start from nothing.
+        if os.path.exists(working_copy):
+            try:
+                os.remove(working_copy)
+            except OSError:
+                pass
+
+        progress_dialog = BugReportProgressDialog(self.root, device_id)
+        progress_dialog.start()
+        self._set_status(f"Collecting a bug report from {device_id}...")
+
+        def task():
+            started = time.monotonic()
+            try:
+                self.device_manager.collect_bugreport(device_id, working_copy)
+                elapsed = time.monotonic() - started
+                briefing = self.device_manager.build_bugreport_briefing(
+                    device_id, working_copy, elapsed)
+
+                def on_done():
+                    if progress_dialog.winfo_exists():
+                        progress_dialog.destroy()
+                    # A collection left running in the background still has
+                    # somewhere to land, so the briefing opens either way.
+                    BugReportDialog(self.root, device_id, working_copy, briefing)
+                    self._set_status(f"Bug report collected from {device_id}")
+
+                self.root.after(0, on_done)
+            except Exception as e:
+                err_msg = str(e)
+
+                def on_error():
+                    if progress_dialog.winfo_exists():
+                        progress_dialog.destroy()
+                    self._show_error("Bug Report Error", err_msg)
+
+                self.root.after(0, on_error)
+
         threading.Thread(target=task, daemon=True).start()
 
     def _backup_to_archive(self):

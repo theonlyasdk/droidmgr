@@ -19,6 +19,7 @@ from .capture import (
 )
 from .apk_extract import extract_apk
 from .llm_report_dialog import LLMReportDialog, LLMReportProgressDialog
+from .bugreport_dialog import BugReportDialog, BugReportProgressDialog
 from .wireless_dialog import WirelessADBSetupDialog, ConnectWirelessDialog
 from .dpi import (
     enable_dpi_awareness,
@@ -48,6 +49,8 @@ __all__ = [
     'extract_apk',
     'LLMReportDialog',
     'LLMReportProgressDialog',
+    'BugReportDialog',
+    'BugReportProgressDialog',
     'WirelessADBSetupDialog',
     'ConnectWirelessDialog',
     'enable_dpi_awareness',
