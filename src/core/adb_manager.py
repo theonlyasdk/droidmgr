@@ -2252,6 +2252,82 @@ class ADBManager:
             raise ValueError("Device address cannot be empty.")
         return self._run_command(['disconnect', address])
 
+    def reboot_device(self, device_id: str, target: Optional[str] = None) -> str:
+        """Reboot a device, optionally into recovery or the bootloader.
+
+        Args:
+            device_id: Device ID / serial number
+            target: 'recovery', 'bootloader', 'sideload' or None for a normal reboot
+
+        Returns:
+            Output from the adb reboot command
+        """
+        if not device_id or not device_id.strip():
+            raise ValueError("Device ID cannot be empty.")
+        args = ['reboot']
+        if target:
+            args.append(target)
+        return self._run_command(args, device_id)
+
+    def shutdown_device(self, device_id: str) -> str:
+        """Power a device off.
+
+        'svc power shutdown' is tried first because it is the tidiest way to ask
+        for a power-off, but several Android releases reject the command and exit
+        non-zero. 'reboot -p' is the same power-off on those builds.
+        """
+        if not device_id or not device_id.strip():
+            raise ValueError("Device ID cannot be empty.")
+        try:
+            return self._run_command(['shell', 'svc', 'power', 'shutdown'], device_id)
+        except ADBCommandError:
+            return self._run_command(['reboot', '-p'], device_id)
+
+    def get_root_status(self, device_id: str) -> Dict[str, Any]:
+        """Report whether adb itself runs as root and whether an su binary exists.
+
+        An su binary on the device is not proof of access: it may need a prompt
+        on the device screen, or be restricted to specific apps.
+        """
+        status: Dict[str, Any] = {'adb_root': False, 'shell_uid': '', 'su_path': ''}
+        try:
+            status['shell_uid'] = self._run_command(['shell', 'id', '-u'], device_id).strip()
+        except Exception:
+            pass
+        status['adb_root'] = status['shell_uid'] == '0'
+
+        try:
+            su = self._run_command(['shell', 'which', 'su'], device_id).strip()
+        except Exception:
+            su = ''
+        if not su:
+            # 'which' is not on every build, so try the usual locations directly.
+            try:
+                listing = self._run_command(
+                    ['shell', 'ls', '/system/xbin/su', '/system/bin/su', '/sbin/su',
+                     '/su/bin/su', '/system/sbin/su', '/debug_ramdisk/su'],
+                    device_id
+                ).strip()
+                su = listing.splitlines()[0].strip() if listing else ''
+            except Exception:
+                su = ''
+        status['su_path'] = su
+        return status
+
+    def reconnect_devices(self, offline: bool = False) -> str:
+        """Ask the adb server to re-establish device connections.
+
+        Args:
+            offline: Also drop devices sitting in the 'offline' state
+
+        Returns:
+            Output from the adb reconnect command
+        """
+        args = ['reconnect']
+        if offline:
+            args.append('offline')
+        return self._run_command(args)
+
     def get_logcat(self, device_id: str) -> subprocess.Popen:
         """Start streaming `adb logcat -v brief` for a device.
 

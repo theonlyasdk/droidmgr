@@ -148,6 +148,22 @@ class DeviceManager:
         """Get battery, storage, temperature, uptime and WiFi in one pass."""
         return self.adb.get_health_stats(device_id)
 
+    def reboot_device(self, device_id: str, target: Optional[str] = None) -> str:
+        """Reboot a device, optionally into recovery or the bootloader."""
+        return self.adb.reboot_device(device_id, target)
+
+    def shutdown_device(self, device_id: str) -> str:
+        """Power a device off."""
+        return self.adb.shutdown_device(device_id)
+
+    def get_root_status(self, device_id: str) -> Dict[str, Any]:
+        """Report root availability for a device."""
+        return self.adb.get_root_status(device_id)
+
+    def reconnect_devices(self, offline: bool = False) -> str:
+        """Ask the adb server to re-establish device connections."""
+        return self.adb.reconnect_devices(offline)
+
 
     
     def list_files(self, device_id: str, path: str = '/sdcard/', show_hidden: bool = True, use_exact_sizes: bool = False) -> List[Dict[str, Any]]:

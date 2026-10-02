@@ -58,6 +58,21 @@ CORE_SYSTEM_PACKAGES = {
 
 SYSTEM_APP_PATHS = ('/system', '/product', '/vendor', '/system_ext', '/odm', '/apex')
 
+# Times (ms) to refresh the device list after a reboot or an adb reconnect, while
+# the device is still coming back.
+_RECONNECT_POLL_DELAYS = (8000, 20000, 35000)
+
+# Power menu actions: the label shown to the user, the adb reboot target (None for
+# a normal reboot or a shutdown), and the detail shown in the confirmation prompt.
+_POWER_ACTIONS = {
+    'reboot': ('Reboot', None, 'The device will restart normally.'),
+    'recovery': ('Reboot to Recovery', 'recovery', 'The device will restart into recovery.'),
+    'bootloader': ('Reboot to Bootloader', 'bootloader',
+                   'The device will restart into the bootloader (fastboot) mode, '
+                   'where adb cannot talk to it.'),
+    'shutdown': ('Shut Down', None, 'The device will power off and must be turned on by hand.'),
+}
+
 
 def _looks_like_system_package(package: str, app_path: str = '') -> bool:
     """Whether a package sits in a system image or is a known core app."""
@@ -168,6 +183,14 @@ class MainWindow:
         device_menu.add_separator()
         device_menu.add_command(label="Connect Wirelessly...", command=self._show_connect_wireless_dialog)
         device_menu.add_command(label="Disconnect Wireless Device", command=self._disconnect_wireless_device)
+        device_menu.add_separator()
+        device_menu.add_command(label="Reboot", command=lambda: self._power_action('reboot'))
+        device_menu.add_command(label="Reboot to Recovery", command=lambda: self._power_action('recovery'))
+        device_menu.add_command(label="Reboot to Bootloader", command=lambda: self._power_action('bootloader'))
+        device_menu.add_command(label="Shut Down", command=lambda: self._power_action('shutdown'))
+        device_menu.add_separator()
+        device_menu.add_command(label="Check Root Access", command=self._check_root_access)
+        device_menu.add_command(label="Reconnect ADB", command=self._reconnect_adb)
         device_menu.add_separator()
         device_menu.add_command(label="Backup to archive...", command=self._backup_to_archive)
         device_menu.add_command(label="Restore from backup...", command=self._restore_from_backup)
@@ -892,6 +915,108 @@ class MainWindow:
             self._refresh_devices()
         except Exception as e:
             self._show_error("Disconnect Error", str(e))
+
+    def _power_action(self, action):
+        """Reboot or power off the selected device, after confirming."""
+        if not self._require_device():
+            return
+
+        label, target, detail = _POWER_ACTIONS[action]
+        if not messagebox.askyesno(
+                label,
+                f"{label} device '{self.selected_device}'?\n\n{detail}\n\n"
+                "Unsaved work on the device will be lost.",
+                parent=self.root):
+            return
+
+        device_id = self.selected_device
+        is_shutdown = action == 'shutdown'
+        self._set_status(f"{label} requested...")
+
+        def task():
+            try:
+                if is_shutdown:
+                    self.device_manager.shutdown_device(device_id)
+                else:
+                    self.device_manager.reboot_device(device_id, target)
+            except Exception as e:
+                msg = str(e)
+                self.root.after(0, lambda: self._show_error(f"{label} Failed", msg))
+                return
+            self.root.after(0, lambda: self._on_power_sent(label, device_id, is_shutdown))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _on_power_sent(self, label, device_id, is_shutdown):
+        """Report a delivered power command and watch for the device coming back."""
+        self._refresh_devices()
+        self._set_status(f"{label} sent to {device_id}")
+        # A powered-off device never comes back on its own.
+        if not is_shutdown:
+            for delay in _RECONNECT_POLL_DELAYS:
+                self.root.after(delay, self._refresh_devices)
+
+    def _check_root_access(self):
+        """Report whether the selected device gives adb root access."""
+        if not self._require_device():
+            return
+
+        device_id = self.selected_device
+        self._set_status("Checking root access...")
+
+        def task():
+            try:
+                status = self.device_manager.get_root_status(device_id)
+            except Exception as e:
+                msg = str(e)
+                self.root.after(0, lambda: self._show_error("Root Check Failed", msg))
+                return
+            self.root.after(0, lambda: self._show_root_status(status))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _show_root_status(self, status):
+        """Explain what the root check found."""
+        uid = status.get('shell_uid') or 'unknown'
+        su_path = status.get('su_path')
+
+        if status.get('adb_root'):
+            summary = ("adb is running as root (uid 0).\n"
+                       "System files and commands are unrestricted.")
+        elif su_path:
+            summary = (f"adb is not root (shell uid {uid}).\n\n"
+                       f"An su binary is present at:\n{su_path}\n\n"
+                       "It may still need approval on the device screen, or be limited "
+                       "to certain apps.")
+        else:
+            summary = (f"adb is not root (shell uid {uid}).\n\n"
+                       "No su binary found. The device is not rooted, or root is hidden.")
+
+        self._set_status("Root check complete: "
+                         + ("root available" if status.get('adb_root') else "not root"))
+        messagebox.showinfo("Root Access", summary, parent=self.root)
+
+    def _reconnect_adb(self):
+        """Ask the adb server to re-establish device connections."""
+        self._set_status("Reconnecting through ADB...")
+
+        def task():
+            try:
+                output = self.device_manager.reconnect_devices()
+            except Exception as e:
+                msg = str(e)
+                self.root.after(0, lambda: self._show_error("Reconnect Failed", msg))
+                return
+            self.root.after(0, lambda: self._on_adb_reconnected(output))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _on_adb_reconnected(self, output):
+        self._refresh_devices()
+        detail = ' '.join((output or '').split())
+        self._set_status(f"ADB reconnect sent{': ' + detail if detail else ''}")
+        for delay in _RECONNECT_POLL_DELAYS:
+            self.root.after(delay, self._refresh_devices)
 
     def _show_device_context_menu(self, event):
         """Show context menu for a device row in device_tree."""
