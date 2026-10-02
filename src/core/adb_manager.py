@@ -5,6 +5,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
+import ipaddress
 import re
 import time
 import queue
@@ -479,6 +480,397 @@ def _summarise_bugreport_archive(path: str) -> Dict[str, Any]:
         pass
 
     return summary
+
+
+# --- Network inspection -------------------------------------------------------
+
+# 'ip addr' names the interface before its flags and repeats its state and MTU
+# on the same line. The interface itself may carry an '@if' suffix when it sits
+# on top of another, which is not part of its name.
+_IP_INTERFACE = re.compile(r'^\d+:\s+([^:@]+)(?:@\S+)?:\s*<([^>]*)>')
+_IP_MTU = re.compile(r'\bmtu (\d+)')
+_IP_STATE = re.compile(r'\bstate (\w+)')
+_IP_ADDRESS = re.compile(r'^\s+(inet6?)\s+(\S+)')
+_IP_MAC = re.compile(r'^\s+link/\S+\s+([0-9a-fA-F:]+)')
+
+# Only the default route matters for reaching anywhere off the device.
+_IP_ROUTE_VIA = re.compile(r'\bvia (\S+)')
+_IP_ROUTE_DEV = re.compile(r'\bdev (\S+)')
+_IP_ROUTE_SRC = re.compile(r'\bsrc (\S+)')
+
+# 'dumpsys netstats' is a run of titled sections. Each one reports the same
+# bytes under a different grouping, so only 'UID stats' counts each app once.
+_NETSTATS_SECTION = re.compile(r'^([A-Za-z][A-Za-z ]*):\s*$')
+_NETSTATS_IDENT = re.compile(r'\buid=(-?\d+)\s')
+_NETSTATS_NETWORK = re.compile(r'networkId="([^"]*)"')
+_NETSTATS_BUCKET = re.compile(
+    r'st=(-?\d+)\s+rb=(\d+)\s+rp=(\d+)\s+tb=(\d+)\s+tp=(\d+)\s+op=(\d+)')
+
+# 'dumpsys connectivity' lists every registered network request. The kind of
+# request says whether an app is asking for data, listening for it, or both.
+_CONNECTIVITY_REQUEST = re.compile(
+    r'uid/pid:(\d+)/(\d+)\s+NetworkRequest\s*\[\s*([A-Z_]+)\s+id=\d+,\s*\[')
+_CONNECTIVITY_TRANSPORTS = re.compile(r'Transports:\s*([A-Z_|]+)')
+_CONNECTIVITY_CAPABILITIES = re.compile(r'Capabilities:\s*([A-Z_&|]+)')
+
+# The addresses a network hands out for name lookups live in the active
+# network's link properties, which are absent while nothing is connected.
+_CONNECTIVITY_DNS = re.compile(r'DnsAddresses:\s*\[([^\]]*)\]')
+_CONNECTIVITY_DEFAULT = re.compile(r'Active default network:\s*(\S+)')
+
+# ping answers in its own words: a reply line per packet, then a summary. The
+# round-trip line is missing altogether when every packet was lost.
+_PING_REPLY = re.compile(r'time[=<]\s*([\d.]+)\s*ms')
+_PING_SUMMARY = re.compile(
+    r'(\d+)\s+packets transmitted,\s*(\d+)(?:\s+packets)?\s+received')
+_PING_LOSS = re.compile(r'([\d.]+)%\s*packet loss')
+_PING_RTT = re.compile(
+    r'rtt\s+min/avg/max(?:\S*)?\s*=\s*([\d.]+)/([\d.]+)/([\d.]+)(?:/([\d.]+))?')
+
+# 'ss' cannot be used: it wants a netlink socket the shell user may not open.
+# '/proc/net' is world-readable and carries the same rows with their uid.
+_TCP_STATES = {
+    '01': 'ESTABLISHED', '02': 'SYN_SENT', '03': 'SYN_RECV', '04': 'FIN_WAIT1',
+    '05': 'FIN_WAIT2', '06': 'TIME_WAIT', '07': 'CLOSE', '08': 'CLOSE_WAIT',
+    '09': 'LAST_ACK', '0A': 'LISTEN', '0B': 'CLOSING',
+}
+
+# An address of all zeroes with port zero is how the kernel writes "nobody".
+_UNSPECIFIED_ADDRESSES = frozenset({'0.0.0.0:0', ':::0', '[::]:0'})
+
+
+def _parse_ip_addr(output: str) -> List[Dict[str, Any]]:
+    """Read the interfaces and their addresses out of 'ip addr' output."""
+    interfaces: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+
+    for line in output.splitlines():
+        heading = _IP_INTERFACE.match(line)
+        if heading:
+            current = {
+                'name': heading.group(1).strip(),
+                'flags': [flag for flag in heading.group(2).split(',') if flag],
+                'mtu': None,
+                'state': None,
+                'mac': '',
+                'ipv4': [],
+                'ipv6': [],
+            }
+            mtu = _IP_MTU.search(line)
+            if mtu:
+                current['mtu'] = int(mtu.group(1))
+            state = _IP_STATE.search(line)
+            if state:
+                current['state'] = state.group(1)
+            interfaces.append(current)
+            continue
+
+        if current is None:
+            continue
+
+        address = _IP_ADDRESS.match(line)
+        if address:
+            family = 'ipv4' if address.group(1) == 'inet' else 'ipv6'
+            current[family].append(address.group(2).split('/')[0])
+            continue
+
+        mac = _IP_MAC.match(line)
+        if mac:
+            current['mac'] = mac.group(1)
+
+    return interfaces
+
+
+def _pick_active_interface(interfaces: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The interface carrying the address a remote peer could reach.
+
+    A phone may hold several up at once, so a routable address is the only
+    reliable test, and loopback is not one: a device with nothing else up has no
+    interface to report rather than one that only talks to itself. Wireless and
+    cellular names come first so that a VPN or hotspot interface does not
+    outrank the interface behind it.
+    """
+    preferred = ('wlan', 'rmnet', 'ccmni', 'eth', 'ap', 'swlan')
+
+    def rank(interface: Dict[str, Any]) -> Tuple[int, int]:
+        if interface['state'] not in ('UP', 'UNKNOWN'):
+            return (2, 0)
+        for index, prefix in enumerate(preferred):
+            if interface['name'].startswith(prefix):
+                return (index, 0)
+        return (1, 0)
+
+    candidates = [
+        iface for iface in interfaces
+        if iface['name'] != 'lo'
+        and any(not address.startswith('127.') for address in iface['ipv4'])
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=rank)
+
+
+def _parse_ip_route(output: str) -> Dict[str, str]:
+    """The default route: where traffic goes, by which interface, from what address."""
+    for line in output.splitlines():
+        if not line.startswith('default'):
+            continue
+        via = _IP_ROUTE_VIA.search(line)
+        dev = _IP_ROUTE_DEV.search(line)
+        src = _IP_ROUTE_SRC.search(line)
+        if not via:
+            continue
+        return {
+            'gateway': via.group(1),
+            'interface': dev.group(1) if dev else '',
+            'source': src.group(1) if src else '',
+            'line': line.strip(),
+        }
+    return {}
+
+
+def _parse_netstats_uid_stats(output: str) -> Dict[int, Dict[str, Any]]:
+    """Bytes moved per uid, from the 'UID stats' section of 'dumpsys netstats'.
+
+    Only that section counts each app once. 'Dev stats' holds the device as a
+    whole, 'UID tag stats' splits one app across per-socket tags, and the XT
+    sections are the same bytes as the iptables layer saw them, so adding the
+    sections together would multiply every total several times over.
+
+    Within the section a uid appears once per network it used and again per
+    state, and each of those carries an hourly bucket per entry, so every
+    bucket is added into the one figure for that uid.
+    """
+    totals: Dict[int, Dict[str, Any]] = {}
+    section = ''
+    uid: Optional[int] = None
+
+    for line in output.splitlines():
+        heading = _NETSTATS_SECTION.match(line)
+        if heading:
+            section = heading.group(1)
+            uid = None
+            continue
+        if section != 'UID stats':
+            continue
+
+        if 'ident=' in line:
+            match = _NETSTATS_IDENT.search(line)
+            uid = int(match.group(1)) if match else None
+            if uid is not None and uid not in totals:
+                totals[uid] = {
+                    'rx_bytes': 0, 'rx_packets': 0,
+                    'tx_bytes': 0, 'tx_packets': 0, 'operations': 0,
+                    'networks': set(),
+                }
+            if uid is not None:
+                network = _NETSTATS_NETWORK.search(line)
+                if network and network.group(1):
+                    totals[uid]['networks'].add(network.group(1))
+            continue
+
+        if uid is None:
+            continue
+        bucket = _NETSTATS_BUCKET.search(line)
+        if bucket:
+            entry = totals[uid]
+            entry['rx_bytes'] += int(bucket.group(2))
+            entry['rx_packets'] += int(bucket.group(3))
+            entry['tx_bytes'] += int(bucket.group(4))
+            entry['tx_packets'] += int(bucket.group(5))
+            entry['operations'] += int(bucket.group(6))
+
+    return totals
+
+
+def _decode_socket_address(token: str) -> str:
+    """Turn one '/proc/net' address into the dotted form a reader expects.
+
+    The kernel writes each 32-bit word in the host's own order, so the bytes of
+    a word are reversed. An IPv6 address holds four such words, each reversed in
+    the same way while the words themselves stay in order.
+    """
+    address, _, port = token.partition(':')
+    try:
+        raw = bytes.fromhex(address)
+    except ValueError:
+        return token
+
+    if len(raw) == 4:
+        host = str(ipaddress.IPv4Address(raw[::-1]))
+    elif len(raw) == 16:
+        words = b''.join(raw[index:index + 4][::-1] for index in range(0, 16, 4))
+        host = str(ipaddress.IPv6Address(words))
+    else:
+        return token
+
+    try:
+        number = int(port, 16)
+    except ValueError:
+        number = 0
+    return f'{host}:{number}'
+
+
+def _parse_proc_net(output: str, protocol: str, names: Dict[int, str]) -> List[Dict[str, Any]]:
+    """One row per open socket, from a '/proc/net' table.
+
+    The rows carry the uid of the app that owns the socket, which is what makes
+    them worth reading: without it a table of addresses says nothing about which
+    app is talking to whom.
+    """
+    sockets: List[Dict[str, Any]] = []
+
+    for line in output.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 8:
+            continue
+        try:
+            uid = int(fields[7])
+        except ValueError:
+            continue
+
+        local = _decode_socket_address(fields[1])
+        remote = _decode_socket_address(fields[2])
+        no_peer = remote in _UNSPECIFIED_ADDRESSES or remote.endswith(':0')
+        raw_state = fields[3].upper()
+
+        if protocol == 'UDP':
+            direction = 'Outbound' if not no_peer else 'Unconnected'
+            state = 'UNCONN'
+        elif raw_state == '0A':
+            direction = 'Listening'
+            state = _TCP_STATES[raw_state]
+        elif no_peer:
+            direction = 'No peer'
+            state = _TCP_STATES.get(raw_state, raw_state)
+        else:
+            # A live TCP socket carries traffic both ways; it is not outgoing.
+            direction = 'Connected'
+            state = _TCP_STATES.get(raw_state, raw_state)
+
+        local_host, _, local_port = local.rpartition(':')
+        remote_host, _, remote_port = remote.rpartition(':')
+        sockets.append({
+            'protocol': protocol,
+            'direction': direction,
+            'state': state,
+            'local': local_host,
+            'local_port': local_port,
+            'remote': remote_host,
+            'remote_port': remote_port,
+            'uid': uid,
+            'package': names.get(uid, ''),
+        })
+
+    return sockets
+
+
+def _parse_network_requests(output: str) -> Dict[int, Dict[str, Any]]:
+    """Who has registered for network access, gathered per uid from connectivity.
+
+    Each request sits on its own line, so one pass over the lines collects the
+    kind of request, the transports it asked for and the capabilities it wants.
+    An app that has both a plain request and a listen registered appears once,
+    with everything it asked for merged in.
+    """
+    requests: Dict[int, Dict[str, Any]] = {}
+
+    for raw in output.splitlines():
+        line = raw.strip()
+        match = _CONNECTIVITY_REQUEST.match(line)
+        if not match:
+            continue
+
+        uid = int(match.group(1))
+        entry = requests.get(uid)
+        if entry is None:
+            entry = {
+                'pids': set(), 'kinds': set(), 'transports': set(),
+                'capabilities': set(), 'internet': False, 'validated': False,
+                'count': 0,
+            }
+            requests[uid] = entry
+
+        entry['count'] += 1
+        entry['pids'].add(int(match.group(2)))
+        entry['kinds'].add(match.group(3))
+
+        transports = _CONNECTIVITY_TRANSPORTS.search(line)
+        if transports:
+            entry['transports'].update(
+                name for name in transports.group(1).split('|') if name)
+
+        capabilities = _CONNECTIVITY_CAPABILITIES.search(line)
+        if capabilities:
+            wanted = capabilities.group(1).split('&')
+            entry['capabilities'].update(name for name in wanted if name)
+            if 'INTERNET' in wanted:
+                entry['internet'] = True
+            if 'VALIDATED' in wanted:
+                entry['validated'] = True
+
+    return requests
+
+
+def _parse_dns_servers(output: str) -> List[str]:
+    """The name servers offered by whichever network is up."""
+    addresses: List[str] = []
+    for group in _CONNECTIVITY_DNS.findall(output):
+        for address in re.findall(r'[0-9a-fA-F:.]{3,}', group):
+            if address not in addresses:
+                addresses.append(address)
+    return addresses
+
+
+def _parse_ping(output: str, error: str, host: str, count: int) -> Dict[str, Any]:
+    """Read a ping run out of its own output.
+
+    A host that cannot be reached is an answer rather than a failure, so the
+    statistics are allowed to be absent: an unreachable host reports no timings
+    and no summary, and says why in its error line instead.
+    """
+    result: Dict[str, Any] = {
+        'host': host,
+        'requested': count,
+        'times': [float(value) for value in _PING_REPLY.findall(output)],
+        'sent': 0,
+        'received': 0,
+        'loss': None,
+        'min': None,
+        'avg': None,
+        'max': None,
+        'jitter': None,
+        'error': '',
+    }
+
+    summary = _PING_SUMMARY.search(output)
+    if summary:
+        result['sent'] = int(summary.group(1))
+        result['received'] = int(summary.group(2))
+
+    loss = _PING_LOSS.search(output)
+    if loss:
+        result['loss'] = float(loss.group(1))
+    elif result['sent']:
+        result['loss'] = round(
+            (result['sent'] - result['received']) * 100.0 / result['sent'], 1)
+
+    rtt = _PING_RTT.search(output)
+    if rtt:
+        result['min'] = float(rtt.group(1))
+        result['avg'] = float(rtt.group(2))
+        result['max'] = float(rtt.group(3))
+        result['jitter'] = float(rtt.group(4)) if rtt.group(4) else None
+
+    if not result['times'] and not summary:
+        for line in error.splitlines():
+            if line.strip():
+                result['error'] = line.strip()
+                break
+        if not result['error']:
+            result['error'] = 'No reply from this host'
+
+    return result
 
 
 def _parse_forward_list(output: str) -> List[Dict[str, str]]:
@@ -2096,6 +2488,214 @@ class ADBManager:
         lines.append('  when a report will do.')
 
         return '\n'.join(lines)
+
+    def _run_probe(self, args: List[str], device_id: Optional[str] = None,
+                   timeout: Optional[int] = None) -> Tuple[str, str]:
+        """Run a command and return its stdout and stderr, exit code ignored.
+
+        Diagnostic commands report their findings by failing: an unreachable host
+        is the answer to a ping, not a broken command, so raising on a non-zero
+        exit would throw away the only useful part of the run.
+        """
+        cmd = [self.adb_path]
+        if device_id:
+            cmd.extend(['-s', device_id])
+        cmd.extend(args)
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=False,
+                timeout=timeout
+            )
+        except FileNotFoundError:
+            raise ADBNotFoundError(f"ADB executable not found at '{self.adb_path}'. Please verify the path in Preferences > External Tools.")
+        except subprocess.TimeoutExpired:
+            raise ADBCommandError(f"ADB command timed out: {' '.join(args)}")
+
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+
+        # A device that has gone away still fails the command, and that one
+        # failure is worth the friendly message rather than a raw exit code.
+        lower = (stderr or stdout).lower()
+        if 'device not found' in lower or 'no devices/emulators found' in lower:
+            raise ADBDeviceNotFoundError(f"Device not found or disconnected: {stderr}")
+        if 'device offline' in lower or 'device unauthorized' in lower:
+            raise ADBDeviceOfflineError(f"Device is offline or unauthorized: {stderr}")
+
+        return stdout, stderr
+
+    # 'pm list packages -U' walks every package on the device, and each of the
+    # network tables needs the same answer, so it is held briefly rather than
+    # asked for again every time a tab is opened.
+    UID_MAP_TTL = 60
+
+    def _get_uid_map(self, device_id: str) -> Dict[int, str]:
+        """Map each app's uid to its package name, cached for a minute."""
+        cached = getattr(self, '_uid_map_cache', None)
+        now = time.time()
+        if cached and cached[0] == device_id and now - cached[1] < self.UID_MAP_TTL:
+            return cached[2]
+
+        mapping: Dict[int, str] = {}
+        try:
+            output = self._run_command(
+                ['shell', 'pm', 'list', 'packages', '-U'], device_id, timeout=30)
+        except Exception:
+            output = ''
+
+        for package, uid in re.findall(r'package:(\S+)\s+uid:(\d+)', output):
+            mapping[int(uid)] = package
+
+        self._uid_map_cache = (device_id, now, mapping)
+        return mapping
+
+    def get_network_info(self, device_id: str) -> Dict[str, Any]:
+        """Everything about the connection in one pass.
+
+        The four sources are independent, so they run together. A device that
+        refuses one of them still reports the rest, since being able to say which
+        half is missing is what makes the rest useful.
+        """
+        jobs = {
+            'addresses': lambda: self._run_command(
+                ['shell', 'ip', '-4', 'addr', 'show'], device_id, timeout=15),
+            'route': lambda: self._run_command(
+                ['shell', 'ip', 'route'], device_id, timeout=15),
+            'wifi': lambda: self._run_command(
+                ['shell', 'cmd', 'wifi', 'status'], device_id, timeout=15),
+            'connectivity': lambda: self._run_command(
+                ['shell', 'dumpsys', 'connectivity'], device_id, timeout=25),
+        }
+
+        raw: Dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            futures = {name: pool.submit(job) for name, job in jobs.items()}
+            for name, future in futures.items():
+                try:
+                    raw[name] = future.result()
+                except Exception:
+                    raw[name] = ''
+
+        # 'cmd wifi status' needs a privilege the shell does not have on some
+        # builds, where the full dump is the only way to the network's name.
+        wifi = _parse_wifi_status(raw['wifi'])
+        if not wifi.get('ssid') and not wifi.get('state'):
+            try:
+                wifi = _parse_wifi_status(self._run_command(
+                    ['shell', 'dumpsys', 'wifi'], device_id, timeout=20))
+            except Exception:
+                pass
+
+        interfaces = _parse_ip_addr(raw['addresses'])
+        route = _parse_ip_route(raw['route'])
+        active = _pick_active_interface(interfaces)
+
+        default_network = _CONNECTIVITY_DEFAULT.search(raw['connectivity'])
+        return {
+            'wifi': wifi,
+            'interfaces': interfaces,
+            'active_interface': active,
+            'gateway': route.get('gateway', ''),
+            'route_interface': route.get('interface', ''),
+            'source_address': route.get('source', ''),
+            'dns': _parse_dns_servers(raw['connectivity']),
+            'default_network': default_network.group(1) if default_network else '',
+        }
+
+    def get_app_network_usage(self, device_id: str) -> List[Dict[str, Any]]:
+        """Bytes each app has received and sent since boot, largest first.
+
+        The figures cover the device's own history rather than the last refresh,
+        so this answers what an app has been doing over the life of the boot
+        rather than what it did in the last few seconds.
+        """
+        output = self._run_command(
+            ['shell', 'dumpsys', 'netstats', 'detail'], device_id, timeout=45)
+        totals = _parse_netstats_uid_stats(output)
+        names = self._get_uid_map(device_id)
+
+        rows: List[Dict[str, Any]] = []
+        for uid, entry in totals.items():
+            received = entry['rx_bytes']
+            sent = entry['tx_bytes']
+            if not received and not sent:
+                continue
+            rows.append({
+                'uid': uid,
+                'package': names.get(uid, ''),
+                'rx_bytes': received,
+                'tx_bytes': sent,
+                'total_bytes': received + sent,
+                'rx_packets': entry['rx_packets'],
+                'tx_packets': entry['tx_packets'],
+                'networks': ', '.join(sorted(entry['networks'])),
+            })
+
+        rows.sort(key=lambda row: -row['total_bytes'])
+        return rows
+
+    def get_active_connections(self, device_id: str) -> List[Dict[str, Any]]:
+        """The sockets the device holds open, with the app behind each one."""
+        names = self._get_uid_map(device_id)
+        sockets: List[Dict[str, Any]] = []
+
+        for table, protocol in (('tcp', 'TCP'), ('tcp6', 'TCP'),
+                                ('udp', 'UDP'), ('udp6', 'UDP')):
+            try:
+                output = self._run_command(['shell', 'cat', f'/proc/net/{table}'],
+                                           device_id, timeout=15)
+            except Exception:
+                continue
+            sockets.extend(_parse_proc_net(output, protocol, names))
+
+        sockets.sort(key=lambda row: (row['protocol'], row['state'],
+                                      row['remote'], row['remote_port']))
+        return sockets
+
+    def get_network_requests(self, device_id: str) -> List[Dict[str, Any]]:
+        """Which apps have registered for network access, and on what."""
+        output = self._run_command(
+            ['shell', 'dumpsys', 'connectivity'], device_id, timeout=25)
+        requests = _parse_network_requests(output)
+        names = self._get_uid_map(device_id)
+
+        rows = []
+        for uid, entry in requests.items():
+            rows.append({
+                'uid': uid,
+                'package': names.get(uid, ''),
+                'pids': ', '.join(str(pid) for pid in sorted(entry['pids'])),
+                'kinds': ', '.join(sorted(entry['kinds'])),
+                'transports': ', '.join(sorted(entry['transports'])),
+                'internet': entry['internet'],
+                'validated': entry['validated'],
+                'count': entry['count'],
+            })
+        rows.sort(key=lambda row: (not row['internet'], row['package'], row['uid']))
+        return rows
+
+    def ping_host(self, device_id: str, host: str, count: int = 4) -> Dict[str, Any]:
+        """Time the round trip to a host from the device itself.
+
+        Pinged from the device rather than from the host, because the route to
+        the internet is the device's and not the workstation's.
+        """
+        target = (host or '').strip()
+        if not target:
+            return _parse_ping('', 'No host given', '', count)
+
+        try:
+            packets = max(1, min(10, int(count)))
+        except (TypeError, ValueError):
+            packets = 4
+
+        # Each packet waits up to two seconds for a reply, with slack for the
+        # interval between them and for the shell round trip itself.
+        stdout, stderr = self._run_probe(
+            ['shell', 'ping', '-c', str(packets), '-W', '2', target],
+            device_id, timeout=packets * 3 + 15)
+        return _parse_ping(f'{stdout}\n{stderr}', stderr, target, packets)
 
     def is_directory_writable(self, device_id: str, path: str) -> bool:
         """Check dynamically if a directory on the device is writable."""

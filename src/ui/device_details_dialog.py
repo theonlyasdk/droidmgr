@@ -5,6 +5,7 @@ from tkinter import ttk, messagebox
 import threading
 import time
 from .dpi import setup_window_dpi
+from .network_inspector import NetworkInspector
 
 HEALTH_REFRESH_MS = 5000
 
@@ -93,9 +94,11 @@ class DeviceDetailsDialog(tk.Toplevel):
         self.displays_tab = ttk.Frame(self.notebook, padding=10)
         self.cameras_tab = ttk.Frame(self.notebook, padding=10)
         self.health_tab = ttk.Frame(self.notebook, padding=10)
+        self.network_tab = ttk.Frame(self.notebook, padding=10)
 
         self.notebook.add(self.specs_tab, text="Specifications")
         self.notebook.add(self.health_tab, text="Health")
+        self.notebook.add(self.network_tab, text="Network")
         self.notebook.add(self.encoders_tab, text="Encoders")
         self.notebook.add(self.displays_tab, text="Displays")
         self.notebook.add(self.cameras_tab, text="Cameras")
@@ -105,6 +108,13 @@ class DeviceDetailsDialog(tk.Toplevel):
         self.specs_scroll.pack(fill=tk.BOTH, expand=True)
 
         self._create_health_tab()
+
+        # The network tables cost a few hundred kilobytes of device output to
+        # read, so they are left alone until the tab is actually looked at.
+        self.network_inspector = NetworkInspector(
+            self.network_tab, self.device_id, self.device_manager)
+        self.network_inspector.pack(fill=tk.BOTH, expand=True)
+        self.notebook.bind('<<NotebookTabChanged>>', self._on_tab_changed)
 
         # Loading indicators
         self.loading_labels = {}
@@ -193,6 +203,14 @@ class DeviceDetailsDialog(tk.Toplevel):
         self.health_updated_var = tk.StringVar(value='')
         ttk.Label(controls, textvariable=self.health_updated_var,
                   foreground='gray').pack(side=tk.RIGHT)
+
+    def _on_tab_changed(self, event=None):
+        """Read the network tab the first time it is shown, and never before."""
+        if self.notebook.index(self.notebook.select()) != self.notebook.index(self.network_tab):
+            return
+        if self.network_inspector.loaded:
+            return
+        self.network_inspector.load()
 
     def _cancel_health_refresh(self):
         if self._health_job is not None:
