@@ -113,23 +113,26 @@ class MainWindow:
         menubar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(label="Preferences", command=self._show_preferences)
         file_menu.add_separator()
-        file_menu.add_command(label="Refresh Devices", command=self._refresh_devices)
-        file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_closing)
         
         device_menu = tk.Menu(menubar, tearoff=0)
+        self.device_menu = device_menu
         menubar.add_cascade(label="Device", menu=device_menu)
-        device_menu.add_command(label="Toggle Mirroring", command=self._toggle_mirroring)
+        device_menu.add_command(label="Refresh Devices", command=self._refresh_devices)
+        device_menu.add_separator()
+        device_menu.add_command(label="Start Mirroring", command=self._toggle_mirroring)
+        self.mirror_menu_index = device_menu.index('end')
+        device_menu.add_separator()
         device_menu.add_command(label="Connect Wirelessly...", command=self._show_connect_wireless_dialog)
         device_menu.add_command(label="Disconnect Wireless Device", command=self._disconnect_wireless_device)
         device_menu.add_separator()
         device_menu.add_command(label="Backup to archive...", command=self._backup_to_archive)
         device_menu.add_command(label="Restore from backup...", command=self._restore_from_backup)
+        device_menu.add_separator()
         device_menu.add_command(label="Generate LLM Report", command=self._generate_llm_report)
 
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Tools", menu=tools_menu)
-        tools_menu.add_command(label="Open Shell", command=self._open_shell_tab)
         tools_menu.add_command(label="Take Screenshot", command=self._take_screenshot)
         tools_menu.add_command(label="Record Screen...", command=self._record_screen)
 
@@ -400,7 +403,7 @@ class MainWindow:
         
         if has_selection:
             is_mirroring = self.device_manager.scrcpy.is_mirroring(self.selected_device)
-            self.mirror_btn.config(text="Stop Mirroring" if is_mirroring else "Start Mirroring")
+            self._update_mirror_label(is_mirroring)
         
         if hasattr(self, 'connect_wireless_btn'):
             self.connect_wireless_btn.config(state=tk.NORMAL)
@@ -751,6 +754,12 @@ class MainWindow:
 
 
     
+    def _update_mirror_label(self, is_mirroring: bool):
+        """Keep the mirroring toolbar button and menu item showing the same action."""
+        label = "Stop Mirroring" if is_mirroring else "Start Mirroring"
+        self.mirror_btn.config(text=label)
+        self.device_menu.entryconfig(self.mirror_menu_index, label=label)
+
     def _toggle_mirroring(self):
         if not self._require_device():
             return
@@ -760,7 +769,7 @@ class MainWindow:
         if is_mirroring:
             try:
                 self.device_manager.stop_mirroring(self.selected_device)
-                self.mirror_btn.config(text="Start Mirroring")
+                self._update_mirror_label(False)
                 self._set_status("Mirroring stopped")
             except Exception as e:
                 self._show_error("Mirroring Error", str(e))
@@ -770,7 +779,7 @@ class MainWindow:
                     process = self.device_manager.start_mirroring(self.selected_device, **self.mirror_settings)
                     
                     def start_dialog():
-                        self.mirror_btn.config(text="Stop Mirroring")
+                        self._update_mirror_label(True)
                         self._set_status("Mirroring started")
                         ScrcpyOutputDialog(self.root, process, self.selected_device, self.device_manager.stop_mirroring)
                         
