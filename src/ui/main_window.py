@@ -410,8 +410,19 @@ class MainWindow:
         # Dropping APKs from Explorer installs them, when the platform supports it.
         self.drop_supported = enable_file_drop(list_frame, self._on_files_dropped)
         if self.drop_supported:
-            ttk.Label(list_frame, text="Drop .apk files here to install them",
-                      foreground='gray').pack(anchor='w', padx=4, pady=(2, 0))
+            # An empty-state hint, parented to the list itself so that centring
+            # it ignores the label frame's border and its scrollbar. It is hidden
+            # as soon as there are rows, so it never covers anything to click.
+            self.drop_hint = ttk.Label(
+                self.app_tree,
+                text="No applications found.\nDrop .apk files here to install them.",
+                foreground='gray',
+                anchor='center',
+                justify='center'
+            )
+            self.drop_hint.place(relx=0.5, rely=0.5, anchor='center')
+            # Re-wrap as the list is resized, so the hint never runs off the side.
+            self.app_tree.bind('<Configure>', self._on_drop_hint_configure)
 
 
 
@@ -1316,6 +1327,7 @@ class MainWindow:
                     self.app_tree.delete(item)
                 tag_text = f"[Device is {status_str}]"
                 self.app_tree.insert('', tk.END, values=(tag_text, "", "", ""))
+                self._update_drop_hint()
                 self._update_app_button_states()
                 self._set_status(f"Device '{self.selected_device}' is {status_str}.")
                 return
@@ -1349,6 +1361,8 @@ class MainWindow:
                         if app['package'] in selected_packages:
                             target_ids.append(item_id)
 
+                    self._update_drop_hint()
+
                     if target_ids:
                         self.app_tree.selection_set(target_ids)
                         self.app_tree.focus(target_ids[0])
@@ -1364,6 +1378,7 @@ class MainWindow:
                     for item in self.app_tree.get_children():
                         self.app_tree.delete(item)
                     self.app_tree.insert('', tk.END, values=("[Device is offline]", "", "", ""))
+                    self._update_drop_hint()
                     self._update_app_button_states()
                     self._set_status(f"Device '{self.selected_device}' is offline or disconnected.")
                 self.root.after(0, handle_offline)
@@ -1376,6 +1391,7 @@ class MainWindow:
                             self.app_tree.delete(item)
                         tag = "[Device is unauthorized]" if "unauthorized" in lower_msg else "[Device is offline]"
                         self.app_tree.insert('', tk.END, values=(tag, "", "", ""))
+                        self._update_drop_hint()
                         self._update_app_button_states()
                         self._set_status(f"Device '{self.selected_device}' is offline or disconnected.")
                     self.root.after(0, handle_offline)
@@ -1565,6 +1581,21 @@ class MainWindow:
     def _on_files_dropped(self, paths):
         """Install APKs dropped from Explorer onto the applications list."""
         self._install_apk_paths(paths)
+
+    def _on_drop_hint_configure(self, event):
+        """Wrap the drop hint to the width the applications list currently has."""
+        available = event.width - scale_size(16, self.root)
+        if available > scale_size(80, self.root):
+            self.drop_hint.configure(wraplength=available)
+
+    def _update_drop_hint(self):
+        """Show the drop hint only while the applications list is empty."""
+        if not getattr(self, 'drop_supported', False):
+            return
+        if self.app_tree.get_children():
+            self.drop_hint.place_forget()
+        else:
+            self.drop_hint.place(relx=0.5, rely=0.5, anchor='center')
 
     def _show_forward_dialog(self):
         """Open the port forward manager for the selected device."""

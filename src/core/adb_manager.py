@@ -295,6 +295,51 @@ def _parse_uptime(output: str) -> float:
         return 0.0
 
 
+# 'dumpsys diskstats' reports one bracketed array per kind of figure, each with
+# one entry per installed package. Package names never contain a bracket, so a
+# negated character class is enough to capture an array's contents.
+_DISKSTATS_ARRAYS = re.compile(
+    r'^(Package Names|App Sizes|App Data Sizes|Cache Sizes):\s*\[([^][]*)\]\s*$',
+    re.MULTILINE)
+
+
+def _decode_array(contents: str) -> List[Any]:
+    """Decode one of diskstats' bracketed arrays, or nothing if it is malformed."""
+    try:
+        values = json.loads(f'[{contents}]')
+    except ValueError:
+        return []
+    return values if isinstance(values, list) else []
+
+
+def _parse_diskstats(output: str) -> Dict[str, int]:
+    """Map each package name to its APK size in bytes, from 'dumpsys diskstats'.
+
+    Reading the files under /data/app is not an option: that directory belongs to
+    the system user, so 'ls -l' answers "Permission denied" and every size comes
+    back as zero. The disk stats service runs with the privileges needed and
+    publishes one 'App Sizes' entry per package instead.
+
+    A device with several users prints the whole group once per user, so the
+    sizes of each group are added together. 'App Sizes' counts the code an app
+    ships, which is what an app size means everywhere else in Android; packages
+    with no APK of their own, such as theme plugins, legitimately come back zero.
+    """
+    sizes: Dict[str, int] = {}
+    names: List[str] = []
+
+    for label, contents in _DISKSTATS_ARRAYS.findall(output):
+        if label == 'Package Names':
+            names = [str(name) for name in _decode_array(contents)]
+        elif label == 'App Sizes' and names:
+            for index, size in enumerate(_decode_array(contents)):
+                if index < len(names) and isinstance(size, int):
+                    sizes[names[index]] = sizes.get(names[index], 0) + size
+            names = []
+
+    return sizes
+
+
 def _parse_forward_list(output: str) -> List[Dict[str, str]]:
     """Parse 'adb forward --list' / 'adb reverse --list' output.
 
@@ -783,53 +828,19 @@ class ADBManager:
         
         return sorted(apps)
 
-    # APK sizes come from one 'ls -l' over shell globs. The device expands the
-    # globs and ls reports every APK in a single process, so a device with 200
-    # apps costs one fork instead of one 'wc' and one 'tr' per APK. The globs
-    # are deliberately non-overlapping, since ls prints a repeated path twice.
-    _APK_SIZE_SCRIPT = (
-        'ls -l '
-        '/data/app/*/*/*.apk '
-        '/system/*/*/*.apk '
-        '/product/*/*/*.apk '
-        '/vendor/*/*/*.apk '
-        '/system_ext/*/*/*.apk '
-        '/odm/*/*/*.apk '
-        '2>/dev/null'
-    )
+    def _get_app_sizes(self, device_id: str, apps: List[Dict[str, Any]]) -> Dict[str, int]:
+        """APK bytes per package, from one batched call to the disk stats service.
 
-    def _get_apk_sizes(self, device_id: str, apps: List[Dict[str, Any]]) -> Dict[str, int]:
-        """Total APK bytes per package, from one batched shell call.
-
-        Every APK sitting beside a package's base APK is added in, so split
-        files count too and the total matches the figure the Play Store shows.
-        A package whose APK was not listed comes back as zero.
+        Sizes are keyed by package name and cover system and user apps alike. A
+        package the service does not list comes back as zero.
         """
         try:
-            output = self._run_command(['shell', self._APK_SIZE_SCRIPT], device_id)
+            output = self._run_command(['shell', 'dumpsys', 'diskstats'], device_id)
         except Exception:
             return {}
 
-        by_dir: Dict[str, int] = {}
-        seen_paths = set()
-        for line in output.split('\n'):
-            # -rw-r--r-- 1 root root 4812345 2024-01-31 09:12 /data/app/.../base.apk
-            fields = line.split()
-            if len(fields) < 8 or not fields[0].startswith('-'):
-                continue
-            path = fields[-1]
-            if path in seen_paths:
-                continue
-            seen_paths.add(path)
-            try:
-                size = int(fields[4])
-            except ValueError:
-                continue
-            directory = os.path.dirname(path)
-            by_dir[directory] = by_dir.get(directory, 0) + size
-
-        return {app['package']: by_dir.get(os.path.dirname(app['path']), 0)
-                for app in apps}
+        sizes = _parse_diskstats(output)
+        return {app['package']: sizes.get(app['package'], 0) for app in apps}
 
     def get_installed_apps_details(self, device_id: str) -> List[Dict[str, Any]]:
         """Get installed apps with package, formatted name, path, type and APK size."""
@@ -852,7 +863,7 @@ class ADBManager:
                             'type': 'System' if is_system else 'User'
                         })
 
-            sizes = self._get_apk_sizes(device_id, apps)
+            sizes = self._get_app_sizes(device_id, apps)
             for app in apps:
                 app['size_bytes'] = sizes.get(app['package'], 0)
 
