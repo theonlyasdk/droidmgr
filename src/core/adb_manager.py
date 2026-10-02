@@ -4,7 +4,7 @@ import os
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import re
 import time
 import queue
@@ -15,6 +15,7 @@ import hashlib
 import posixpath
 import shlex
 from .audit_logger import AuditLogger
+from . import apk_icon
 
 
 
@@ -99,7 +100,27 @@ class ADBManager:
             else:
                 raise ADBCommandError(f"ADB command failed: {clean_err}")
 
-    
+    def _run_exec_out(self, args: List[str], device_id: str, timeout: int = 60) -> bytes:
+        """Run a device command and return raw stdout bytes (for APK zip entries)."""
+        cmd = [self.adb_path, '-s', device_id, 'exec-out'] + args
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        except FileNotFoundError:
+            raise ADBNotFoundError(
+                f"ADB executable not found at '{self.adb_path}'. "
+                "Please verify the path in Preferences > External Tools."
+            )
+        except subprocess.TimeoutExpired:
+            raise ADBCommandError("ADB command timed out.")
+        if result.returncode != 0 and not result.stdout:
+            stderr = ''
+            if result.stderr:
+                stderr = result.stderr.decode('utf-8', errors='replace')
+            raise ADBCommandError(
+                f"ADB command failed: {self._sanitize_adb_error(stderr, device_id)}"
+            )
+        return result.stdout
+
     def get_devices(self) -> List[Dict[str, str]]:
         output = self._run_command(['devices', '-l'])
         devices = []
@@ -506,7 +527,8 @@ class ADBManager:
         output = self._run_command(['shell', 'dumpsys', 'package', package], device_id)
 
         info = {'package': package}
-        
+        icon_ids = apk_icon.parse_icon_resource_ids_from_dumpsys(output)
+
         for line in output.split('\n'):
             line = line.strip()
             if 'versionName=' in line:
@@ -524,7 +546,9 @@ class ADBManager:
                 info['installer'] = line.split('=')[1]
             elif 'userId=' in line:
                 info['user_id'] = line.split('=')[1]
-                
+
+        if icon_ids:
+            info['icon_res_ids'] = icon_ids
         return info
 
 
@@ -1301,121 +1325,258 @@ class ADBManager:
         except Exception:
             pass
 
-    def extract_app_icon(self, device_id: str, package: str, output_dir: str) -> Optional[str]:
-        """Extract application icon from base/system/split APK on device and save to output_dir.
-        Returns the local filepath of the extracted PNG, or None if failed.
+    def extract_app_icon(
+        self,
+        device_id: str,
+        package: str,
+        output_dir: str,
+        cache_token: Optional[str] = None,
+        icon_res_ids: Optional[List[int]] = None,
+    ) -> Optional[str]:
+        """Extract the launcher icon declared in the installed APKs.
+
+        Resolves android:icon / android:roundIcon from the binary manifest and
+        resources.arsc (the same IDs PackageManager uses), including split APKs
+        and adaptive-icon XML.         Returns a local PNG path, or None.
         """
-        import os
+        archive = None
         try:
             _validate_package(package)
-            # Purge icon cache files older than 7 days
             self.cleanup_icon_cache(output_dir, max_age_days=7)
-
-
-            # 1. Get all APK paths on device for package
+            os.makedirs(output_dir, exist_ok=True)
+            device_key = hashlib.sha256(device_id.encode('utf-8')).hexdigest()[:10]
+            token = cache_token or ''
+            token_key = hashlib.sha256(token.encode('utf-8')).hexdigest()[:10] if token else 'latest'
+            local_icon_path = os.path.join(output_dir, f"{package}_{device_key}_{token_key}_icon.png")
+            if os.path.isfile(local_icon_path) and os.path.getsize(local_icon_path) > 0:
+                return local_icon_path
 
             path_output = self._run_command(['shell', 'pm', 'path', package], device_id)
             apk_paths = []
-            for line in path_output.split('\n'):
+            for line in path_output.splitlines():
                 line = line.strip()
                 if line.startswith('package:'):
                     p = line.replace('package:', '').strip()
                     if p.endswith('.apk'):
                         apk_paths.append(p)
-            
             if not apk_paths:
                 return None
-                
-            # Sort paths to prefer base.apk or split_config first if available
-            apk_paths.sort(key=lambda x: 0 if 'base.apk' in x else (1 if 'split_config' in x else 2))
-            
-            # 2. List zip contents across all APKs
-            all_candidates = [] # list of (score, file_path, apk_path)
-            for apk_path in apk_paths:
-                try:
-                    list_output = self._run_command(['shell', 'unzip', '-l', f'"{apk_path}"'], device_id)
-                    for line in list_output.split('\n'):
-                        line = line.strip()
-                        if not line or not (line.endswith('.png') or line.endswith('.webp')):
-                            continue
-                        parts = line.split()
-                        if len(parts) < 4:
-                            continue
-                        file_path = parts[-1]
-                        
-                        score = 0
-                        filename = os.path.basename(file_path).lower()
-                        
-                        if filename in ('ic_launcher_foreground.png', 'ic_launcher_foreground.webp'):
-                            score += 120
-                        elif filename in ('ic_launcher.png', 'ic_launcher.webp'):
-                            score += 100
-                        elif 'ic_launcher_foreground' in filename:
-                            score += 90
-                        elif 'ic_launcher' in filename:
-                            score += 50
-                        elif 'launcher' in filename:
-                            score += 40
-                        elif 'icon' in filename:
-                            score += 20
-                        elif 'logo' in filename:
-                            score += 15
-                            
-                        if 'monochrome' in filename or 'background' in filename:
-                            score -= 50
-                        
-                        if 'xxhdpi' in file_path:
-                            score += 15
-                        elif 'xhdpi' in file_path:
-                            score += 12
-                        elif 'xxxhdpi' in file_path:
-                            score += 10
-                        elif 'hdpi' in file_path:
-                            score += 8
-                        elif 'mdpi' in file_path:
-                            score += 5
-                            
-                        if score > 0:
-                            all_candidates.append((score, file_path, apk_path))
-                except Exception:
-                    continue
-                
-            if not all_candidates:
-                return None
-                
-            all_candidates.sort(key=lambda x: x[0], reverse=True)
-            best_score, best_candidate, target_apk_path = all_candidates[0]
-                
-            # 3. Extract chosen PNG/WebP to local output_dir
-            local_icon_path = os.path.join(output_dir, f"{package}_icon.png")
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Remove existing local icon to avoid returning stale files if extraction fails
-            if os.path.exists(local_icon_path):
-                try:
-                    os.remove(local_icon_path)
-                except Exception:
-                    pass
+            apk_paths.sort(key=lambda path: (0 if posixpath.basename(path) == 'base.apk' else 1, path))
 
-            unique_id = uuid.uuid4().hex[:8]
-            device_temp_dir = f"/data/local/tmp/droidmgr_icon_{package}_{unique_id}"
-            
-            try:
-                self._run_command(['shell', 'unzip', '-o', f'"{target_apk_path}"', f'"{best_candidate}"', '-d', device_temp_dir], device_id)
-                device_icon_path = f"{device_temp_dir}/{best_candidate}"
-                self.download_file(device_id, device_icon_path, local_icon_path)
-                
-                if os.path.exists(local_icon_path) and os.path.getsize(local_icon_path) > 0:
-                    return local_icon_path
-            finally:
-                try:
-                    self._run_command(['shell', 'rm', '-rf', device_temp_dir], device_id)
-                except Exception:
-                    pass
-                    
+            archive = _DeviceApkArchive(self, device_id, apk_paths)
+            table = apk_icon.ResourceTable()
+            for apk_path in apk_paths:
+                arsc = archive.read(apk_path, 'resources.arsc')
+                if arsc:
+                    table.merge(apk_icon.parse_resource_table(arsc))
+
+            res_ids: List[int] = []
+            manifest = archive.read_name('AndroidManifest.xml')
+            if manifest:
+                icons = apk_icon.parse_manifest_icons(manifest)
+                res_ids.extend(icons.candidate_ids())
+            if icon_res_ids:
+                for res_id in icon_res_ids:
+                    if res_id not in res_ids:
+                        res_ids.append(res_id)
+
+            if self._render_icon_from_resources(archive, table, res_ids, local_icon_path):
+                return local_icon_path
+            if self._render_icon_from_filename_fallback(archive, local_icon_path):
+                return local_icon_path
         except Exception:
             pass
+        finally:
+            if archive is not None:
+                archive.close()
         return None
+
+    def _render_icon_from_resources(
+        self,
+        archive: '_DeviceApkArchive',
+        table: apk_icon.ResourceTable,
+        res_ids: List[int],
+        destination: str,
+    ) -> bool:
+        all_entries = archive.all_entries()
+        for res_id in res_ids:
+            rasters, xmls, color, name = apk_icon.pick_paths_for_icon(table, res_id)
+            if name:
+                guessed = apk_icon.guess_paths_from_name(all_entries, name[0], name[1])
+                rasters = apk_icon.sort_raster_paths(
+                    rasters + [path for path in guessed if apk_icon._is_raster_path(path)]
+                )
+                xmls = list(dict.fromkeys(
+                    xmls + [path for path in guessed if apk_icon._is_xml_path(path)]
+                ))
+            for path in rasters:
+                data = archive.read_name(path)
+                if data and apk_icon.decode_to_png(data, destination):
+                    return True
+            for xml_path in xmls:
+                xml_data = archive.read_name(xml_path)
+                if not xml_data:
+                    continue
+                drawable = apk_icon.parse_xml_drawable(xml_data)
+                if drawable and self._render_xml_drawable(archive, table, drawable, destination, color):
+                    return True
+            if color and apk_icon.composite_adaptive_icon(None, None, color, destination):
+                return True
+        return False
+
+    def _render_xml_drawable(
+        self,
+        archive: '_DeviceApkArchive',
+        table: apk_icon.ResourceTable,
+        drawable: apk_icon.XmlDrawable,
+        destination: str,
+        fallback_color: Optional[tuple] = None,
+    ) -> bool:
+        if drawable.kind == 'adaptive':
+            fg_bytes, fg_color = self._resolve_drawable_layer(archive, table, drawable.foreground)
+            bg_bytes, bg_color = self._resolve_drawable_layer(archive, table, drawable.background)
+            background_color = bg_color or fallback_color
+            if not fg_bytes and not bg_bytes and not background_color:
+                return False
+            return apk_icon.composite_adaptive_icon(
+                fg_bytes, bg_bytes, background_color, destination, inset=drawable.inset,
+            )
+        layer_bytes, layer_color = self._resolve_drawable_layer(archive, table, drawable)
+        if layer_bytes:
+            return apk_icon.decode_to_png(layer_bytes, destination)
+        if layer_color:
+            return apk_icon.composite_adaptive_icon(None, None, layer_color, destination)
+        return False
+
+    def _resolve_drawable_layer(
+        self,
+        archive: '_DeviceApkArchive',
+        table: apk_icon.ResourceTable,
+        layer: Optional[apk_icon.XmlDrawable],
+    ) -> Tuple[Optional[bytes], Optional[tuple]]:
+        if layer is None:
+            return None, None
+        if layer.color:
+            return None, layer.color
+        if not layer.reference:
+            return None, None
+        rasters, xmls, color, name = apk_icon.pick_paths_for_icon(table, layer.reference)
+        if name:
+            guessed = apk_icon.guess_paths_from_name(archive.all_entries(), name[0], name[1])
+            rasters = apk_icon.sort_raster_paths(
+                rasters + [path for path in guessed if apk_icon._is_raster_path(path)]
+            )
+        for path in rasters:
+            data = archive.read_name(path)
+            if data:
+                return data, color
+        return None, color
+
+    def _render_icon_from_filename_fallback(self, archive: '_DeviceApkArchive', destination: str) -> bool:
+        preferred = (
+            'ic_launcher', 'ic_launcher_round', 'launcher_icon', 'app_icon', 'icon', 'appicon',
+        )
+        layer_names = ('ic_launcher_foreground', 'ic_launcher_background')
+        rasters: List[Tuple[int, str]] = []
+        layers: Dict[str, List[str]] = {name: [] for name in layer_names}
+        for entry in archive.all_entries():
+            lowered = entry.lower()
+            if not lowered.startswith('res/'):
+                continue
+            if not apk_icon._is_raster_path(lowered):
+                continue
+            folder = posixpath.basename(posixpath.dirname(lowered))
+            if not (folder.startswith('mipmap') or folder.startswith('drawable')):
+                continue
+            stem = posixpath.splitext(posixpath.basename(lowered))[0]
+            if any(part in stem for part in ('notification', 'monochrome', 'shortcut', 'tvbanner')):
+                continue
+            if stem in layer_names:
+                layers[stem].append(entry)
+                continue
+            if stem not in preferred:
+                continue
+            score = 80 if folder.startswith('mipmap') else 40
+            score += preferred.index(stem) * -5
+            score += apk_icon._density_from_path(lowered)
+            rasters.append((score, entry))
+        rasters.sort(key=lambda row: row[0], reverse=True)
+        for _, path in rasters:
+            data = archive.read_name(path)
+            if data and apk_icon.decode_to_png(data, destination):
+                return True
+        fg_paths = apk_icon.sort_raster_paths(layers['ic_launcher_foreground'])
+        bg_paths = apk_icon.sort_raster_paths(layers['ic_launcher_background'])
+        fg = archive.read_name(fg_paths[0]) if fg_paths else None
+        bg = archive.read_name(bg_paths[0]) if bg_paths else None
+        if fg or bg:
+            return apk_icon.composite_adaptive_icon(fg, bg, (255, 255, 255, 255), destination)
+        return False
+
+    def _list_apk_zip_entries(self, device_id: str, apk_path: str) -> List[str]:
+        try:
+            listing = self._run_exec_out(
+                ['sh', '-c', 'unzip -l -- "$1"', 'droidmgr', apk_path],
+                device_id,
+            )
+            text = listing.decode('utf-8', errors='replace')
+            entries = self._parse_unzip_list(text)
+            if entries:
+                return entries
+        except Exception:
+            pass
+        try:
+            listing = self._run_command(['shell', 'unzip', '-l', apk_path], device_id)
+            entries = self._parse_unzip_list(listing)
+            if entries:
+                return entries
+        except Exception:
+            pass
+        return []
+
+    @staticmethod
+    def _parse_unzip_list(listing: str) -> List[str]:
+        entries: List[str] = []
+        seen_header = False
+        for line in listing.splitlines():
+            stripped = line.strip()
+            if not seen_header:
+                if stripped.lower().endswith('name') and 'length' in stripped.lower():
+                    seen_header = True
+                continue
+            if not stripped or stripped.startswith('-') or stripped.lower().endswith('files'):
+                continue
+            match = re.match(r'^\s*\d+\s+\S+\s+\S+\s+(.+)$', line)
+            if not match:
+                continue
+            name = match.group(1).strip()
+            if name and posixpath.normpath(name) == name and '..' not in name.split('/'):
+                entries.append(name)
+        return entries
+
+    def _read_apk_zip_entry(
+        self,
+        device_id: str,
+        apk_path: str,
+        entry: str,
+        archive: '_DeviceApkArchive',
+    ) -> Optional[bytes]:
+        if archive.has_local(apk_path):
+            return archive.read_local(apk_path, entry)
+        try:
+            data = self._run_exec_out(
+                ['sh', '-c', 'unzip -p -- "$1" "$2"', 'droidmgr', apk_path, entry],
+                device_id,
+            )
+            if data and not _looks_like_unzip_error(data):
+                return data
+        except Exception:
+            pass
+        try:
+            local_apk = archive.ensure_local(apk_path)
+            return archive.read_local(apk_path, entry) if local_apk else None
+        except Exception:
+            return None
 
     def enable_tcpip(self, device_id: str, port: int = 5555) -> str:
         """Restart ADB daemon on the device in TCP/IP mode on specified port.
@@ -1643,6 +1804,103 @@ class ADBManager:
         if not address:
             raise ValueError("Device address cannot be empty.")
         return self._run_command(['disconnect', address])
+
+
+def _looks_like_unzip_error(data: bytes) -> bool:
+    if not data:
+        return True
+    prefix = data[:48].lstrip().lower()
+    return prefix.startswith(b'unzip:') or prefix.startswith(b'toybox') or prefix.startswith(b'/system/bin')
+
+
+class _DeviceApkArchive:
+    """Lists and reads zip entries from on-device APKs, pulling locally if unzip is missing."""
+
+    def __init__(self, adb: ADBManager, device_id: str, apk_paths: List[str]):
+        self.adb = adb
+        self.device_id = device_id
+        self.apk_paths = apk_paths
+        self._entries: Dict[str, List[str]] = {}
+        self._local: Dict[str, str] = {}
+        self._tmp: Optional[str] = None
+
+    def entries(self, apk_path: str) -> List[str]:
+        if apk_path not in self._entries:
+            listed = self.adb._list_apk_zip_entries(self.device_id, apk_path)
+            if not listed:
+                local = self.ensure_local(apk_path)
+                if local:
+                    listed = self._list_local(local)
+            self._entries[apk_path] = listed
+        return self._entries[apk_path]
+
+    def all_entries(self) -> List[str]:
+        found: List[str] = []
+        for apk_path in self.apk_paths:
+            found.extend(self.entries(apk_path))
+        return found
+
+    def read(self, apk_path: str, entry: str) -> Optional[bytes]:
+        names = self.entries(apk_path)
+        if names and entry not in names:
+            return None
+        return self.adb._read_apk_zip_entry(self.device_id, apk_path, entry, self)
+
+    def read_name(self, entry: str) -> Optional[bytes]:
+        for apk_path in self.apk_paths:
+            names = self.entries(apk_path)
+            if names and entry not in names:
+                continue
+            data = self.read(apk_path, entry)
+            if data:
+                return data
+        return None
+
+    def has_local(self, apk_path: str) -> bool:
+        return apk_path in self._local
+
+    def ensure_local(self, apk_path: str) -> Optional[str]:
+        import tempfile
+        if apk_path in self._local and os.path.isfile(self._local[apk_path]):
+            return self._local[apk_path]
+        if self._tmp is None:
+            self._tmp = tempfile.mkdtemp(prefix='droidmgr_apk_')
+        local = os.path.join(
+            self._tmp,
+            hashlib.sha256(apk_path.encode('utf-8')).hexdigest()[:16] + '.apk',
+        )
+        self.adb.download_file(self.device_id, apk_path, local)
+        if os.path.isfile(local) and os.path.getsize(local) > 0:
+            self._local[apk_path] = local
+            return local
+        return None
+
+    def read_local(self, apk_path: str, entry: str) -> Optional[bytes]:
+        import zipfile
+        local = self._local.get(apk_path)
+        if not local:
+            return None
+        try:
+            with zipfile.ZipFile(local, 'r') as zf:
+                return zf.read(entry)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _list_local(local_apk: str) -> List[str]:
+        import zipfile
+        try:
+            with zipfile.ZipFile(local_apk, 'r') as zf:
+                return [name for name in zf.namelist() if not name.endswith('/')]
+        except Exception:
+            return []
+
+    def close(self) -> None:
+        import shutil
+        if self._tmp and os.path.isdir(self._tmp):
+            shutil.rmtree(self._tmp, ignore_errors=True)
+        self._local.clear()
+        self._tmp = None
 
 
 

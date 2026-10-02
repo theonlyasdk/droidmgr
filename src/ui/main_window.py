@@ -1041,6 +1041,9 @@ class MainWindow:
         self._update_apps_view_widget()
         selected_package = self._get_selected_package()
         
+        yview_tree = self.app_tree.yview()
+        yview_lb = self.app_listbox.yview()
+
         def task():
             try:
                 if mode == 'detailed':
@@ -1062,6 +1065,9 @@ class MainWindow:
                             self.app_tree.selection_set(target_id)
                             self.app_tree.focus(target_id)
                             
+                        if yview_tree:
+                            self.app_tree.yview_moveto(yview_tree[0])
+
                         self._update_app_button_states()
                         self._set_status(f"Found {len(apps_details)} applications")
                     self.root.after(0, update)
@@ -1077,6 +1083,9 @@ class MainWindow:
                             self.app_listbox.selection_set(idx)
                             self.app_listbox.activate(idx)
                             
+                        if yview_lb:
+                            self.app_listbox.yview_moveto(yview_lb[0])
+
                         self._update_app_button_states()
                         self._set_status(f"Found {len(apps)} applications")
                     self.root.after(0, update)
