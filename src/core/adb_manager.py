@@ -468,8 +468,40 @@ class ADBManager:
         
         return sorted(apps)
 
+    # APK size for every installed package in a single shell round trip. 'stat -c'
+    # is missing on older Android builds, so the bytes are counted with 'wc -c'.
+    _APK_SIZE_SCRIPT = (
+        "pm list packages -f | sed -n 's/^package://p' | "
+        "while IFS= read -r line; do "
+        'case "$line" in *=*) apk=${line#*=} ;; *) continue ;; esac; '
+        'echo "$(wc -c < "$apk" 2>/dev/null | tr -d " ") $line"; '
+        "done"
+    )
+
+    def _get_apk_sizes(self, device_id: str) -> Dict[str, int]:
+        """APK size in bytes per package, from one batched shell call.
+
+        Packages whose APK cannot be read are left out of the map; callers
+        should treat a missing entry as zero rather than as a failure.
+        """
+        sizes: Dict[str, int] = {}
+        try:
+            output = self._run_command(['shell', self._APK_SIZE_SCRIPT], device_id)
+        except Exception:
+            return sizes
+
+        for line in output.split('\n'):
+            size_str, _, path_and_pkg = line.strip().partition(' ')
+            if not size_str or '=' not in path_and_pkg:
+                continue
+            try:
+                sizes[path_and_pkg.rsplit('=', 1)[1]] = int(size_str)
+            except ValueError:
+                continue
+        return sizes
+
     def get_installed_apps_details(self, device_id: str) -> List[Dict[str, Any]]:
-        """Get list of installed apps with package, formatted name, path, and category size."""
+        """Get installed apps with package, formatted name, path, type and APK size."""
         try:
             output = self._run_command(['shell', 'pm', 'list', 'packages', '-f'], device_id)
             apps = []
@@ -513,19 +545,25 @@ class ADBManager:
                             raw_name = parts[-1] if len(parts[-1]) > 2 else (parts[-2] if len(parts) > 1 else package)
                             name = raw_name.replace('_', ' ').replace('-', ' ').title()
                             
-                        size_str = 'System App' if path.startswith(('/system', '/product', '/vendor', '/system_ext')) else 'User App'
+                        is_system = path.startswith(('/system', '/product', '/vendor', '/system_ext'))
                         apps.append({
                             'package': package,
                             'name': name,
                             'path': path,
-                            'size': size_str
+                            'is_system': is_system,
+                            'type': 'System' if is_system else 'User'
                         })
-            
+
+            sizes = self._get_apk_sizes(device_id)
+            for app in apps:
+                app['size_bytes'] = sizes.get(app['package'], 0)
+
             apps.sort(key=lambda x: x['name'].lower())
             return apps
         except Exception:
             pkgs = self.get_installed_apps(device_id)
-            return [{'package': p, 'name': p.split('.')[-1].title(), 'path': '', 'size': 'N/A'} for p in pkgs]
+            return [{'package': p, 'name': p.split('.')[-1].title(), 'path': '',
+                     'is_system': False, 'type': 'Unknown', 'size_bytes': 0} for p in pkgs]
 
     
     def get_app_info(self, device_id: str, package: str) -> Dict[str, str]:

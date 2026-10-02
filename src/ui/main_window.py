@@ -73,6 +73,18 @@ def _is_offline_error(msg: str) -> bool:
     return any(keyword in lower_msg for keyword in _OFFLINE_ERROR_KEYWORDS)
 
 
+def _format_bytes(num_bytes: int) -> str:
+    """Render a byte count as a short human-readable size such as '12.4 MB'."""
+    size = float(num_bytes or 0)
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if size < 1024 or unit == 'GB':
+            if unit == 'B':
+                return f"{int(size)} B"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
 def _parse_memory(val: str) -> int:
     """Parse a process memory string such as '12.5 MB' into a byte count."""
     parts = str(val).split()
@@ -335,38 +347,24 @@ class MainWindow:
         list_frame = ttk.LabelFrame(tab, text="Installed Applications")
         list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # 1. Compact View Frame (Listbox)
-        self.app_listbox_frame = ttk.Frame(list_frame)
-        scrollbar_lb = ttk.Scrollbar(self.app_listbox_frame, orient=tk.VERTICAL)
-        self.app_listbox = tk.Listbox(self.app_listbox_frame, yscrollcommand=scrollbar_lb.set,
-                                      selectmode=tk.EXTENDED)
-        scrollbar_lb.configure(command=self.app_listbox.yview)
-        self.app_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar_lb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.app_listbox.bind('<<ListboxSelect>>', self._on_app_selection_change)
-        self.app_listbox.bind('<Double-1>', self._show_app_info)
-        self.app_listbox.bind('<Return>', self._show_app_info)
-
-        # 2. Detailed View Frame (Treeview)
-        self.app_tree_frame = ttk.Frame(list_frame)
-        columns = ('Name', 'Package', 'Size')
-        self.app_tree = ttk.Treeview(self.app_tree_frame, columns=columns, show='headings',
+        # Applications list
+        columns = ('Name', 'Package', 'Type', 'Size')
+        self.app_tree = ttk.Treeview(list_frame, columns=columns, show='headings',
                                      selectmode='extended')
         for col in columns:
             self.app_tree.heading(col, text=col)
-        self.app_tree.column('Name', width=scale_size(220, self.root))
-        self.app_tree.column('Package', width=scale_size(320, self.root))
-        self.app_tree.column('Size', width=scale_size(120, self.root), anchor='center')
-        
-        scrollbar_tv = ttk.Scrollbar(self.app_tree_frame, orient=tk.VERTICAL, command=self.app_tree.yview)
+        self.app_tree.column('Name', width=scale_size(200, self.root))
+        self.app_tree.column('Package', width=scale_size(300, self.root))
+        self.app_tree.column('Type', width=scale_size(80, self.root), anchor='center')
+        self.app_tree.column('Size', width=scale_size(100, self.root), anchor='e')
+
+        scrollbar_tv = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.app_tree.yview)
         self.app_tree.configure(yscrollcommand=scrollbar_tv.set)
         self.app_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar_tv.pack(side=tk.RIGHT, fill=tk.Y)
         self.app_tree.bind('<<TreeviewSelect>>', self._on_app_selection_change)
         self.app_tree.bind('<Double-1>', self._show_app_info)
         self.app_tree.bind('<Return>', self._show_app_info)
-
-        self._update_apps_view_widget()
 
 
 
@@ -443,42 +441,17 @@ class MainWindow:
         # App specific buttons depend on both device readiness AND app selection
         self._update_app_button_states()
     
-    def _update_apps_view_widget(self):
-        if not hasattr(self, 'app_listbox_frame') or not hasattr(self, 'app_tree_frame'):
-            return
-        mode = self.config.get('general', 'apps_view_mode', 'compact')
-        if mode == 'detailed':
-            self.app_listbox_frame.pack_forget()
-            self.app_tree_frame.pack(fill=tk.BOTH, expand=True)
-        else:
-            self.app_tree_frame.pack_forget()
-            self.app_listbox_frame.pack(fill=tk.BOTH, expand=True)
-
-    def _select_listbox_indices(self, indices: List[int]):
-        """Select several compact-view rows at once.
-
-        Python 3.14 changed Listbox.selection_set to take a first..last range
-        rather than a list of indices, so each index is passed on its own:
-        'selection set' adds to the selection instead of replacing it.
-        """
-        self.app_listbox.selection_clear(0, tk.END)
-        for index in indices:
-            self.app_listbox.selection_set(index, index)
-
     def _get_selected_packages(self) -> List[str]:
         """Every selected package, in the order the rows appear in the view."""
-        mode = self.config.get('general', 'apps_view_mode', 'compact')
-        if mode == 'detailed':
-            selected = set(self.app_tree.selection())
-            packages = []
-            for item_id in self.app_tree.get_children(''):
-                if item_id not in selected:
-                    continue
-                values = self.app_tree.item(item_id, 'values')
-                if values and len(values) >= 2 and values[1]:
-                    packages.append(values[1])
-            return packages
-        return [self.app_listbox.get(index) for index in self.app_listbox.curselection()]
+        selected = set(self.app_tree.selection())
+        packages = []
+        for item_id in self.app_tree.get_children(''):
+            if item_id not in selected:
+                continue
+            values = self.app_tree.item(item_id, 'values')
+            if values and len(values) >= 2 and values[1]:
+                packages.append(values[1])
+        return packages
 
     def _get_selected_package(self) -> Optional[str]:
         """The package the single-app actions act on.
@@ -491,17 +464,11 @@ class MainWindow:
             return None
 
         focused = None
-        mode = self.config.get('general', 'apps_view_mode', 'compact')
-        if mode == 'detailed':
-            focus_id = self.app_tree.focus()
-            if focus_id:
-                values = self.app_tree.item(focus_id, 'values')
-                if values and len(values) >= 2:
-                    focused = values[1]
-        else:
-            focus_index = self.app_listbox.focus()
-            if focus_index is not None:
-                focused = self.app_listbox.get(focus_index)
+        focus_id = self.app_tree.focus()
+        if focus_id:
+            values = self.app_tree.item(focus_id, 'values')
+            if values and len(values) >= 2:
+                focused = values[1]
 
         return focused if focused in packages else packages[0]
 
@@ -613,8 +580,7 @@ class MainWindow:
             self.shell_view.device_manager = self.device_manager
             self._set_status("Preferences updated")
             self._refresh_devices()
-            
-            self._update_apps_view_widget()
+
             if self.selected_device and getattr(self.device_manager, 'is_device_ready', lambda d: True)(self.selected_device):
                 self.file_manager.refresh()
                 self._refresh_apps()
@@ -1186,76 +1152,49 @@ class MainWindow:
                 status_str = status.lower() if status else 'offline'
                 for item in self.app_tree.get_children():
                     self.app_tree.delete(item)
-                self.app_listbox.delete(0, tk.END)
                 tag_text = f"[Device is {status_str}]"
-                self.app_listbox.insert(tk.END, tag_text)
-                self.app_tree.insert('', tk.END, values=(tag_text, "", ""))
+                self.app_tree.insert('', tk.END, values=(tag_text, "", "", ""))
                 self._update_app_button_states()
                 self._set_status(f"Device '{self.selected_device}' is {status_str}.")
                 return
         except Exception:
             pass
 
-        mode = self.config.get('general', 'apps_view_mode', 'compact')
-        self._update_apps_view_widget()
         selected_packages = set(self._get_selected_packages())
-        
-        yview_tree = self.app_tree.yview()
-        yview_lb = self.app_listbox.yview()
+        yview = self.app_tree.yview()
 
         def task():
             try:
-                if mode == 'detailed':
-                    apps_details = self.device_manager.get_installed_apps_details(self.selected_device)
-                    def update():
-                        for item in self.app_tree.get_children():
-                            self.app_tree.delete(item)
-                        
-                        target_ids = []
-                        for app in apps_details:
-                            item_id = self.app_tree.insert(
-                                '', tk.END,
-                                values=(app['name'], app['package'], app['size'])
-                            )
-                            if app['package'] in selected_packages:
-                                target_ids.append(item_id)
+                apps_details = self.device_manager.get_installed_apps_details(self.selected_device)
+                def update():
+                    for item in self.app_tree.get_children():
+                        self.app_tree.delete(item)
 
-                        if target_ids:
-                            self.app_tree.selection_set(target_ids)
-                            self.app_tree.focus(target_ids[0])
-                            
-                        if yview_tree:
-                            self.app_tree.yview_moveto(yview_tree[0])
+                    target_ids = []
+                    for app in apps_details:
+                        item_id = self.app_tree.insert(
+                            '', tk.END,
+                            values=(app['name'], app['package'], app['type'],
+                                    _format_bytes(app.get('size_bytes', 0)))
+                        )
+                        if app['package'] in selected_packages:
+                            target_ids.append(item_id)
 
-                        self._update_app_button_states()
-                        self._set_status(f"Found {len(apps_details)} applications")
-                    self.root.after(0, update)
-                else:
-                    apps = self.device_manager.get_apps(self.selected_device)
-                    def update():
-                        self.app_listbox.delete(0, tk.END)
-                        for app in apps:
-                            self.app_listbox.insert(tk.END, app)
-                            
-                        if selected_packages:
-                            indices = sorted(apps.index(pkg) for pkg in selected_packages if pkg in apps)
-                            if indices:
-                                self._select_listbox_indices(indices)
-                                self.app_listbox.activate(indices[0])
-                            
-                        if yview_lb:
-                            self.app_listbox.yview_moveto(yview_lb[0])
+                    if target_ids:
+                        self.app_tree.selection_set(target_ids)
+                        self.app_tree.focus(target_ids[0])
 
-                        self._update_app_button_states()
-                        self._set_status(f"Found {len(apps)} applications")
-                    self.root.after(0, update)
+                    if yview:
+                        self.app_tree.yview_moveto(yview[0])
+
+                    self._update_app_button_states()
+                    self._set_status(f"Found {len(apps_details)} applications")
+                self.root.after(0, update)
             except (ADBDeviceOfflineError, ADBDeviceNotFoundError):
                 def handle_offline():
                     for item in self.app_tree.get_children():
                         self.app_tree.delete(item)
-                    self.app_listbox.delete(0, tk.END)
-                    self.app_listbox.insert(tk.END, "[Device is offline]")
-                    self.app_tree.insert('', tk.END, values=("[Device is offline]", "", ""))
+                    self.app_tree.insert('', tk.END, values=("[Device is offline]", "", "", ""))
                     self._update_app_button_states()
                     self._set_status(f"Device '{self.selected_device}' is offline or disconnected.")
                 self.root.after(0, handle_offline)
@@ -1266,10 +1205,8 @@ class MainWindow:
                     def handle_offline():
                         for item in self.app_tree.get_children():
                             self.app_tree.delete(item)
-                        self.app_listbox.delete(0, tk.END)
                         tag = "[Device is unauthorized]" if "unauthorized" in lower_msg else "[Device is offline]"
-                        self.app_listbox.insert(tk.END, tag)
-                        self.app_tree.insert('', tk.END, values=(tag, "", ""))
+                        self.app_tree.insert('', tk.END, values=(tag, "", "", ""))
                         self._update_app_button_states()
                         self._set_status(f"Device '{self.selected_device}' is offline or disconnected.")
                     self.root.after(0, handle_offline)

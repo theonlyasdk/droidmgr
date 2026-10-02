@@ -32,8 +32,7 @@ class ConfigManager:
         self.settings = {
             'config_version': CURRENT_CONFIG_VERSION,
             'general': {
-                'query_interval': 5,
-                'apps_view_mode': 'compact'
+                'query_interval': 5
             },
             'file_manager': {
                 'show_hidden': False,
@@ -128,7 +127,6 @@ class ConfigManager:
         if from_version < 1:
             general = settings.setdefault('general', {})
             general.setdefault('query_interval', 5)
-            general.setdefault('apps_view_mode', 'compact')
         if from_version < 2:
             backup = settings.setdefault('backup', {})
             if not backup.get('exclude_paths'):
@@ -147,15 +145,6 @@ class ConfigManager:
                 self.settings.setdefault('general', {})['query_interval'] = 5
         except Exception:
             self.settings.setdefault('general', {})['query_interval'] = 5
-
-        # Validate apps_view_mode (must be 'compact' or 'detailed')
-        try:
-            val = self.settings.get('general', {}).get('apps_view_mode')
-            if val not in ('compact', 'detailed'):
-                print(f"Warning: Invalid apps_view_mode {val!r} in config. Reverting to default 'compact'.")
-                self.settings.setdefault('general', {})['apps_view_mode'] = 'compact'
-        except Exception:
-            self.settings.setdefault('general', {})['apps_view_mode'] = 'compact'
 
         backup = self.settings.setdefault('backup', {})
         if backup.get('scope') not in (0, 1):

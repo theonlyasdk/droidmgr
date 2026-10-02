@@ -204,12 +204,6 @@ class PreferencesDialog:
         # Load General settings
         interval = self.config.get('general', 'query_interval', 5)
         self.query_interval_var.set(f"{interval} second{'s' if int(interval) > 1 else ''}")
-        
-        apps_mode = self.config.get('general', 'apps_view_mode', 'compact')
-        if apps_mode == 'detailed':
-            self.apps_view_mode_var.set("Detailed (Icon, Name, Package, Size)")
-        else:
-            self.apps_view_mode_var.set("Compact (Package List)")
 
 
 
@@ -231,20 +225,6 @@ class PreferencesDialog:
         )
         self.query_interval_cb.grid(row=0, column=1, sticky=tk.W, pady=5)
         
-        apps_view_frame = ttk.LabelFrame(tab, text="Applications View Settings", padding=10)
-        apps_view_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        ttk.Label(apps_view_frame, text="View Mode:").grid(row=0, column=0, sticky=tk.W, pady=5, padx=(0, 10))
-        self.apps_view_mode_var = tk.StringVar(value="Compact (Package List)")
-        self.apps_view_mode_cb = ttk.Combobox(
-            apps_view_frame,
-            textvariable=self.apps_view_mode_var,
-            values=["Compact (Package List)", "Detailed (Icon, Name, Package, Size)"],
-            state="readonly",
-            width=32
-        )
-        self.apps_view_mode_cb.grid(row=0, column=1, sticky=tk.W, pady=5)
-
         info_frame = ttk.LabelFrame(tab, text="Application Information", padding=10)
         info_frame.pack(fill=tk.X, padx=10, pady=10)
         
@@ -439,10 +419,6 @@ class PreferencesDialog:
             self.config.set('general', 'query_interval', interval_sec)
         except Exception:
             pass
-
-        apps_mode_str = self.apps_view_mode_var.get()
-        apps_mode_val = 'detailed' if 'Detailed' in apps_mode_str else 'compact'
-        self.config.set('general', 'apps_view_mode', apps_mode_val)
 
         self.config.set('paths', 'adb', adb_path)
         self.config.set('paths', 'scrcpy', scrcpy_path)
