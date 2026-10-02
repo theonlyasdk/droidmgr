@@ -339,7 +339,7 @@ class MainWindow:
         self.app_listbox_frame = ttk.Frame(list_frame)
         scrollbar_lb = ttk.Scrollbar(self.app_listbox_frame, orient=tk.VERTICAL)
         self.app_listbox = tk.Listbox(self.app_listbox_frame, yscrollcommand=scrollbar_lb.set,
-                                      selectmode=tk.MULTIPLE)
+                                      selectmode=tk.EXTENDED)
         scrollbar_lb.configure(command=self.app_listbox.yview)
         self.app_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar_lb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -453,6 +453,17 @@ class MainWindow:
         else:
             self.app_tree_frame.pack_forget()
             self.app_listbox_frame.pack(fill=tk.BOTH, expand=True)
+
+    def _select_listbox_indices(self, indices: List[int]):
+        """Select several compact-view rows at once.
+
+        Python 3.14 changed Listbox.selection_set to take a first..last range
+        rather than a list of indices, so each index is passed on its own:
+        'selection set' adds to the selection instead of replacing it.
+        """
+        self.app_listbox.selection_clear(0, tk.END)
+        for index in indices:
+            self.app_listbox.selection_set(index, index)
 
     def _get_selected_packages(self) -> List[str]:
         """Every selected package, in the order the rows appear in the view."""
@@ -1229,7 +1240,7 @@ class MainWindow:
                         if selected_packages:
                             indices = sorted(apps.index(pkg) for pkg in selected_packages if pkg in apps)
                             if indices:
-                                self.app_listbox.selection_set(indices)
+                                self._select_listbox_indices(indices)
                                 self.app_listbox.activate(indices[0])
                             
                         if yview_lb:
