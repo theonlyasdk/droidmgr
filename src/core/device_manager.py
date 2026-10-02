@@ -173,6 +173,25 @@ class DeviceManager:
         """Reboot a device, optionally into recovery or the bootloader."""
         return self.adb.reboot_device(device_id, target)
 
+    def get_fastboot_devices(self) -> List[str]:
+        """Serials of the devices currently sitting in fastboot mode.
+        
+        Returns:
+            List of device serials, empty when none are or fastboot is absent
+        """
+        return self.adb.get_fastboot_devices()
+
+    def fastboot_reboot(self, device_id: str) -> str:
+        """Restart a fastboot-mode device back into Android.
+        
+        Args:
+            device_id: Device ID
+            
+        Returns:
+            Output from the fastboot reboot command
+        """
+        return self.adb.fastboot_reboot(device_id)
+
     def shutdown_device(self, device_id: str) -> str:
         """Power a device off."""
         return self.adb.shutdown_device(device_id)

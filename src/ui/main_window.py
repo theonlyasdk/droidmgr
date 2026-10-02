@@ -83,9 +83,11 @@ _RECONNECT_POLL_DELAYS = (8000, 20000, 35000)
 _POWER_ACTIONS = {
     'reboot': ('Reboot', None, 'The device will restart normally.'),
     'recovery': ('Reboot to Recovery', 'recovery', 'The device will restart into recovery.'),
-    'bootloader': ('Reboot to Bootloader', 'bootloader',
-                   'The device will restart into the bootloader (fastboot) mode, '
-                   'where adb cannot talk to it.'),
+    'bootloader': ('Reboot to Fastboot',
+                   'bootloader',
+                   'The device will restart into fastboot mode, where adb cannot talk '
+                   'to it. Nothing in this app will work until it is booted back '
+                   'into Android with "Reboot from Fastboot to Android".'),
     'shutdown': ('Shut Down', None, 'The device will power off and must be turned on by hand.'),
 }
 
@@ -164,6 +166,8 @@ class MainWindow:
         
         self.selected_device: Optional[str] = None
         self.has_devices = False
+        # Serials fastboot reports, which adb cannot see for itself.
+        self._fastboot_devices: set = set()
         
         # Mirroring settings
         from core import ConfigManager
@@ -208,7 +212,10 @@ class MainWindow:
         device_menu.add_separator()
         device_menu.add_command(label="Reboot", command=lambda: self._power_action('reboot'))
         device_menu.add_command(label="Reboot to Recovery", command=lambda: self._power_action('recovery'))
-        device_menu.add_command(label="Reboot to Bootloader", command=lambda: self._power_action('bootloader'))
+        device_menu.add_command(label="Reboot to Fastboot (Bootloader)", command=lambda: self._power_action('bootloader'))
+        device_menu.add_command(label="Reboot from Fastboot to Android", command=self._fastboot_reboot)
+        self.fastboot_reboot_menu_index = device_menu.index('end')
+        device_menu.entryconfig(self.fastboot_reboot_menu_index, state=tk.DISABLED)
         device_menu.add_command(label="Shut Down", command=lambda: self._power_action('shutdown'))
         device_menu.add_separator()
         device_menu.add_command(label="Check Root Access", command=self._check_root_access)
@@ -544,6 +551,8 @@ class MainWindow:
 
         self.install_apk_btn.config(state=ready_state)
         
+        self._update_fastboot_menu_state()
+        
         # App specific buttons depend on both device readiness AND app selection
         self._update_app_button_states()
     
@@ -842,6 +851,7 @@ class MainWindow:
         
         try:
             devices = self.device_manager.get_devices()
+            self._fastboot_devices = self._add_fastboot_devices(devices)
             self.has_devices = len(devices) > 0
             self._update_tab_visibility()
             
@@ -867,6 +877,10 @@ class MainWindow:
                     msg = f"Device '{dev_id}' is offline. Try reconnecting the USB cable or restarting ADB."
                     if self._notified_device_statuses.get(dev_id) != 'offline':
                         problem_msgs.append(msg)
+                elif st == 'fastboot':
+                    # Not a fault: the device is in fastboot mode deliberately, so
+                    # it is described rather than reported as a problem to fix.
+                    display_status = "Fastboot Mode (no ADB)"
 
                 device['display_status'] = display_status
 
@@ -1034,6 +1048,69 @@ class MainWindow:
         if not is_shutdown:
             for delay in _RECONNECT_POLL_DELAYS:
                 self.root.after(delay, self._refresh_devices)
+
+    def _add_fastboot_devices(self, devices):
+        """Append the fastboot-mode devices adb cannot report, and return their serials.
+
+        adb's device list drops a device the moment it enters fastboot mode,
+        which would read here as a disconnect and take the row away with it. The
+        fastboot binary still knows the device, so the row is put back from its
+        answer; that is also what gives the return command something to act on.
+
+        Returns:
+            Set of serials that are sitting in fastboot mode
+        """
+        try:
+            serials = set(self.device_manager.get_fastboot_devices())
+        except Exception:
+            serials = set()
+
+        known = {device['id'] for device in devices}
+        for serial in sorted(serials - known):
+            # Model and mirroring are unknowable without adb, so both say so.
+            devices.append({'id': serial, 'model': 'Unknown (fastboot)',
+                            'status': 'fastboot', 'is_mirroring': False})
+        return serials
+
+    def _update_fastboot_menu_state(self):
+        """Offer the way back only to a device fastboot can actually reach."""
+        in_fastboot = (self.selected_device is not None
+                       and self.selected_device in self._fastboot_devices)
+        self.device_menu.entryconfig(self.fastboot_reboot_menu_index,
+                                     state=tk.NORMAL if in_fastboot else tk.DISABLED)
+
+    def _fastboot_reboot(self):
+        """Boot a fastboot-mode device back into Android, after confirming."""
+        if not self._require_device(require_ready=False):
+            return
+
+        device_id = self.selected_device
+        if not messagebox.askyesno(
+                'Reboot from Fastboot',
+                f"Reboot device '{device_id}' out of fastboot mode and back into "
+                "Android?\n\nIt will restart normally. Nothing is written to the "
+                "device.",
+                parent=self.root):
+            return
+
+        self._set_status(f"Rebooting {device_id} from fastboot...")
+
+        def task():
+            try:
+                self.device_manager.fastboot_reboot(device_id)
+            except Exception as e:
+                msg = str(e)
+                self.root.after(0, lambda: self._show_error('Fastboot Reboot Failed', msg))
+                return
+            self.root.after(0, lambda: self._on_fastboot_reboot_sent(device_id))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _on_fastboot_reboot_sent(self, device_id):
+        self._refresh_devices()
+        self._set_status(f"{device_id} is rebooting from fastboot")
+        for delay in _RECONNECT_POLL_DELAYS:
+            self.root.after(delay, self._refresh_devices)
 
     def _check_root_access(self):
         """Report whether the selected device gives adb root access."""

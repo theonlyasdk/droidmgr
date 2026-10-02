@@ -40,7 +40,7 @@ MAX_SAMPLES = 1200
 _SIZE_UNITS = {'B': 1, 'K': 1024, 'M': 1024 ** 2, 'G': 1024 ** 3, 'T': 1024 ** 4}
 _SIZE_PATTERN = re.compile(r'([\d.]+)\s*([KMGT]?)B?\s*$', re.IGNORECASE)
 
-INTERVALS = (1, 2, 3, 5, 10)
+INTERVALS = (0.5, 1, 2, 3, 5, 10)
 HISTORY_CHOICES = (2, 5, 10, 20)
 TOP_CHOICES = (25, 50, 100, 200)
 
@@ -195,7 +195,7 @@ class ProcessHistoryWindow(tk.Toplevel):
         self._samples_taken = 0
         self._total_memory = 0
 
-        self.interval_var = tk.IntVar(value=3)
+        self.interval_var = tk.StringVar(value='3')
         self.history_var = tk.IntVar(value=5)
         self.top_var = tk.IntVar(value=50)
 
@@ -272,15 +272,30 @@ class ProcessHistoryWindow(tk.Toplevel):
 
         values = ttk.Frame(parent)
         values.pack(fill=tk.X, pady=(8, 4))
+        values.columnconfigure(0, weight=1, uniform='boxes')
+        values.columnconfigure(1, weight=1, uniform='boxes')
 
-        self.cpu_value = tk.Label(values, text='-', background=VALUE_CPU_BACKGROUND,
+        self.cpu_box = tk.Frame(values, background=VALUE_CPU_BACKGROUND, padx=16, pady=8)
+        self.cpu_box.grid(row=0, column=0, sticky='nsew', padx=(0, 5))
+        self.cpu_label = tk.Label(self.cpu_box, text='CPU', background=VALUE_CPU_BACKGROUND,
+                                  foreground=CPU_LINE, font=('Segoe UI', 9, 'bold'),
+                                  anchor='center')
+        self.cpu_label.pack(fill=tk.X)
+        self.cpu_value = tk.Label(self.cpu_box, text='-', background=VALUE_CPU_BACKGROUND,
                                   foreground='#12395e', font=('Segoe UI', 20, 'bold'),
-                                  padx=16, pady=8, width=11, anchor='center')
-        self.cpu_value.pack(side=tk.LEFT)
-        self.memory_value = tk.Label(values, text='-', background=VALUE_MEMORY_BACKGROUND,
+                                  anchor='center')
+        self.cpu_value.pack(fill=tk.X)
+
+        self.memory_box = tk.Frame(values, background=VALUE_MEMORY_BACKGROUND, padx=16, pady=8)
+        self.memory_box.grid(row=0, column=1, sticky='nsew', padx=(5, 0))
+        self.memory_label = tk.Label(self.memory_box, text='Memory', background=VALUE_MEMORY_BACKGROUND,
+                                     foreground=MEMORY_LINE, font=('Segoe UI', 9, 'bold'),
+                                     anchor='center')
+        self.memory_label.pack(fill=tk.X)
+        self.memory_value = tk.Label(self.memory_box, text='-', background=VALUE_MEMORY_BACKGROUND,
                                      foreground='#7a4a10', font=('Segoe UI', 20, 'bold'),
-                                     padx=16, pady=8, width=11, anchor='center')
-        self.memory_value.pack(side=tk.LEFT, padx=(10, 0))
+                                     anchor='center')
+        self.memory_value.pack(fill=tk.X)
 
         self.stats_label = ttk.Label(parent, text='', foreground='gray', anchor=tk.W)
         self.stats_label.pack(fill=tk.X, pady=(0, 6))
@@ -292,9 +307,9 @@ class ProcessHistoryWindow(tk.Toplevel):
 
     def _interval_seconds(self):
         try:
-            return max(1, int(self.interval_var.get()))
+            return max(0.1, float(self.interval_var.get()))
         except (TypeError, ValueError):
-            return 3
+            return 3.0
 
     def _window_seconds(self):
         try:
@@ -339,7 +354,7 @@ class ProcessHistoryWindow(tk.Toplevel):
     def _schedule_next(self):
         if self._closing or self._paused:
             return
-        self._timer = self.after(self._interval_seconds() * 1000, self._take_sample)
+        self._timer = self.after(int(self._interval_seconds() * 1000), self._take_sample)
 
     def _on_sample_failed(self, message):
         self._sampling = False
@@ -349,8 +364,7 @@ class ProcessHistoryWindow(tk.Toplevel):
     def _on_sample(self, sample):
         self._sampling = False
         self._samples_taken += 1
-        self.sample_label.config(
-            text=f'{self._samples_taken} samples', foreground='gray')
+        self.sample_label.config(text='')
 
         stamp = time.time()
         cpu_totals = sample.get('cpu') or {}
@@ -534,6 +548,7 @@ class ProcessHistoryWindow(tk.Toplevel):
             self.tree.delete(item)
         self._keys.clear()
         self.selected_key = DEVICE_KEY
+        self.sample_label.config(text='')
         self._refresh_graph()
 
     def set_device(self, device_id):

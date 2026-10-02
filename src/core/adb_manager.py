@@ -3,6 +3,7 @@
 import os
 import subprocess
 import uuid
+import shutil
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 import ipaddress
@@ -637,6 +638,23 @@ def _parse_top_memory_totals(output: str) -> Dict[str, int]:
     return {}
 
 
+# --- Fastboot ---------------------------------------------------------------
+
+def _parse_fastboot_devices(output: str) -> List[str]:
+    """The serials of the devices 'fastboot devices' reported.
+
+    The command prints one entry per line and nothing at all when no device is
+    in fastboot mode. Builds differ over whether the line carries a state word
+    after the serial, so only the first field of each line is taken.
+    """
+    serials = []
+    for line in output.splitlines():
+        fields = line.split()
+        if fields:
+            serials.append(fields[0])
+    return serials
+
+
 # --- Network inspection -------------------------------------------------------
 
 # 'ip addr' names the interface before its flags and repeats its state and MTU
@@ -1092,6 +1110,10 @@ class ADBCommandError(ADBError):
     """Raised when an ADB command fails execution."""
     pass
 
+class FastbootNotFoundError(ADBError):
+    """Raised when the fastboot executable cannot be found."""
+    pass
+
 _PACKAGE_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+$')
 
 def _validate_package(package: str) -> None:
@@ -1104,6 +1126,7 @@ class ADBManager:
     
     def __init__(self, adb_path: Path):
         self.adb_path = str(adb_path)
+        self._fastboot_path: Optional[str] = None
     
     @staticmethod
     def _sanitize_adb_error(err_text: str, device_id: Optional[str] = None) -> str:
@@ -3365,6 +3388,107 @@ class ADBManager:
         if target:
             args.append(target)
         return self._run_command(args, device_id)
+
+    def _fastboot_executable(self) -> Optional[str]:
+        """The fastboot binary belonging to the adb this manager is using.
+
+        fastboot ships inside the same platform-tools package as adb, so it is
+        looked for beside the adb already configured before falling back to
+        whatever is on PATH. None means fastboot is not installed, which is
+        reported as a missing tool rather than a missing device.
+
+        The answer is remembered, including when it is None, so a machine
+        without fastboot costs one lookup rather than one per refresh.
+        """
+        if self._fastboot_path is not None:
+            return self._fastboot_path or None
+
+        executable = 'fastboot.exe' if os.name == 'nt' else 'fastboot'
+        beside_adb = Path(self.adb_path).parent / executable
+        if beside_adb.exists():
+            self._fastboot_path = str(beside_adb)
+            return self._fastboot_path
+
+        on_path = shutil.which(executable)
+        self._fastboot_path = on_path or ''
+        return self._fastboot_path or None
+
+    def _require_fastboot(self) -> str:
+        executable = self._fastboot_executable()
+        if not executable:
+            raise FastbootNotFoundError(
+                "fastboot was not found. It ships in Android platform-tools "
+                "alongside adb; install platform-tools or put fastboot on PATH."
+            )
+        return executable
+
+    def _run_fastboot(self, args: List[str], timeout: Optional[int] = None,
+                      check: bool = False) -> Tuple[str, str]:
+        """Run fastboot and return its stdout and stderr.
+
+        With check off the exit code is ignored, for the listing command where a
+        device that is not there is an answer rather than a failure.
+        """
+        executable = self._require_fastboot()
+        try:
+            result = subprocess.run(
+                [executable] + args,
+                capture_output=True, text=True, check=False,
+                timeout=timeout
+            )
+        except FileNotFoundError:
+            raise FastbootNotFoundError(f"fastboot executable not found at '{executable}'.")
+        except subprocess.TimeoutExpired:
+            raise ADBCommandError(f"fastboot command timed out: {' '.join(args)}")
+
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+
+        if check and result.returncode != 0:
+            detail = self._sanitize_adb_error(stderr, args[1] if len(args) > 1 else None)
+            raise ADBCommandError(f"fastboot failed: {detail or 'unknown error'}")
+
+        return stdout, stderr
+
+    def get_fastboot_devices(self, timeout: Optional[int] = 10) -> List[str]:
+        """Serials of the devices currently sitting in fastboot mode.
+
+        adb cannot talk to a fastboot device, so its own device list says
+        nothing useful about one. This asks the fastboot binary directly, and
+        reports no devices at all when fastboot is not installed, since without
+        the tool there is nothing that could be in fastboot mode through here.
+        """
+        try:
+            executable = self._fastboot_executable()
+            if not executable:
+                return []
+            stdout, _ = self._run_fastboot(['devices'], timeout=timeout)
+        except (FastbootNotFoundError, ADBCommandError):
+            return []
+        return _parse_fastboot_devices(stdout)
+
+    def fastboot_reboot(self, device_id: str, timeout: Optional[int] = 30) -> str:
+        """Restart a fastboot-mode device back into Android.
+
+        This is the way back out of fastboot: the device leaves fastboot mode and
+        comes up as an ordinary adb device. fastboot says nothing at all on
+        success, so an empty result is the expected one rather than a failure.
+        """
+        if not device_id or not device_id.strip():
+            raise ValueError("Device ID cannot be empty.")
+        self._require_fastboot()
+
+        known = self.get_fastboot_devices(timeout=timeout)
+        if device_id not in known:
+            raise ADBDeviceNotFoundError(
+                f"Device '{device_id}' is not in fastboot mode, so it cannot be "
+                f"rebooted from there. fastboot currently sees: "
+                f"{', '.join(known) if known else 'no devices'}."
+            )
+
+        stdout, stderr = self._run_fastboot(['-s', device_id, 'reboot'],
+                                            timeout=timeout, check=True)
+        return stdout or stderr or f'{device_id} is rebooting'
 
     def shutdown_device(self, device_id: str) -> str:
         """Power a device off.
