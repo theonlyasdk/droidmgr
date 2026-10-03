@@ -28,21 +28,37 @@ A GUI frontend for scrcpy and device manager for Android written in Python using
 
 ### Prerequisites
 
-1. **scrcpy** - For screen mirroring
-   - Linux: `sudo apt install scrcpy`
-   - macOS: `brew install scrcpy`
-   - Windows: Download from [scrcpy releases](https://github.com/Genymobile/scrcpy/releases)
+1. **Python 3.8+** with **Tkinter**:
+   - **Windows / macOS**: Included with standard official Python installers (ensure "tcl/tk and IDLE" is checked during Windows setup).
+   - **Linux (Ubuntu/Debian)**: `sudo apt install python3-tk`
+   - **Linux (Fedora)**: `sudo dnf install python3-tkinter`
+   - **Linux (Arch)**: `sudo pacman -S tk`
 
-2. **ADB** - Will be downloaded automatically if not found
-3. **Python** - 3.7 or higher
+2. **Python Dependencies**:
+   - **Pillow** (Recommended): Enables high-fidelity app icon extraction, adaptive icon compositing, WebP decoding, and icon scaling.
+     ```bash
+     pip install -r requirements.txt
+     ```
+     *(or `pip install Pillow`)*
+
+3. **scrcpy & ADB**:
+   - `droidmgr` can **automatically download and configure ADB and scrcpy** into `~/.droidmgr/bin` if they are not detected in your `PATH`.
+   - Alternatively, install them manually:
+     - **Linux**: `sudo apt install scrcpy adb`
+     - **macOS**: `brew install scrcpy android-platform-tools`
+     - **Windows**: Download from [scrcpy releases](https://github.com/Genymobile/scrcpy/releases) and [Android SDK Platform-Tools](https://developer.android.com/tools/releases/platform-tools).
 
 ### Running
 
 ```bash
+# On Linux / macOS:
 python3 droidmgr.py
+
+# On Windows:
+python droidmgr.py
 ```
 
-Or make it executable:
+Or make it executable (Linux / macOS):
 
 ```bash
 chmod +x droidmgr.py

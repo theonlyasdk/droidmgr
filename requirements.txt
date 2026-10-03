@@ -1,5 +1,7 @@
-tkinter             # GUI framework (usually pre-installed with Python)
-# If it shows errors related to tkinter not being installed on Windows, 
-# you need to go to Control Panel > Programs > right click Python 
-# (Whatever version you got installed), click modify and then click modify 
-# installation and install it with Tk/IDLE enabled (usually under more options)
+# Python GUI framework (usually pre-installed with standard Python distributions):
+# - Ubuntu/Debian: sudo apt install python3-tk
+# - Fedora: sudo dnf install python3-tkinter
+# - Windows: Ensure "tcl/tk and IDLE" was selected in the Python installer
+
+# Optional / Recommended for app icon extraction, adaptive icon compositing, and image scaling
+Pillow>=9.0.0
