@@ -16,6 +16,13 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Tuple
 
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -156,7 +163,7 @@ def build_executable(use_upx: bool = True, strip: bool = True) -> bool:
     info = get_platform_info()
 
     cmd = [
-        "pyinstaller",
+        sys.executable, "-m", "PyInstaller",
         "--name", APP_NAME,
         "--onefile",
         "--clean",
@@ -166,9 +173,17 @@ def build_executable(use_upx: bool = True, strip: bool = True) -> bool:
         f"--workpath={BUILD_DIR}",
         f"--specpath={SPEC_DIR}",
         f"--paths={SRC_DIR}",
-        "--collect-all", "src.core",
-        "--collect-all", "src.ui",
+        "--collect-all", "core",
+        "--collect-all", "ui",
     ]
+
+    sep = ";" if os.name == "nt" else ":"
+    assets_dir = SRC_DIR / "assets"
+    if assets_dir.exists():
+        cmd.append(f"--add-data={assets_dir}{sep}assets")
+    ui_assets_dir = SRC_DIR / "ui" / "assets"
+    if ui_assets_dir.exists():
+        cmd.append(f"--add-data={ui_assets_dir}{sep}ui/assets")
 
     # Windowed vs console
     if info["windowed"]:
