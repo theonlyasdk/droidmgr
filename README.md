@@ -14,13 +14,14 @@ A GUI frontend for scrcpy and device manager for Android written in Python using
 - **Auto-Setup**: Automatically downloads and installs ADB if not found
 
 ## Screenshots
-<img width="900" height="572" alt="annotation-11-02-2026_22-50" src="https://github.com/user-attachments/assets/849b909b-5a31-45b9-86bd-a91fb1e8f99c" />
 
-<img width="900" height="572" alt="image" src="https://github.com/user-attachments/assets/1fd6bd75-f4d2-4b37-adad-3b24bff2684d" />
+![Devices](docs/screenshots/devices.png)
 
-<img width="900" height="572" alt="image" src="https://github.com/user-attachments/assets/b136fed2-c8ef-48a7-bba7-eb0dbedd4fba" />
+![Applications](docs/screenshots/applications.png)
 
-<img width="900" height="572" alt="image" src="https://github.com/user-attachments/assets/c16f516f-7ea1-4ba1-866e-3328c8c92db0" />
+![Processes](docs/screenshots/processes.png)
+
+![Files](docs/screenshots/files.png)
 
 
 ## Installation
