@@ -107,7 +107,7 @@ class ConfigManager:
     def load(self):
         if self.config_file.exists():
             try:
-                with open(self.config_file, 'r') as f:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
                     loaded_settings = json.load(f)
                     
                     # Version check and migration
@@ -208,7 +208,7 @@ class ConfigManager:
     def save(self):
         self.config_dir.mkdir(parents=True, exist_ok=True)
         try:
-            with open(self.config_file, 'w') as f:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.settings, f, indent=4)
         except Exception as e:
             print(f"Error saving config: {e}")
@@ -221,3 +221,17 @@ class ConfigManager:
             self.settings[section] = {}
         self.settings[section][key] = value
         self.save()
+
+    def get_cache_dir(self, subfolder: str = "") -> str:
+        """Return the persistent cache directory (under ~/.droidmgr/cache/...)."""
+        cache = self.config_dir / 'cache'
+        if subfolder:
+            cache = cache / subfolder
+        try:
+            cache.mkdir(parents=True, exist_ok=True)
+            return str(cache)
+        except Exception:
+            import tempfile
+            fallback = os.path.join(tempfile.gettempdir(), 'droidmgr_cache', subfolder)
+            os.makedirs(fallback, exist_ok=True)
+            return fallback

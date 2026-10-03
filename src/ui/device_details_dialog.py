@@ -205,12 +205,14 @@ class DeviceDetailsDialog(tk.Toplevel):
                   foreground='gray').pack(side=tk.RIGHT)
 
     def _on_tab_changed(self, event=None):
-        """Read the network tab the first time it is shown, and never before."""
+        """Read the network tab the first time it is shown, and manage polling."""
         if self.notebook.index(self.notebook.select()) != self.notebook.index(self.network_tab):
+            self.network_inspector.stop_polling()
             return
-        if self.network_inspector.loaded:
-            return
-        self.network_inspector.load()
+        if not self.network_inspector.loaded:
+            self.network_inspector.load()
+        else:
+            self.network_inspector.start_polling()
 
     def _cancel_health_refresh(self):
         if self._health_job is not None:

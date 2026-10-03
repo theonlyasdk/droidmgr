@@ -2,7 +2,10 @@
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+import ctypes
+from ctypes import wintypes
 import os
+import sys
 from typing import Dict, List, Optional
 from pathlib import Path
 import threading
@@ -11,6 +14,7 @@ import shutil
 import zipfile
 import queue
 import tempfile
+import hashlib
 import stat
 import json
 import time
@@ -24,12 +28,14 @@ from .file_manager import FileManager
 from .app_info_dialog import AppInfoDialog, ProcessInfoDialog
 from .scrcpy_settings_dialog import ScrcpySettingsDialog
 from .scrcpy_output_dialog import ScrcpyOutputDialog
+from .scrcpy_overlay import ScrcpyOverlayToolbar
 from .device_details_dialog import DeviceDetailsDialog
 from .process_graph import ProcessHistoryWindow
 from .forward_dialog import ForwardDialog
 from .file_drop import enable_file_drop
 from .logcat_view import LogcatView
 from .shell_view import ShellView
+from .network_inspector import NetworkInspector
 from .capture import take_screenshot, record_screen
 from .apk_extract import extract_apk
 from .llm_report_dialog import LLMReportDialog, LLMReportProgressDialog
@@ -39,6 +45,7 @@ from .backup_dialog import BackupCancelToken, BackupOptionsDialog, BackupProgres
 from .taskbar_progress import TaskbarProgress
 from .apk_install_progress import APKInstallProgressDialog
 from .dpi import enable_dpi_awareness, setup_window_dpi, scale_size
+from .misc_tab import MiscTab
 
 
 _OFFLINE_ERROR_KEYWORDS = [
@@ -62,6 +69,33 @@ _MEMORY_UNITS = {
     'MB': 1024 * 1024,
     'GB': 1024 * 1024 * 1024
 }
+
+_MEMORY_LIMIT_BYTES = 300 * 1024 * 1024
+
+
+class _ProcessMemoryCounters(ctypes.Structure):
+    _fields_ = [
+        ('cb', ctypes.c_ulong),
+        ('PageFaultCount', ctypes.c_ulong),
+        ('PeakWorkingSetSize', ctypes.c_size_t),
+        ('WorkingSetSize', ctypes.c_size_t),
+        ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+        ('QuotaPagedPoolUsage', ctypes.c_size_t),
+        ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+        ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+        ('PagefileUsage', ctypes.c_size_t),
+        ('PeakPagefileUsage', ctypes.c_size_t),
+        ('PrivateUsage', ctypes.c_size_t),
+    ]
+
+
+_kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+_kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+_psapi = ctypes.WinDLL('psapi', use_last_error=True)
+_get_process_memory_info = _psapi.GetProcessMemoryInfo
+_get_process_memory_info.argtypes = (
+    wintypes.HANDLE, ctypes.POINTER(_ProcessMemoryCounters), wintypes.DWORD)
+_get_process_memory_info.restype = wintypes.BOOL
 
 CORE_SYSTEM_PACKAGES = {
     'com.android.settings', 'com.android.systemui', 'com.android.launcher',
@@ -168,6 +202,9 @@ class MainWindow:
         self.has_devices = False
         # Serials fastboot reports, which adb cannot see for itself.
         self._fastboot_devices: set = set()
+        self._device_poll_job = None
+        self._device_refresh_in_progress = False
+        self._closing = False
         
         # Mirroring settings
         from core import ConfigManager
@@ -183,6 +220,26 @@ class MainWindow:
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
         self._check_signals()
+        self._enforce_memory_limit()
+
+    def _enforce_memory_limit(self):
+        """Hard-stop this process if its Windows working set exceeds 300 MiB."""
+        if self._closing:
+            return
+        counters = _ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        if not _get_process_memory_info(
+                _kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+            # A hard limit cannot be enforced without a valid measurement.
+            self._exit_for_memory_limit("The memory watchdog could not measure process memory.")
+        if counters.WorkingSetSize >= _MEMORY_LIMIT_BYTES:
+            self._exit_for_memory_limit(
+                "droidmgr reached its 300 MiB memory limit and will now close.")
+        self.root.after(1000, self._enforce_memory_limit)
+
+    def _exit_for_memory_limit(self, reason):
+        messagebox.showerror("droidmgr closing", reason, parent=self.root)
+        os._exit(137)
     
     def _create_ui(self):
         self._create_menu()
@@ -275,6 +332,27 @@ class MainWindow:
             self._set_status,
             self._show_error,
             self._require_device
+        )
+
+        # Initialize Network Inspector
+        self.network_tab = ttk.Frame(self.notebook)
+        self.network_view = NetworkInspector(
+            self.network_tab,
+            device_id=None,
+            device_manager=self.device_manager,
+            set_status_callback=self._set_status,
+            show_error_callback=self._show_error,
+            require_device_callback=self._require_device,
+            config=self.config
+        )
+        self.network_view.pack(fill=tk.BOTH, expand=True)
+
+        # Initialize Misc / Developer Options Tab
+        self.misc_tab = MiscTab(
+            self.notebook,
+            self.device_manager,
+            lambda: self.selected_device,
+            self._set_status
         )
 
         self.notebook.add(self.devices_tab, text="Devices")
@@ -433,15 +511,80 @@ class MainWindow:
     
     def _create_apps_tab(self):
         tab = ttk.Frame(self.notebook)
-        
+
+        self._apps_data = []
+        self._filtered_apps = []
+        self._app_tile_widgets = {}
+        self._app_tree_items = {}
+        self._app_icon_cache = {}
+        self._app_icon_cache_device = None
+        self._app_icon_loading = set()
+        self._grid_packages = []
+        self._grid_tile_geometry = {}
+        self._grid_layout_after_id = None
+        self._grid_animation_after_id = None
+        self._grid_focus_animation_after_id = None
+        self._grid_focus_item = None
+        self._grid_resize_after_id = None
+        self._default_app_icon = None
+        self._last_grid_cols = 0
+        self._last_grid_height = 0
+        self._grid_scroll_after_id = None
+        self._icon_pending_packages = []
+        self._icon_lock = threading.Lock()
+        self._icon_worker_active = False
+
+        # Applications filter and view switch toolbar
+        app_toolbar = ttk.Frame(tab)
+        app_toolbar.pack(fill=tk.X, padx=5, pady=(5, 2))
+
+        ttk.Label(app_toolbar, text="Filter:").pack(side=tk.LEFT, padx=(0, 4))
+        self.app_filter_var = tk.StringVar()
+        self.app_filter_entry = ttk.Entry(app_toolbar, textvariable=self.app_filter_var, width=20)
+        self.app_filter_entry.pack(side=tk.LEFT, padx=(0, 8))
+        self.app_filter_var.trace_add('write', lambda *_: self._apply_app_filter())
+
+        self.app_system_var = tk.BooleanVar(value=True)
+        self.app_system_cb = ttk.Checkbutton(
+            app_toolbar, text="System packages", variable=self.app_system_var,
+            command=self._apply_app_filter)
+        self.app_system_cb.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.app_count_label = ttk.Label(app_toolbar, text="", foreground="gray")
+        self.app_count_label.pack(side=tk.LEFT, padx=4)
+
+        # Right-aligned view switcher and actions
+        self.refresh_apps_btn = ttk.Button(app_toolbar, text="Refresh", command=self._refresh_apps, width=8)
+        self.refresh_apps_btn.pack(side=tk.RIGHT, padx=(4, 0))
+
+        self.install_apk_btn = ttk.Button(app_toolbar, text="+ Install APK", command=self._install_apk)
+        self.install_apk_btn.pack(side=tk.RIGHT, padx=4)
+
+        self.app_view_mode_var = tk.StringVar(value="grid")
+        self.app_list_mode_btn = ttk.Radiobutton(
+            app_toolbar, text="List", variable=self.app_view_mode_var,
+            value="list", command=self._switch_app_view_mode)
+        self.app_list_mode_btn.pack(side=tk.RIGHT, padx=2)
+
+        self.app_grid_mode_btn = ttk.Radiobutton(
+            app_toolbar, text="Grid", variable=self.app_view_mode_var,
+            value="grid", command=self._switch_app_view_mode)
+        self.app_grid_mode_btn.pack(side=tk.RIGHT, padx=2)
+
+        # Container for List and Grid views
         list_frame = ttk.LabelFrame(tab, text="Installed Applications")
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Applications list
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=4)
+
+        self.app_view_container = ttk.Frame(list_frame)
+        self.app_view_container.pack(fill=tk.BOTH, expand=True)
+
+        # 1. List View (Treeview)
+        self.app_list_container = ttk.Frame(self.app_view_container)
+
         self.app_sort_col = 'Name'
         self.app_sort_reverse = False
         columns = ('Name', 'Package', 'Type', 'Size')
-        self.app_tree = ttk.Treeview(list_frame, columns=columns, show='headings',
+        self.app_tree = ttk.Treeview(self.app_list_container, columns=columns, show='headings',
                                      selectmode='extended')
         for col in columns:
             self.app_tree.heading(col, text=col,
@@ -451,20 +594,66 @@ class MainWindow:
         self.app_tree.column('Type', width=scale_size(80, self.root), anchor='center')
         self.app_tree.column('Size', width=scale_size(100, self.root), anchor='e')
 
-        scrollbar_tv = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.app_tree.yview)
+        scrollbar_tv = ttk.Scrollbar(self.app_list_container, orient=tk.VERTICAL, command=self.app_tree.yview)
         self.app_tree.configure(yscrollcommand=scrollbar_tv.set)
         self.app_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar_tv.pack(side=tk.RIGHT, fill=tk.Y)
         self.app_tree.bind('<<TreeviewSelect>>', self._on_app_selection_change)
         self.app_tree.bind('<Double-1>', self._show_app_info)
         self.app_tree.bind('<Return>', self._show_app_info)
+        self.app_tree.bind('<Button-3>', self._show_app_context_menu)
+
+        # 2. Grid View (App Drawer - Direct Hardware-Accelerated Canvas Rendering)
+        self.app_grid_container = ttk.Frame(self.app_view_container)
+
+        self.app_canvas = tk.Canvas(
+            self.app_grid_container, borderwidth=0, highlightthickness=0, background="#ffffff",
+            takefocus=True
+        )
+        scrollbar_grid = ttk.Scrollbar(self.app_grid_container, orient=tk.VERTICAL, command=self._on_grid_scrollbar)
+        self.app_canvas.configure(yscrollcommand=scrollbar_grid.set)
+        self.app_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar_grid.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.app_canvas.bind('<Configure>', self._on_app_canvas_configure)
+
+        def _on_canvas_wheel(event):
+            if self.app_view_mode_var.get() == "grid" and self._is_apps_tab_visible():
+                self.app_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                self._on_canvas_motion(event)
+                if self._grid_scroll_after_id:
+                    try:
+                        self.root.after_cancel(self._grid_scroll_after_id)
+                    except Exception:
+                        pass
+                self._grid_scroll_after_id = self.root.after(60, self._load_visible_grid_icons)
+
+        self.app_canvas.bind("<MouseWheel>", _on_canvas_wheel)
+
+        self.app_canvas.bind("<Button-1>", lambda event: self.app_canvas.focus_set())
+        self.app_canvas.tag_bind("tile", "<Button-1>", self._on_canvas_tile_click)
+        self.app_canvas.tag_bind("tile", "<Double-1>", self._on_canvas_tile_dblclick)
+        self.app_canvas.tag_bind("tile", "<Button-3>", self._on_canvas_tile_context)
+        self.app_canvas.bind("<Motion>", self._on_canvas_motion)
+        self.app_canvas.bind("<Leave>", self._on_canvas_leave)
+        self.app_canvas.bind("<Button-3>", self._on_canvas_tile_context)
+        self.app_canvas.bind("<Left>", lambda event: self._navigate_app_grid(-1, 0))
+        self.app_canvas.bind("<Right>", lambda event: self._navigate_app_grid(1, 0))
+        self.app_canvas.bind("<Up>", lambda event: self._navigate_app_grid(0, -1))
+        self.app_canvas.bind("<Down>", lambda event: self._navigate_app_grid(0, 1))
+        self.app_canvas.bind("<Home>", lambda event: self._navigate_app_grid_to(0))
+        self.app_canvas.bind("<End>", lambda event: self._navigate_app_grid_to(-1))
+        self.app_canvas.bind("<Prior>", lambda event: self._navigate_app_grid_page(-1))
+        self.app_canvas.bind("<Next>", lambda event: self._navigate_app_grid_page(1))
+        self.app_canvas.bind("<Return>", self._open_grid_app_info)
+        self.app_canvas.bind("<space>", self._open_grid_app_info)
+
+        # Start with Grid view active
+        self.app_grid_container.pack(fill=tk.BOTH, expand=True)
 
         # Dropping APKs from Explorer installs them, when the platform supports it.
         self.drop_supported = enable_file_drop(list_frame, self._on_files_dropped)
         if self.drop_supported:
-            # An empty-state hint, parented to the list itself so that centring
-            # it ignores the label frame's border and its scrollbar. It is hidden
-            # as soon as there are rows, so it never covers anything to click.
             self.drop_hint = ttk.Label(
                 self.app_tree,
                 text="No applications found.\nDrop .apk files here to install them.",
@@ -473,38 +662,724 @@ class MainWindow:
                 justify='center'
             )
             self.drop_hint.place(relx=0.5, rely=0.5, anchor='center')
-            # Re-wrap as the list is resized, so the hint never runs off the side.
             self.app_tree.bind('<Configure>', self._on_drop_hint_configure)
 
-
-
-        
+        # Bottom action buttons
         btn_frame = ttk.Frame(tab)
         btn_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        self.refresh_apps_btn = ttk.Button(btn_frame, text="Refresh", command=self._refresh_apps)
-        self.refresh_apps_btn.pack(side=tk.LEFT, padx=2)
-        
-        self.install_apk_btn = ttk.Button(btn_frame, text="Install APK", command=self._install_apk)
-        self.install_apk_btn.pack(side=tk.LEFT, padx=2)
-        
+
         self.extract_apk_btn = ttk.Button(btn_frame, text="Extract APK", command=self._extract_apk)
         self.extract_apk_btn.pack(side=tk.LEFT, padx=2)
-        
+
         self.start_app_btn = ttk.Button(btn_frame, text="Start App", command=self._start_app)
         self.start_app_btn.pack(side=tk.LEFT, padx=2)
-        
+
         self.stop_app_btn = ttk.Button(btn_frame, text="Stop App", command=self._stop_app)
         self.stop_app_btn.pack(side=tk.LEFT, padx=2)
-        
+
         self.uninstall_app_btn = ttk.Button(btn_frame, text="Uninstall App", command=self._uninstall_app)
         self.uninstall_app_btn.pack(side=tk.LEFT, padx=2)
 
         self.clear_cache_btn = ttk.Button(btn_frame, text="Clear Cache", command=self._clear_app_cache)
         self.clear_cache_btn.pack(side=tk.LEFT, padx=2)
 
-        
         return tab
+
+    def _is_apps_tab_visible(self) -> bool:
+        try:
+            sel = self.notebook.select()
+            return self.notebook.tab(sel, 'text') == 'Applications' if sel else False
+        except Exception:
+            return False
+
+    def _switch_app_view_mode(self):
+        mode = self.app_view_mode_var.get()
+        if mode == "grid":
+            self.app_list_container.pack_forget()
+            self.app_grid_container.pack(fill=tk.BOTH, expand=True)
+            self._render_app_grid()
+        else:
+            self.app_grid_container.pack_forget()
+            self.app_list_container.pack(fill=tk.BOTH, expand=True)
+
+    def _get_default_icon_path(self) -> Optional[str]:
+        candidates = [
+            Path(__file__).resolve().parent / 'assets' / 'android.png',
+            Path(__file__).resolve().parent.parent / 'assets' / 'android.png',
+            Path(__file__).resolve().parent / 'android.png',
+            Path(getattr(sys, '_MEIPASS', '')) / 'assets' / 'android.png',
+        ]
+        for p in candidates:
+            if p.is_file():
+                return str(p)
+        return None
+
+    def _create_default_app_icon(self) -> tk.PhotoImage:
+        size = scale_size(48, self.root)
+        default_path = self._get_default_icon_path()
+        if default_path:
+            try:
+                raw_img = tk.PhotoImage(file=default_path)
+                w = raw_img.width()
+                sub = max(1, round(w / size))
+                return raw_img.subsample(sub, sub) if sub > 1 else raw_img
+            except Exception:
+                pass
+
+        img = tk.PhotoImage(width=size, height=size)
+        r = int(size * 0.2)
+        green = "#27ae60"
+        img.put(green, to=(0, r, size, size - r))
+        img.put(green, to=(r, 0, size - r, size))
+        for i in range(r):
+            dx = int((r * r - (r - i - 0.5) ** 2) ** 0.5)
+            img.put(green, to=(r - dx, i, r, i + 1))
+            img.put(green, to=(size - r, i, size - r + dx, i + 1))
+            img.put(green, to=(r - dx, size - 1 - i, r, size - i))
+            img.put(green, to=(size - r, size - 1 - i, size - r + dx, size - i))
+
+        cx, cy = size // 2, int(size * 0.56)
+        head_r = int(size * 0.22)
+        white = "#ffffff"
+        for y in range(cy - head_r, cy):
+            dy = cy - y
+            if head_r * head_r - dy * dy >= 0:
+                hw = int((head_r * head_r - dy * dy) ** 0.5)
+                img.put(white, to=(cx - hw, y, cx + hw + 1, y + 1))
+
+        eye_y = int(cy - head_r * 0.45)
+        eye_spacing = int(head_r * 0.45)
+        eye_sz = max(2, int(size * 0.05))
+        img.put(green, to=(cx - eye_spacing - eye_sz // 2, eye_y, cx - eye_spacing + eye_sz // 2 + 1, eye_y + eye_sz))
+        img.put(green, to=(cx + eye_spacing - eye_sz // 2, eye_y, cx + eye_spacing + eye_sz // 2 + 1, eye_y + eye_sz))
+
+        ant_len = int(size * 0.1)
+        for d in range(ant_len):
+            img.put(white, to=(cx - eye_spacing - d, cy - head_r - d, cx - eye_spacing - d + 2, cy - head_r - d + 1))
+            img.put(white, to=(cx + eye_spacing + d, cy - head_r - d, cx + eye_spacing + d + 2, cy - head_r - d + 1))
+
+        return img
+
+    def _apply_app_filter(self, restore_selected=None, restore_yview=None):
+        query = getattr(self, 'app_filter_var', None)
+        q_text = query.get().strip().lower() if query else ""
+        show_sys = getattr(self, 'app_system_var', None)
+        is_sys = show_sys.get() if show_sys is not None else True
+
+        apps = getattr(self, '_apps_data', [])
+        filtered = []
+        for app in apps:
+            if not is_sys and app.get('is_system'):
+                continue
+            if q_text:
+                name = (app.get('name') or '').lower()
+                pkg = (app.get('package') or '').lower()
+                if q_text not in name and q_text not in pkg:
+                    continue
+            filtered.append(app)
+
+        self._filtered_apps = filtered
+
+        # Update count badge
+        total = len(apps)
+        showing = len(filtered)
+        if hasattr(self, 'app_count_label'):
+            if q_text or not is_sys:
+                self.app_count_label.config(text=f"{showing} of {total} packages")
+            else:
+                self.app_count_label.config(text=f"{total} total packages")
+
+        # Update Treeview
+        for item in self.app_tree.get_children():
+            self.app_tree.delete(item)
+
+        target_ids = []
+        self._app_tree_items.clear()
+        for app in filtered:
+            item_id = self.app_tree.insert(
+                '', tk.END,
+                values=(app['name'], app['package'], app['type'],
+                        _format_bytes(app.get('size_bytes', 0)))
+            )
+            self._app_tree_items[app['package']] = item_id
+            if restore_selected and app['package'] in restore_selected:
+                target_ids.append(item_id)
+
+        self._update_drop_hint()
+
+        if target_ids:
+            self.app_tree.selection_set(target_ids)
+            self.app_tree.focus(target_ids[0])
+
+        if restore_yview:
+            try:
+                self.app_tree.yview_moveto(restore_yview[0])
+            except Exception:
+                pass
+
+        # Update Grid View
+        if getattr(self, 'app_view_mode_var', None) and self.app_view_mode_var.get() == "grid":
+            self._render_app_grid()
+
+    def _render_app_grid(self):
+        if self._grid_focus_animation_after_id:
+            self.root.after_cancel(self._grid_focus_animation_after_id)
+            self._grid_focus_animation_after_id = None
+        self.app_canvas.delete("all")
+        self._hovered_pkg = None
+        self._grid_focus_item = None
+
+        if not getattr(self, '_default_app_icon', None):
+            self._default_app_icon = self._create_default_app_icon()
+
+        canvas_w = self.app_canvas.winfo_width() or scale_size(600, self.root)
+        tile_w = scale_size(100, self.root)
+        tile_h = scale_size(105, self.root)
+        margin = scale_size(10, self.root)
+
+        cols = max(1, (canvas_w - margin * 2) // tile_w)
+        self._last_grid_cols = cols
+
+        selected_pkgs = set(self._get_selected_packages())
+        apps = getattr(self, '_filtered_apps', [])
+
+        for idx, app in enumerate(apps):
+            pkg = app['package']
+            name = app.get('name') or pkg.split('.')[-1]
+            r = idx // cols
+            c = idx % cols
+
+            x1 = margin + c * tile_w
+            y1 = margin + r * tile_h
+            x2 = x1 + tile_w - 6
+            y2 = y1 + tile_h - 6
+            cx = (x1 + x2) // 2
+            icon_y = y1 + scale_size(32, self.root)
+            text_y = y1 + scale_size(78, self.root)
+
+            is_sel = pkg in selected_pkgs
+            fill = "#cce8ff" if is_sel else ""
+            outline = "#2684ff" if is_sel else ""
+
+            # 1. Background selection/hover box
+            self.app_canvas.create_rectangle(
+                x1, y1, x2, y2, fill=fill, outline=outline, width=1,
+                tags=("tile", f"tile_{pkg}", f"bg_{pkg}")
+            )
+
+            # 2. App icon
+            icon_img = self._app_icon_cache.get(pkg, self._default_app_icon)
+            self.app_canvas.create_image(
+                cx, icon_y, image=icon_img,
+                tags=("tile", f"tile_{pkg}", f"icon_{pkg}")
+            )
+
+            # 3. Label text
+            display_name = name if len(name) <= 18 else name[:16] + "…"
+            self.app_canvas.create_text(
+                cx, text_y, text=display_name,
+                font=("Segoe UI", 9), fill="#1f1f1f",
+                width=tile_w - 12, justify=tk.CENTER,
+                tags=("tile", f"tile_{pkg}", f"text_{pkg}")
+            )
+
+        total_rows = (len(apps) + cols - 1) // cols if apps else 1
+        total_h = margin * 2 + total_rows * tile_h + 20
+        self.app_canvas.configure(scrollregion=(0, 0, canvas_w, total_h))
+
+        self._load_visible_grid_icons()
+
+    def _visible_grid_packages(self):
+        """Return only tiles in or immediately beside the viewport."""
+        top = self.app_canvas.canvasy(0) - scale_size(105, self.root)
+        bottom = self.app_canvas.canvasy(self.app_canvas.winfo_height()) + scale_size(105, self.root)
+        visible = []
+        for app in getattr(self, '_filtered_apps', []):
+            pkg = app['package']
+            box = self.app_canvas.bbox(f"bg_{pkg}")
+            if box and box[3] >= top and box[1] <= bottom:
+                visible.append(pkg)
+        return visible
+
+    def _load_visible_grid_icons(self):
+        if not getattr(self, '_filtered_apps', None):
+            return
+        visible = self._visible_grid_packages()
+        to_load = [p for p in visible if p not in self._app_icon_cache and p not in self._app_icon_loading]
+        if to_load:
+            self._load_app_icons_async(to_load)
+
+    def _get_pkg_from_canvas_event(self, event) -> Optional[str]:
+        cx = self.app_canvas.canvasx(event.x)
+        cy = self.app_canvas.canvasy(event.y)
+        items = self.app_canvas.find_overlapping(cx, cy, cx, cy)
+        for item in reversed(items):
+            tags = self.app_canvas.gettags(item)
+            for tag in tags:
+                if tag.startswith("tile_"):
+                    return tag[5:]
+        return None
+
+    def _on_canvas_tile_click(self, event):
+        pkg = self._get_pkg_from_canvas_event(event)
+        if pkg:
+            self._select_grid_tile(pkg)
+
+    def _on_canvas_tile_dblclick(self, event):
+        pkg = self._get_pkg_from_canvas_event(event)
+        if pkg:
+            self._select_grid_tile(pkg)
+            self._show_app_info()
+
+    def _on_canvas_tile_context(self, event):
+        pkg = self._get_pkg_from_canvas_event(event)
+        if pkg:
+            self._select_grid_tile(pkg)
+            self._show_app_context_menu(event)
+
+    def _on_canvas_motion(self, event):
+        pkg = self._get_pkg_from_canvas_event(event)
+        old_pkg = getattr(self, '_hovered_pkg', None)
+        if pkg == old_pkg:
+            return
+
+        selected = set(self._get_selected_packages())
+
+        # Un-hover the previously hovered tile
+        if old_pkg and old_pkg not in selected:
+            self.app_canvas.itemconfig(f"bg_{old_pkg}", fill="", outline="")
+
+        # Hover the new tile
+        if pkg:
+            if pkg not in selected:
+                self.app_canvas.itemconfig(f"bg_{pkg}", fill="#e8f0fe", outline="#cce8ff")
+            self.app_canvas.config(cursor="hand2")
+        else:
+            self.app_canvas.config(cursor="")
+
+        self._hovered_pkg = pkg
+
+    def _on_canvas_leave(self, event):
+        old_pkg = getattr(self, '_hovered_pkg', None)
+        if old_pkg:
+            selected = set(self._get_selected_packages())
+            if old_pkg not in selected:
+                self.app_canvas.itemconfig(f"bg_{old_pkg}", fill="", outline="")
+            self._hovered_pkg = None
+        self.app_canvas.config(cursor="")
+
+    def _sync_grid_selection(self):
+        if not hasattr(self, 'app_canvas') or not self.app_canvas.winfo_exists():
+            return
+        selected = set(self._get_selected_packages())
+        hovered = getattr(self, '_hovered_pkg', None)
+        for app in getattr(self, '_filtered_apps', []):
+            p = app['package']
+            if p in selected:
+                self.app_canvas.itemconfig(f"bg_{p}", fill="#cce8ff", outline="#2684ff")
+            elif p == hovered:
+                self.app_canvas.itemconfig(f"bg_{p}", fill="#e8f0fe", outline="#cce8ff")
+            else:
+                self.app_canvas.itemconfig(f"bg_{p}", fill="", outline="")
+        self._animate_grid_focus(self._get_selected_package())
+
+    def _animate_grid_focus(self, package):
+        """Move the keyboard focus outline with a short linear interpolation."""
+        if not package or not self.app_canvas.find_withtag(f"bg_{package}"):
+            if self._grid_focus_item:
+                self.app_canvas.itemconfig(self._grid_focus_item, state=tk.HIDDEN)
+            return
+        target = self.app_canvas.coords(f"bg_{package}")
+        if not target:
+            return
+        if not self._grid_focus_item:
+            self._grid_focus_item = self.app_canvas.create_rectangle(
+                *target, outline="#2684ff", width=2, state=tk.HIDDEN, tags=("grid_focus",))
+        if self._grid_focus_animation_after_id:
+            self.root.after_cancel(self._grid_focus_animation_after_id)
+        current = self.app_canvas.coords(self._grid_focus_item) or target
+        self.app_canvas.itemconfig(self._grid_focus_item, state=tk.NORMAL)
+        self.app_canvas.tag_raise(self._grid_focus_item)
+        def frame(step=1):
+            amount = step / 6
+            self.app_canvas.coords(self._grid_focus_item, *[a + (b - a) * amount for a, b in zip(current, target)])
+            if step < 6:
+                self._grid_focus_animation_after_id = self.root.after(16, lambda: frame(step + 1))
+            else:
+                self._grid_focus_animation_after_id = None
+        frame()
+
+    def _select_grid_tile(self, package):
+        self._hovered_pkg = None
+        target_item = self._app_tree_items.get(package)
+        if target_item:
+            self.app_tree.selection_set(target_item)
+            if getattr(self, 'app_view_mode_var', None) and self.app_view_mode_var.get() == "tree":
+                self.app_tree.focus(target_item)
+        if getattr(self, 'app_view_mode_var', None) and self.app_view_mode_var.get() == "grid":
+            self.app_canvas.focus_set()
+        self._sync_grid_selection()
+        self._update_app_button_states()
+
+    def _navigate_app_grid(self, dx, dy):
+        packages = self._grid_packages
+        if not packages:
+            return "break"
+        current = self._get_selected_package()
+        index = packages.index(current) if current in packages else 0
+        cols = max(1, self._last_grid_cols)
+        row, col = divmod(index, cols)
+        last_row = (len(packages) - 1) // cols
+        target_row = max(0, min(last_row, row + dy))
+        target_col = max(0, min(cols - 1, col + dx))
+        target = min(len(packages) - 1, target_row * cols + target_col)
+        self._select_grid_tile(packages[target])
+        self._scroll_grid_tile_into_view(packages[target])
+        self._load_visible_grid_icons()
+        return "break"
+
+    def _navigate_app_grid_to(self, index):
+        if self._grid_packages:
+            self._select_grid_tile(self._grid_packages[index])
+            self._scroll_grid_tile_into_view(self._grid_packages[index])
+            self._load_visible_grid_icons()
+        return "break"
+
+    def _navigate_app_grid_page(self, direction):
+        visible_rows = max(1, self.app_canvas.winfo_height() // scale_size(105, self.root))
+        return self._navigate_app_grid(0, direction * visible_rows)
+
+    def _scroll_grid_tile_into_view(self, package):
+        box = self.app_canvas.bbox(f"bg_{package}")
+        region = self.app_canvas.cget("scrollregion").split()
+        if not box or len(region) != 4:
+            return
+        top, bottom = self.app_canvas.canvasy(0), self.app_canvas.canvasy(self.app_canvas.winfo_height())
+        if box[1] < top or box[3] > bottom:
+            total = max(1, float(region[3]) - self.app_canvas.winfo_height())
+            self.app_canvas.yview_moveto(max(0.0, min(1.0, (box[1] - 8) / total)))
+
+    def _open_grid_app_info(self, event=None):
+        if self._get_selected_package():
+            self._show_app_info()
+        return "break"
+
+    def _on_grid_scrollbar(self, *args):
+        self.app_canvas.yview(*args)
+        if getattr(self, '_grid_scroll_after_id', None):
+            try:
+                self.root.after_cancel(self._grid_scroll_after_id)
+            except Exception:
+                pass
+        self._grid_scroll_after_id = self.root.after(60, self._load_visible_grid_icons)
+
+    def _on_app_canvas_configure(self, event):
+        if not getattr(self, '_filtered_apps', None):
+            return
+        tile_w = scale_size(100, self.root)
+        margin = scale_size(10, self.root)
+        cols = max(1, (event.width - margin * 2) // tile_w)
+        h_diff = abs(event.height - getattr(self, '_last_grid_height', 0))
+        if cols != getattr(self, '_last_grid_cols', 0) or h_diff > 40:
+            if self._grid_resize_after_id:
+                try:
+                    self.root.after_cancel(self._grid_resize_after_id)
+                except Exception:
+                    pass
+            self._grid_resize_after_id = self.root.after(80, self._render_resized_app_grid)
+
+    def _render_resized_app_grid(self):
+        self._grid_resize_after_id = None
+        if self.app_view_mode_var.get() == "grid" and self._is_apps_tab_visible():
+            self._relayout_app_grid()
+
+    def _relayout_app_grid(self):
+        """Reposition existing canvas items without allocating a new grid."""
+        apps = getattr(self, '_filtered_apps', [])
+        if not apps:
+            return
+
+        canvas_w = self.app_canvas.winfo_width() or scale_size(600, self.root)
+        canvas_h = self.app_canvas.winfo_height() or scale_size(400, self.root)
+        tile_w = scale_size(100, self.root)
+        tile_h = scale_size(105, self.root)
+        margin = scale_size(10, self.root)
+        cols = max(1, (canvas_w - margin * 2) // tile_w)
+
+        cols_changed = (cols != getattr(self, '_last_grid_cols', 0))
+        self._last_grid_cols = cols
+        self._last_grid_height = canvas_h
+
+        if cols_changed:
+            for index, app in enumerate(apps):
+                pkg = app['package']
+                row, col = divmod(index, cols)
+                x1 = margin + col * tile_w
+                y1 = margin + row * tile_h
+                x2 = x1 + tile_w - 6
+                y2 = y1 + tile_h - 6
+                cx = (x1 + x2) // 2
+                self.app_canvas.coords(f"bg_{pkg}", x1, y1, x2, y2)
+                self.app_canvas.coords(f"icon_{pkg}", cx, y1 + scale_size(32, self.root))
+                self.app_canvas.coords(f"text_{pkg}", cx, y1 + scale_size(78, self.root))
+                self.app_canvas.itemconfig(f"text_{pkg}", width=tile_w - 12)
+
+            rows = (len(apps) + cols - 1) // cols
+            self.app_canvas.configure(scrollregion=(0, 0, canvas_w, margin * 2 + rows * tile_h + 20))
+            self._sync_grid_selection()
+
+        self._load_visible_grid_icons()
+
+    def _show_app_context_menu(self, event):
+        pkgs = self._get_selected_packages()
+        if not pkgs:
+            return
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="App Details", command=self._show_app_info)
+        menu.add_separator()
+        menu.add_command(label="Start App", command=self._start_app)
+        menu.add_command(label="Stop App", command=self._stop_app)
+        menu.add_command(label="Extract APK...", command=self._extract_apk)
+        menu.add_command(label="Save App Icon...", command=self._save_app_icon)
+        menu.add_command(label="Clear Cache", command=self._clear_app_cache)
+        menu.add_separator()
+        menu.add_command(label="Uninstall App", command=self._uninstall_app)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _get_icon_cache_dir(self) -> str:
+        try:
+            return self.config.get_cache_dir('icons')
+        except Exception:
+            p = os.path.join(tempfile.gettempdir(), 'droidmgr_icons')
+            os.makedirs(p, exist_ok=True)
+            return p
+
+    def _save_app_icon(self):
+        pkgs = self._get_selected_packages()
+        if not pkgs or not self._require_device():
+            return
+
+        cache_dir = self._get_icon_cache_dir()
+        dev_id = self.selected_device
+        device_key = hashlib.sha256(dev_id.encode('utf-8')).hexdigest()[:10]
+
+        pkg_paths = {}
+        for app in getattr(self, '_apps_data', []):
+            if app.get('package') and app.get('path'):
+                pkg_paths[app['package']] = app['path']
+
+        def get_or_extract_icon(pkg):
+            # 1. Check existing cached icon
+            try:
+                for fname in os.listdir(cache_dir):
+                    if fname.startswith(f"{pkg}_{device_key}_") and fname.endswith("_icon.png"):
+                        full_p = os.path.join(cache_dir, fname)
+                        if os.path.isfile(full_p) and os.path.getsize(full_p) > 0:
+                            return full_p
+            except Exception:
+                pass
+
+            # 2. Extract icon using adb
+            try:
+                apk_p = pkg_paths.get(pkg)
+                p = self.device_manager.adb.extract_app_icon(dev_id, pkg, cache_dir, known_apk_path=apk_p)
+                if p and os.path.isfile(p) and os.path.getsize(p) > 0:
+                    return p
+            except Exception:
+                pass
+            return None
+
+        if len(pkgs) == 1:
+            pkg = pkgs[0]
+            self._set_status(f"Fetching app icon for {pkg}...")
+            icon_path = get_or_extract_icon(pkg) or self._get_default_icon_path()
+            if not icon_path:
+                self._show_warning(f"Could not extract icon for '{pkg}'.")
+                self._set_status(f"Could not extract icon for {pkg}")
+                return
+
+            dest = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="Save App Icon",
+                defaultextension=".png",
+                initialfile=f"{pkg}_icon.png",
+                filetypes=[("PNG Image", "*.png"), ("All Files", "*.*")]
+            )
+            if dest:
+                try:
+                    shutil.copy2(icon_path, dest)
+                    self._set_status(f"App icon saved to {dest}")
+                    messagebox.showinfo("Save App Icon", f"App icon saved to:\n{dest}", parent=self.root)
+                except Exception as exc:
+                    self._show_error("Save Icon Error", f"Failed to save icon:\n{exc}")
+        else:
+            dest_dir = filedialog.askdirectory(
+                parent=self.root,
+                title=f"Select Directory to Save {len(pkgs)} App Icons"
+            )
+            if not dest_dir:
+                return
+
+            saved = 0
+            default_path = self._get_default_icon_path()
+            self._set_status(f"Saving {len(pkgs)} app icons...")
+            for pkg in pkgs:
+                ip = get_or_extract_icon(pkg) or default_path
+                if ip:
+                    try:
+                        shutil.copy2(ip, os.path.join(dest_dir, f"{pkg}_icon.png"))
+                        saved += 1
+                    except Exception:
+                        pass
+            self._set_status(f"Saved {saved} of {len(pkgs)} app icons to {dest_dir}")
+            messagebox.showinfo("Save App Icons", f"Saved {saved} of {len(pkgs)} app icons to:\n{dest_dir}", parent=self.root)
+
+    def _load_app_icons_async(self, packages):
+        if not self.selected_device or not packages:
+            return
+        manager = getattr(self, 'device_manager', None)
+        if not manager or not hasattr(manager, 'adb'):
+            return
+
+        to_fetch = [p for p in packages
+                    if p not in self._app_icon_cache and p not in self._app_icon_loading]
+        if not to_fetch:
+            return
+
+        if not hasattr(self, '_icon_pending_packages'):
+            self._icon_pending_packages = []
+        if not hasattr(self, '_icon_lock'):
+            self._icon_lock = threading.Lock()
+
+        with self._icon_lock:
+            for p in to_fetch:
+                if p not in self._icon_pending_packages:
+                    self._icon_pending_packages.append(p)
+            self._app_icon_loading.update(to_fetch)
+
+        if not getattr(self, '_icon_worker_active', False):
+            self._icon_worker_active = True
+            threading.Thread(target=self._icon_loader_worker, daemon=True).start()
+
+    def _icon_loader_worker(self):
+        dev_id = self.selected_device
+        current_gen = getattr(self, '_icon_extract_generation', 0)
+        cache_dir = self._get_icon_cache_dir()
+        manager = getattr(self, 'device_manager', None)
+        if not manager or not hasattr(manager, 'adb'):
+            with self._icon_lock:
+                self._icon_worker_active = False
+            return
+
+        def is_cancelled():
+            return (
+                getattr(self, '_closing', False)
+                or current_gen != getattr(self, '_icon_extract_generation', 0)
+                or self.selected_device != dev_id
+            )
+
+        try:
+            while not is_cancelled():
+                pkg_paths = {}
+                for app in getattr(self, '_apps_data', []):
+                    if app.get('package') and app.get('path'):
+                        pkg_paths[app['package']] = app['path']
+
+                chunk = []
+                with self._icon_lock:
+                    if not self._icon_pending_packages:
+                        break
+                    visible = set(self._visible_grid_packages()) if hasattr(self, '_visible_grid_packages') else set()
+                    vis_chunk = [p for p in self._icon_pending_packages if p in visible]
+                    if vis_chunk:
+                        chunk = vis_chunk[:40]
+                    else:
+                        chunk = self._icon_pending_packages[:40]
+                    for p in chunk:
+                        self._icon_pending_packages.remove(p)
+
+                if not chunk or is_cancelled():
+                    break
+
+                batch_extracted = {}
+                if hasattr(manager.adb, 'extract_app_icons_batch'):
+                    try:
+                        batch_extracted = manager.adb.extract_app_icons_batch(
+                            dev_id, chunk, cache_dir, cancel_check=is_cancelled
+                        )
+                    except Exception:
+                        batch_extracted = {}
+
+                for pkg, icon_path in batch_extracted.items():
+                    if is_cancelled():
+                        return
+                    def apply_icon(p=pkg, ip=icon_path):
+                        if is_cancelled():
+                            return
+                        try:
+                            raw_img = tk.PhotoImage(file=ip)
+                            w = raw_img.width()
+                            target_sz = scale_size(48, self.root)
+                            sub = max(1, round(w / target_sz))
+                            scaled = raw_img.subsample(sub, sub) if sub > 1 else raw_img
+                            self._app_icon_cache[p] = scaled
+                            if hasattr(self, 'app_canvas'):
+                                self.app_canvas.itemconfig(f"icon_{p}", image=scaled)
+                        except Exception:
+                            pass
+                        finally:
+                            self._app_icon_loading.discard(p)
+                    self.root.after(0, apply_icon)
+
+                remaining = [p for p in chunk if p not in batch_extracted]
+                for pkg in remaining:
+                    if is_cancelled():
+                        return
+                    apk_path = pkg_paths.get(pkg)
+                    try:
+                        icon_path = manager.adb.extract_app_icon(
+                            dev_id, pkg, cache_dir, known_apk_path=apk_path
+                        )
+                        if is_cancelled():
+                            return
+                        if icon_path and os.path.isfile(icon_path):
+                            def apply_single(p=pkg, ip=icon_path):
+                                if is_cancelled():
+                                    return
+                                try:
+                                    raw_img = tk.PhotoImage(file=ip)
+                                    w = raw_img.width()
+                                    target_sz = scale_size(48, self.root)
+                                    sub = max(1, round(w / target_sz))
+                                    scaled = raw_img.subsample(sub, sub) if sub > 1 else raw_img
+                                    self._app_icon_cache[p] = scaled
+                                    if hasattr(self, 'app_canvas'):
+                                        self.app_canvas.itemconfig(f"icon_{p}", image=scaled)
+                                except Exception:
+                                    pass
+                                finally:
+                                    self._app_icon_loading.discard(p)
+                            self.root.after(0, apply_single)
+                        else:
+                            self.root.after(0, lambda p=pkg: (
+                                self._app_icon_cache.setdefault(p, self._default_app_icon),
+                                self._app_icon_loading.discard(p)
+                            ))
+                    except Exception:
+                        self.root.after(0, lambda p=pkg: (
+                            self._app_icon_cache.setdefault(p, self._default_app_icon),
+                            self._app_icon_loading.discard(p)
+                        ))
+        finally:
+            with self._icon_lock:
+                self._icon_worker_active = False
+                if self._icon_pending_packages and not is_cancelled():
+                    self._icon_worker_active = True
+                    threading.Thread(target=self._icon_loader_worker, daemon=True).start()
+
     
     def _update_tab_visibility(self):
         if self.has_devices:
@@ -516,9 +1391,13 @@ class MainWindow:
                 self.notebook.add(self.processes_tab, text="Processes")
                 self.notebook.add(self.apps_tab, text="Applications")
                 self.notebook.add(self.files_tab, text="Files")
+                self.notebook.add(self.network_tab, text="Network")
                 self.notebook.add(self.logcat_tab, text="Logcat")
                 self.notebook.add(self.shell_tab, text="Shell")
+                self.notebook.add(self.misc_tab, text="Misc")
             elif not self.selected_device:
+                if hasattr(self, 'network_view'):
+                    self.network_view.set_device(None)
                 while self.notebook.index('end') > 1:
                     self.notebook.forget(1)
         else:
@@ -526,6 +1405,8 @@ class MainWindow:
             self.no_devices_frame.pack(fill=tk.BOTH, expand=True)
             self._update_button_states()
             
+            if hasattr(self, 'network_view'):
+                self.network_view.set_device(None)
             while self.notebook.index('end') > 1:
                 self.notebook.forget(1)
     
@@ -693,6 +1574,7 @@ class MainWindow:
     def _on_preferences_changed(self):
         from core import ConfigManager
         config = ConfigManager()
+        self.config = config
         
         adb_path = config.get('paths', 'adb')
         scrcpy_path = config.get('paths', 'scrcpy')
@@ -765,6 +1647,11 @@ class MainWindow:
                 except Exception:
                     current_tab_text = ""
                 
+                if current_tab_text != "Network" and hasattr(self, 'network_view'):
+                    self.network_view.stop_polling()
+                if current_tab_text != "Logcat" and hasattr(self, 'logcat_view'):
+                    self.logcat_view.stop()
+
                 if current_tab_text == "Processes":
                     self._refresh_processes()
                 elif current_tab_text == "Applications":
@@ -772,6 +1659,8 @@ class MainWindow:
                 elif current_tab_text == "Files":
                     self.file_manager.refresh()
                     self.logcat_view.set_device(self.selected_device)
+                elif current_tab_text == "Network":
+                    self.network_view.set_device(self.selected_device)
                 elif current_tab_text == "Logcat":
                     self.logcat_view.set_device(
                         self.selected_device, force_refresh=True, autostart=True)
@@ -790,18 +1679,53 @@ class MainWindow:
             if not current_tab_id:
                 return
             tab_text = self.notebook.tab(current_tab_id, "text")
+
+            if tab_text != "Network" and hasattr(self, 'network_view'):
+                self.network_view.stop_polling()
+            if tab_text != "Logcat" and hasattr(self, 'logcat_view'):
+                self.logcat_view.stop()
             
+            # Debounce tab activation so rapid tab clicking doesn't flood ADB and Tkinter
+            if getattr(self, '_tab_change_timer', None) is not None:
+                try:
+                    self.root.after_cancel(self._tab_change_timer)
+                except Exception:
+                    pass
+                self._tab_change_timer = None
+
+            self._tab_change_timer = self.root.after(120, lambda: self._activate_tab_safely(current_tab_id, tab_text))
+        except Exception:
+            pass
+
+    def _activate_tab_safely(self, target_tab_id, expected_tab_text):
+        self._tab_change_timer = None
+        if not self.selected_device:
+            return
+        try:
+            if not self.notebook.winfo_exists():
+                return
+            current_tab_id = self.notebook.select()
+            if current_tab_id != target_tab_id:
+                return
+            tab_text = self.notebook.tab(current_tab_id, "text")
+            if tab_text != expected_tab_text:
+                return
+
             if tab_text == "Processes":
                 self._refresh_processes()
             elif tab_text == "Applications":
                 self._refresh_apps()
             elif tab_text == "Files":
                 self.file_manager.set_device(self.selected_device, force_refresh=True)
+            elif tab_text == "Network":
+                self.network_view.set_device(self.selected_device)
             elif tab_text == "Logcat":
                 self.logcat_view.set_device(
                     self.selected_device, force_refresh=True, autostart=True)
             elif tab_text == "Shell":
                 self.shell_view.set_device(self.selected_device)
+            elif tab_text == "Misc":
+                self.misc_tab.set_device(self.selected_device)
         except Exception:
             pass
 
@@ -845,16 +1769,85 @@ class MainWindow:
         if self.selected_device:
             DeviceDetailsDialog(self.root, self.selected_device, self.device_manager)
     
-    def _refresh_devices(self):
-        for item in self.device_tree.get_children():
-            self.device_tree.delete(item)
-        
+    def _schedule_device_poll(self):
+        """Schedule the next periodic device refresh, canceling any existing timer."""
+        if self._device_poll_job is not None:
+            try:
+                self.root.after_cancel(self._device_poll_job)
+            except Exception:
+                pass
+            self._device_poll_job = None
+
+        if getattr(self, '_closing', False):
+            return
+
+        interval_sec = self.config.get('general', 'query_interval', 5)
         try:
-            devices = self.device_manager.get_devices()
-            self._fastboot_devices = self._add_fastboot_devices(devices)
+            interval_ms = max(1000, int(float(interval_sec) * 1000))
+        except (ValueError, TypeError):
+            interval_ms = 5000
+
+        self._device_poll_job = self.root.after(interval_ms, self._refresh_devices)
+
+    def _refresh_devices(self):
+        """Asynchronously query connected devices and update the device list."""
+        if getattr(self, '_closing', False):
+            return
+
+        # Cancel any scheduled poll since we are running a refresh now
+        if self._device_poll_job is not None:
+            try:
+                self.root.after_cancel(self._device_poll_job)
+            except Exception:
+                pass
+            self._device_poll_job = None
+
+        # If a background refresh is already running, mark pending and return
+        if getattr(self, '_device_refresh_in_progress', False):
+            self._device_refresh_pending = True
+            return
+
+        self._device_refresh_in_progress = True
+
+        def bg_query():
+            try:
+                devices = self.device_manager.get_devices()
+                fastboot_devices = self._add_fastboot_devices(devices)
+                err = None
+            except Exception as e:
+                devices = []
+                fastboot_devices = set()
+                err = str(e)
+
+            def apply():
+                self._apply_device_refresh(devices, fastboot_devices, err)
+
+            try:
+                if not getattr(self, '_closing', False):
+                    self.root.after(0, apply)
+            except Exception:
+                pass
+
+        threading.Thread(target=bg_query, daemon=True).start()
+
+    def _apply_device_refresh(self, devices: List[Dict], fastboot_devices: set, error: Optional[str] = None):
+        self._device_refresh_in_progress = False
+        if getattr(self, '_closing', False):
+            return
+
+        try:
+            if error is not None:
+                self.has_devices = False
+                self.selected_device = None
+                self.logcat_view.set_device(None)
+                self._update_tab_visibility()
+                self._set_status(f"Device refresh error: {error}")
+                return
+
+            self._fastboot_devices = fastboot_devices
             self.has_devices = len(devices) > 0
             self._update_tab_visibility()
-            
+
             if not hasattr(self, '_notified_device_statuses'):
                 self._notified_device_statuses = {}
 
@@ -889,11 +1882,29 @@ class MainWindow:
             if problem_msgs:
                 self._set_status("; ".join(problem_msgs))
 
-            for idx, device in enumerate(devices, 1):
+            # Smart tree update: check if the device table actually changed
+            # to avoid destroying selection and causing visible row flicker.
+            existing_children = self.device_tree.get_children()
+            new_rows = []
+            for device in devices:
                 mirroring = "Yes" if device.get('is_mirroring', False) else "No"
-                self.device_tree.insert('', tk.END, text=str(idx),
-                                       values=(device['id'], device.get('model', 'Unknown'),
-                                              device.get('display_status', device['status']), mirroring))
+                new_rows.append((
+                    str(device['id']),
+                    str(device.get('model', 'Unknown')),
+                    str(device.get('display_status', device['status'])),
+                    str(mirroring)
+                ))
+
+            if len(existing_children) == len(new_rows):
+                for child, row in zip(existing_children, new_rows):
+                    if tuple(str(x) for x in self.device_tree.item(child, 'values')) != tuple(row):
+                        self.device_tree.item(child, values=row)
+            else:
+                for item in existing_children:
+                    self.device_tree.delete(item)
+                for idx, row in enumerate(new_rows, 1):
+                    self.device_tree.insert('', tk.END, text=str(idx), values=row)
+
             self._set_status(f"Found {len(devices)} device(s)")
 
             children = self.device_tree.get_children()
@@ -903,7 +1914,7 @@ class MainWindow:
                 disconnected_id = self.selected_device
                 self.statusbar.config(text=f"WARNING: Device '{disconnected_id}' disconnected.", foreground='red')
                 self.root.after(4000, lambda: self.statusbar.config(foreground='black'))
-                
+
                 if self.device_manager.scrcpy.is_mirroring(disconnected_id):
                     try:
                         self.device_manager.stop_mirroring(disconnected_id)
@@ -918,11 +1929,15 @@ class MainWindow:
                     self._on_device_select(None)
                 else:
                     curr_idx = device_ids.index(self.selected_device)
-                    self.device_tree.selection_set(children[curr_idx])
+                    selected_items = self.device_tree.selection()
+                    target_item = children[curr_idx]
+                    if not selected_items or selected_items[0] != target_item:
+                        self.device_tree.selection_set(target_item)
             else:
-                self.selected_device = None
-                self.logcat_view.set_device(None)
-                self._update_tab_visibility()
+                if self.selected_device is not None:
+                    self.selected_device = None
+                    self.logcat_view.set_device(None)
+                    self._update_tab_visibility()
 
         except Exception as e:
             self.has_devices = False
@@ -930,9 +1945,12 @@ class MainWindow:
             self.logcat_view.set_device(None)
             self._update_tab_visibility()
             self._set_status(f"Device refresh error: {e}")
-
-        interval_sec = self.config.get('general', 'query_interval', 5)
-        self.root.after(int(interval_sec) * 1000, self._refresh_devices)
+        finally:
+            if getattr(self, '_device_refresh_pending', False):
+                self._device_refresh_pending = False
+                self.root.after(50, self._refresh_devices)
+            else:
+                self._schedule_device_poll()
 
 
     
@@ -958,14 +1976,37 @@ class MainWindow:
         else:
             def task():
                 try:
-                    process = self.device_manager.start_mirroring(self.selected_device, **self.mirror_settings)
+                    settings = dict(self.mirror_settings)
+                    window_title = f"Droidmgr - {self.selected_device}"
+                    settings['window_title'] = window_title
+
+                    process = self.device_manager.start_mirroring(self.selected_device, **settings)
                     
-                    def start_dialog():
+                    def start_overlay():
                         self._update_mirror_label(True)
                         self._set_status("Mirroring started")
-                        ScrcpyOutputDialog(self.root, process, self.selected_device, self.device_manager.stop_mirroring)
+
+                        def stop_cb(dev_id):
+                            try:
+                                self.device_manager.stop_mirroring(dev_id)
+                            except Exception:
+                                pass
+                            self._update_mirror_label(False)
+                            self._set_status("Mirroring stopped")
+
+                        ScrcpyOverlayToolbar(
+                            parent=self.root,
+                            process=process,
+                            device_id=self.selected_device,
+                            device_manager=self.device_manager,
+                            stop_callback=stop_cb,
+                            show_settings_callback=self._show_scrcpy_settings,
+                            take_screenshot_callback=self._take_screenshot,
+                            record_screen_callback=self._record_screen,
+                            window_title=window_title,
+                        )
                         
-                    self.root.after(0, start_dialog)
+                    self.root.after(0, start_overlay)
                 except Exception as e:
                     msg = str(e)
                     self.root.after(0, lambda: self._show_error("Mirroring Error", msg))
@@ -1287,6 +2328,11 @@ class MainWindow:
 
                 
                 def update():
+                    if not self.notebook.winfo_exists():
+                        return
+                    cur_sel = self.notebook.select()
+                    if cur_sel and self.notebook.tab(cur_sel, 'text') != 'Processes':
+                        return
                     # Clear existing items inside the main thread to avoid intermediate empty states
                     for item in self.process_tree.get_children():
                         self.process_tree.delete(item)
@@ -1450,6 +2496,14 @@ class MainWindow:
     def _refresh_apps(self):
         if not self.selected_device:
             return
+        if self._app_icon_cache_device != self.selected_device:
+            self._app_icon_cache.clear()
+            self._app_icon_loading.clear()
+            if hasattr(self, '_icon_pending_packages'):
+                with self._icon_lock:
+                    self._icon_pending_packages.clear()
+            self._app_icon_cache_device = self.selected_device
+            self._icon_extract_generation = getattr(self, '_icon_extract_generation', 0) + 1
         
         # Check device readiness before querying
         try:
@@ -1458,10 +2512,15 @@ class MainWindow:
                 if hasattr(self.device_manager, 'get_device_status'):
                     status = self.device_manager.get_device_status(self.selected_device)
                 status_str = status.lower() if status else 'offline'
+                self._apps_data = []
                 for item in self.app_tree.get_children():
                     self.app_tree.delete(item)
+                if hasattr(self, 'app_canvas'):
+                    self.app_canvas.delete("all")
                 tag_text = f"[Device is {status_str}]"
                 self.app_tree.insert('', tk.END, values=(tag_text, "", "", ""))
+                if hasattr(self, 'app_count_label'):
+                    self.app_count_label.config(text="")
                 self._update_drop_hint()
                 self._update_app_button_states()
                 self._set_status(f"Device '{self.selected_device}' is {status_str}.")
@@ -1483,36 +2542,26 @@ class MainWindow:
                                       reverse=self.app_sort_reverse)
 
                 def update():
-                    for item in self.app_tree.get_children():
-                        self.app_tree.delete(item)
-
-                    target_ids = []
-                    for app in apps_details:
-                        item_id = self.app_tree.insert(
-                            '', tk.END,
-                            values=(app['name'], app['package'], app['type'],
-                                    _format_bytes(app.get('size_bytes', 0)))
-                        )
-                        if app['package'] in selected_packages:
-                            target_ids.append(item_id)
-
-                    self._update_drop_hint()
-
-                    if target_ids:
-                        self.app_tree.selection_set(target_ids)
-                        self.app_tree.focus(target_ids[0])
-
-                    if yview:
-                        self.app_tree.yview_moveto(yview[0])
-
+                    if not self.notebook.winfo_exists():
+                        return
+                    cur_sel = self.notebook.select()
+                    if cur_sel and self.notebook.tab(cur_sel, 'text') != 'Applications':
+                        return
+                    self._apps_data = apps_details
+                    self._apply_app_filter(restore_selected=selected_packages, restore_yview=yview)
                     self._update_app_button_states()
                     self._set_status(f"Found {len(apps_details)} applications")
                 self.root.after(0, update)
             except (ADBDeviceOfflineError, ADBDeviceNotFoundError):
                 def handle_offline():
+                    self._apps_data = []
                     for item in self.app_tree.get_children():
                         self.app_tree.delete(item)
+                    if hasattr(self, 'app_canvas'):
+                        self.app_canvas.delete("all")
                     self.app_tree.insert('', tk.END, values=("[Device is offline]", "", "", ""))
+                    if hasattr(self, 'app_count_label'):
+                        self.app_count_label.config(text="")
                     self._update_drop_hint()
                     self._update_app_button_states()
                     self._set_status(f"Device '{self.selected_device}' is offline or disconnected.")
@@ -1522,10 +2571,15 @@ class MainWindow:
                 lower_msg = msg.lower()
                 if _is_offline_error(msg):
                     def handle_offline():
+                        self._apps_data = []
                         for item in self.app_tree.get_children():
                             self.app_tree.delete(item)
+                        if hasattr(self, 'app_canvas'):
+                            self.app_canvas.delete("all")
                         tag = "[Device is unauthorized]" if "unauthorized" in lower_msg else "[Device is offline]"
                         self.app_tree.insert('', tk.END, values=(tag, "", "", ""))
+                        if hasattr(self, 'app_count_label'):
+                            self.app_count_label.config(text="")
                         self._update_drop_hint()
                         self._update_app_button_states()
                         self._set_status(f"Device '{self.selected_device}' is offline or disconnected.")
@@ -1537,6 +2591,7 @@ class MainWindow:
 
     def _on_app_selection_change(self, event):
         self._update_app_button_states()
+        self._sync_grid_selection()
         count = len(self._get_selected_packages())
         if count > 1:
             self._set_status(f"{count} applications selected")
@@ -2673,6 +3728,14 @@ class MainWindow:
         if not col:
             return
 
+        if getattr(self, '_apps_data', None):
+            self._apps_data.sort(key=lambda app: _app_sort_key(app, col),
+                                 reverse=self.app_sort_reverse)
+            selected_pkgs = set(self._get_selected_packages())
+            yview = self.app_tree.yview()
+            self._apply_app_filter(restore_selected=selected_pkgs, restore_yview=yview)
+            return
+
         def row_key(item_id):
             val = self.app_tree.set(item_id, col)
             if col == 'Size':
@@ -2690,13 +3753,53 @@ class MainWindow:
 
         
     def _check_signals(self):
+        if getattr(self, '_closing', False):
+            return
         # Periodically yield control back to the Python interpreter so it can process signals (like SIGINT/Ctrl+C) instantly
-        self.root.after(100, self._check_signals)
+        self._signal_poll_job = self.root.after(100, self._check_signals)
     
     def _on_closing(self):
+        if getattr(self, '_closing', False):
+            return
+        self._closing = True
+        self._icon_extract_generation = getattr(self, '_icon_extract_generation', 0) + 1
 
+        if getattr(self, '_device_poll_job', None) is not None:
+            try:
+                self.root.after_cancel(self._device_poll_job)
+            except Exception:
+                pass
+            self._device_poll_job = None
 
-        self.taskbar_progress.close()
+        if getattr(self, '_signal_poll_job', None) is not None:
+            try:
+                self.root.after_cancel(self._signal_poll_job)
+            except Exception:
+                pass
+            self._signal_poll_job = None
+
+        if getattr(self, '_grid_resize_after_id', None) is not None:
+            try:
+                self.root.after_cancel(self._grid_resize_after_id)
+            except Exception:
+                pass
+            self._grid_resize_after_id = None
+
+        if getattr(self, '_grid_scroll_after_id', None) is not None:
+            try:
+                self.root.after_cancel(self._grid_scroll_after_id)
+            except Exception:
+                pass
+            self._grid_scroll_after_id = None
+
+        if hasattr(self, '_icon_pending_packages'):
+            with self._icon_lock:
+                self._icon_pending_packages.clear()
+
+        try:
+            self.taskbar_progress.close()
+        except Exception:
+            pass
         try:
             self.logcat_view.destroy()
         except Exception:
@@ -2705,8 +3808,24 @@ class MainWindow:
             self.shell_view.destroy()
         except Exception:
             pass
-        self.device_manager.cleanup()
-        self.root.destroy()
+        try:
+            self.device_manager.cleanup()
+        except Exception:
+            pass
+        try:
+            self.root.quit()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
     
     def run(self):
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            try:
+                self._on_closing()
+            except Exception:
+                pass

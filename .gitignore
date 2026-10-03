@@ -131,3 +131,8 @@ cython_debug/
 
 # Custom
 .agent
+output/
+tools/icon_extractor/bin/
+tools/icon_extractor/build/
+tools/icon_extractor/*.png
+tools/icon_extractor/icon_extractor.jar

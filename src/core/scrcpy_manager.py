@@ -200,6 +200,8 @@ class ScrcpyManager:
                 start_new_session=True,
                 env=os.environ.copy(),
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 bufsize=1
             )
             
@@ -272,6 +274,8 @@ class ScrcpyManager:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 env=os.environ.copy()
             )
             return result.stdout + result.stderr

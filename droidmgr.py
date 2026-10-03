@@ -65,7 +65,11 @@ def main():
     
     print("Starting UI...")
     app = MainWindow(adb_path, scrcpy_path)
-    app.run()
+    try:
+        app.run()
+    finally:
+        import os
+        os._exit(0)
 
 
 if __name__ == '__main__':

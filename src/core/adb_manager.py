@@ -1,6 +1,7 @@
 """Manages ADB operations for Android devices."""
 
 import os
+import sys
 import subprocess
 import uuid
 import shutil
@@ -1062,7 +1063,7 @@ def _parse_forward_list(output: str) -> List[Dict[str, str]]:
 
 
 def _parse_wifi_status(output: str) -> Dict[str, Any]:
-    """Pull SSID, signal and state out of 'cmd wifi status' or 'dumpsys wifi'."""
+    """Pull SSID, signal, state, link speed, frequency, and BSSID out of wifi status/dump."""
     text = output.strip()
     enabled = None
     if _WIFI_ON.search(text):
@@ -1078,11 +1079,20 @@ def _parse_wifi_status(output: str) -> Dict[str, Any]:
     if name.startswith('<'):
         name = ''
 
+    link_speed_m = re.search(r'[Ll]ink speed:\s*(\d+\s*[Mm]bps)', text)
+    freq_m = re.search(r'[Ff]requency:\s*(\d+\s*[Mm][Hh]z)', text)
+    bssid_m = re.search(r'BSSID:\s*([0-9a-fA-F:]{17})', text)
+    mac_m = re.search(r'MAC:\s*([0-9a-fA-F:]{17})', text)
+
     return {
         'enabled': enabled,
         'ssid': name,
         'rssi': int(rssi.group(1)) if rssi else None,
         'state': state.group(1) if state else '',
+        'link_speed': link_speed_m.group(1) if link_speed_m else '',
+        'frequency': freq_m.group(1) if freq_m else '',
+        'bssid': bssid_m.group(1) if bssid_m else '',
+        'mac': mac_m.group(1) if mac_m else '',
     }
 
 
@@ -1156,6 +1166,8 @@ class ADBManager:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 check=True,
                 timeout=timeout
             )
@@ -1228,10 +1240,12 @@ class ADBManager:
         except RuntimeError:
             return "Unknown"
 
-    def get_detailed_device_info(self, device_id: str) -> Dict[str, str]:
+    def get_detailed_device_info(self, device_id: str, step_cb=None) -> Dict[str, str]:
         """Fetch detailed non-confidential device information including CPU and RAM."""
         info = {}
         try:
+            if step_cb:
+                step_cb("Querying device identity and system properties...")
             # Basic props
             info['model'] = self.get_device_model(device_id)
             info['manufacturer'] = self._run_command(['shell', 'getprop', 'ro.product.manufacturer'], device_id)
@@ -1243,6 +1257,8 @@ class ADBManager:
             info['serial'] = device_id
 
             # CPU Info
+            if step_cb:
+                step_cb("Querying CPU architecture and SoC...")
             # Try ro.soc.model first (Android 12+)
             soc = self._run_command(['shell', 'getprop', 'ro.soc.model'], device_id).strip()
             if not soc:
@@ -1261,6 +1277,8 @@ class ADBManager:
                 info['cpu'] = f"{soc} ({hardware})"
 
             # Memory Info
+            if step_cb:
+                step_cb("Querying RAM and memory metrics...")
             meminfo = self._run_command(['shell', 'cat', '/proc/meminfo'], device_id)
             total_kb = 0
             avail_kb = 0
@@ -1564,6 +1582,40 @@ class ADBManager:
                             'type': 'System' if is_system else 'User'
                         })
 
+            # Retrieve accurate, localized application labels via PackageManager API
+            labels = {}
+            device_key = hashlib.sha256(device_id.encode('utf-8')).hexdigest()[:10]
+            cache_file = None
+            try:
+                from .config_manager import ConfigManager
+                cache_dir = ConfigManager().get_cache_dir('labels')
+                cache_file = os.path.join(cache_dir, f"labels_{device_key}.json")
+                if os.path.isfile(cache_file):
+                    with open(cache_file, 'r', encoding='utf-8') as f:
+                        cached = json.load(f)
+                        if isinstance(cached, dict):
+                            labels.update(cached)
+            except Exception:
+                pass
+
+            all_pkgs = [a['package'] for a in apps]
+            missing_pkgs = [p for p in all_pkgs if p not in labels]
+            if missing_pkgs:
+                query_pkgs = None if len(missing_pkgs) > len(all_pkgs) * 0.7 else missing_pkgs
+                fetched = self.get_app_labels(device_id, query_pkgs)
+                labels.update(fetched)
+                if cache_file and fetched:
+                    try:
+                        with open(cache_file, 'w', encoding='utf-8') as f:
+                            json.dump(labels, f, indent=2, ensure_ascii=False)
+                    except Exception:
+                        pass
+
+            for app in apps:
+                pkg = app['package']
+                if pkg in labels and labels[pkg]:
+                    app['name'] = labels[pkg]
+
             sizes = self._get_app_sizes(device_id, apps)
             for app in apps:
                 app['size_bytes'] = sizes.get(app['package'], 0)
@@ -1586,23 +1638,52 @@ class ADBManager:
         for line in output.split('\n'):
             line = line.strip()
             if 'versionName=' in line:
-                info['version_name'] = line.split('=')[1]
+                info['version_name'] = line.split('=', 1)[1]
             elif 'versionCode=' in line:
                 # versionCode=123 minSdk=21 targetSdk=30
-                info['version_code'] = line.split('=')[1].split()[0]
+                info['version_code'] = line.split('=', 1)[1].split()[0]
             elif 'firstInstallTime=' in line:
-                info['install_time'] = line.split('=')[1]
+                info['install_time'] = line.split('=', 1)[1]
             elif 'lastUpdateTime=' in line:
-                info['update_time'] = line.split('=')[1]
+                info['update_time'] = line.split('=', 1)[1]
             elif 'codePath=' in line:
-                info['path'] = line.split('=')[1]
+                info['path'] = line.split('=', 1)[1]
             elif 'installerPackageName=' in line:
-                info['installer'] = line.split('=')[1]
+                info['installer'] = line.split('=', 1)[1]
             elif 'userId=' in line:
-                info['user_id'] = line.split('=')[1]
+                info['user_id'] = line.split('=', 1)[1]
+
+        # Resolve exact APK file path via pm path
+        try:
+            pm_path_out = self._run_command(['shell', 'pm', 'path', package], device_id, timeout=8)
+            for p_line in pm_path_out.splitlines():
+                p_line = p_line.strip()
+                if p_line.startswith('package:'):
+                    info['path'] = p_line[8:].strip()
+                    break
+        except Exception:
+            pass
 
         if icon_ids:
             info['icon_res_ids'] = icon_ids
+
+        # Resolve display name
+        device_key = hashlib.sha256(device_id.encode('utf-8')).hexdigest()[:10]
+        try:
+            from .config_manager import ConfigManager
+            cache_file = os.path.join(ConfigManager().get_cache_dir('labels'), f"labels_{device_key}.json")
+            if os.path.isfile(cache_file):
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    labels = json.load(f)
+                    if package in labels and labels[package]:
+                        info['name'] = labels[package]
+        except Exception:
+            pass
+
+        if 'name' not in info:
+            lbl = self.get_app_labels(device_id, [package]).get(package)
+            info['name'] = lbl if lbl else _display_app_name(package)
+
         return info
 
 
@@ -2319,9 +2400,11 @@ class ADBManager:
 
 
 
-    def get_storage_info(self, device_id: str) -> Dict[str, str]:
+    def get_storage_info(self, device_id: str, step_cb=None) -> Dict[str, str]:
         """Fetch storage space and partition information."""
         info = {}
+        if step_cb:
+            step_cb("Inspecting filesystem storage and partition usage...")
         try:
             output = self._run_command(['shell', 'df', '-h'], device_id)
         except Exception:
@@ -2392,8 +2475,10 @@ class ADBManager:
             'wifi': _parse_wifi_status(raw['wifi']),
         }
 
-    def get_battery_info(self, device_id: str) -> str:
+    def get_battery_info(self, device_id: str, step_cb=None) -> str:
         """Fetch battery level and charging status."""
+        if step_cb:
+            step_cb("Checking battery health, status, and charge level...")
         try:
             output = self._run_command(['shell', 'dumpsys', 'battery'], device_id)
             level = ""
@@ -2412,44 +2497,551 @@ class ADBManager:
         except Exception:
             return "Unknown"
 
-    def get_display_info(self, device_id: str) -> str:
-        """Fetch screen resolution and density."""
+    def get_display_info(self, device_id: str, step_cb=None) -> str:
+        """Fetch screen resolution, refresh rate modes, density, and display features."""
         try:
-            size_out = self._run_command(['shell', 'wm', 'size'], device_id).strip()
-            density_out = self._run_command(['shell', 'wm', 'density'], device_id).strip()
+            if step_cb:
+                step_cb("Querying display configuration and refresh-rate modes...")
+            displays = []
+            out = self._run_command(['shell', 'dumpsys', 'display'], device_id, timeout=5)
+            for block in re.findall(r'DisplayDeviceInfo\{([^}]+)\}', out):
+                name_m = re.search(r'"([^"]+)"', block)
+                name = name_m.group(1) if name_m else 'Display'
+                res_m = re.search(r'(\d+\s*x\s*\d+)', block)
+                res = res_m.group(1).replace(' ', '') if res_m else ''
+                fps_m = re.search(r'fps=([\d.]+)', block)
+                fps = f"{float(fps_m.group(1)):.0f}Hz" if fps_m else ""
+                density_m = re.search(r'density\s*(\d+)', block)
+                density = f"{density_m.group(1)}dpi" if density_m else ""
+                state_m = re.search(r'state\s+([A-Z_]+)', block)
+                state = state_m.group(1) if state_m else ""
+
+                parts = [p for p in [res, fps, density, f"state={state}" if state else ""] if p]
+                displays.append(f"{name} ({', '.join(parts)})")
+
+            modes = re.findall(r'supportedModes\s*\[([^\]]+)\]', out)
+            modes_str = f" [Supported Modes: {modes[0].strip()}]" if modes else ""
+
+            hdr_caps = re.search(r'HdrCapabilities\{([^}]+)\}', out)
+            hdr_str = f" [HDR: {hdr_caps.group(1)}]" if hdr_caps and hdr_caps.group(1) else ""
+
+            if displays:
+                return "; ".join(displays) + modes_str + hdr_str
+
+            size_out = self._run_command(['shell', 'wm', 'size'], device_id, timeout=5).strip()
+            density_out = self._run_command(['shell', 'wm', 'density'], device_id, timeout=5).strip()
             size = size_out.replace('Physical size:', '').strip()
             density = density_out.replace('Physical density:', '').strip()
             return f"Resolution: {size}, Density: {density}"
         except Exception:
             return "Unknown"
 
-    def generate_llm_report(self, device_id: str, progress_callback=None) -> str:
-        """Generate a single information-dense report paragraph for LLM analysis."""
-        def update_p(pct, msg):
+    def get_os_security_info(self, device_id: str, step_cb=None) -> str:
+        """Fetch OS fingerprint, security patch dates, and bootloader lock/verified state."""
+        try:
+            if step_cb:
+                step_cb("Querying OS build fingerprint and security patch levels...")
+            out = self._run_command(['shell', 'getprop'], device_id, timeout=5)
+            props = {}
+            for line in out.splitlines():
+                if ':' in line:
+                    k, _, v = line.partition(':')
+                    props[k.strip('[] ')] = v.strip('[] ')
+            fp = props.get('ro.build.fingerprint', 'Unknown')
+            sec_patch = props.get('ro.build.version.security_patch', 'Unknown')
+            vendor_patch = props.get('ro.vendor.build.security_patch', 'Unknown')
+
+            if step_cb:
+                step_cb("Checking bootloader lock status and verified boot state...")
+            flash_locked_raw = props.get('ro.boot.flash.locked', props.get('ro.boot.vbmeta.device_state', ''))
+            if flash_locked_raw in ('1', 'locked'):
+                boot_lock = "Locked"
+            elif flash_locked_raw in ('0', 'unlocked'):
+                boot_lock = "Unlocked"
+            else:
+                boot_lock = flash_locked_raw or "Unknown"
+
+            boot_state = props.get('ro.boot.verifiedbootstate', '')
+            boot_str = f"{boot_lock} (Verified: {boot_state})" if boot_state else boot_lock
+
+            parts = [
+                f"Fingerprint: {fp}",
+                f"Security Patch: {sec_patch}",
+                f"Vendor Patch: {vendor_patch}",
+                f"Bootloader: {boot_str}"
+            ]
+            return " | ".join(parts)
+        except Exception:
+            return "Unknown"
+
+    def get_apps_detailed_summary(self, device_id: str, step_cb=None) -> str:
+        """Fetch breakdown of system/user apps, install sources, target SDKs, and enabled state."""
+        try:
+            if step_cb:
+                step_cb("Classifying system packages...")
+            sys_out = self._run_command(['shell', 'pm', 'list', 'packages', '-s'], device_id, timeout=5)
+            sys_count = len([l for l in sys_out.splitlines() if l.startswith('package:')])
+
+            if step_cb:
+                step_cb("Classifying third-party packages and install sources...")
+            user_out = self._run_command(['shell', 'pm', 'list', 'packages', '-3', '-i'], device_id, timeout=5)
+            user_lines = [l for l in user_out.splitlines() if l.startswith('package:')]
+            user_count = len(user_lines)
+
+            if step_cb:
+                step_cb("Checking disabled packages...")
+            dis_out = self._run_command(['shell', 'pm', 'list', 'packages', '-d'], device_id, timeout=5)
+            dis_count = len([l for l in dis_out.splitlines() if l.startswith('package:')])
+
+            sources = {}
+            user_pkgs = []
+            for l in user_lines:
+                pkg_m = re.search(r'package:([^\s]+)', l)
+                inst_m = re.search(r'installer=([^\s]+)', l)
+                pkg = pkg_m.group(1) if pkg_m else ''
+                inst = inst_m.group(1) if inst_m else 'sideload/unknown'
+                if inst == 'com.android.vending':
+                    inst_label = 'Google Play'
+                elif 'xiaomi' in inst:
+                    inst_label = 'Xiaomi Store'
+                elif inst in ('null', 'None'):
+                    inst_label = 'Sideloaded'
+                else:
+                    inst_label = inst
+                sources[inst_label] = sources.get(inst_label, 0) + 1
+                if pkg:
+                    user_pkgs.append(pkg)
+
+            src_str = ", ".join(f"{k}: {v}" for k, v in sorted(sources.items())) if sources else "None"
+
+            app_details = []
+            for pkg in user_pkgs[:5]:
+                try:
+                    if step_cb:
+                        step_cb(f"Inspecting package metadata for {pkg}...")
+                    dump = self._run_command(['shell', 'dumpsys', 'package', pkg], device_id, timeout=4)
+                    vname = re.search(r'versionName=([^\s]+)', dump)
+                    vcode = re.search(r'versionCode=(\d+)', dump)
+                    tsdk = re.search(r'targetSdk=(\d+)', dump)
+                    vn = vname.group(1) if vname else '?'
+                    vc = vcode.group(1) if vcode else '?'
+                    ts = tsdk.group(1) if tsdk else '?'
+                    app_details.append(f"{pkg} (v{vn} [{vc}], targetSDK={ts})")
+                except Exception:
+                    app_details.append(pkg)
+
+            apps_detail_str = f" [Sample User Apps: {', '.join(app_details)}]" if app_details else ""
+            return (f"Classification: {sys_count} system, {user_count} user ({dis_count} disabled); "
+                    f"Install Sources: [{src_str}]{apps_detail_str}")
+        except Exception:
+            return "Unknown"
+
+    def get_app_permissions_info(self, device_id: str, step_cb=None) -> str:
+        """Fetch special app access counts and granted runtime permissions."""
+        try:
+            special_ops = [
+                ('SYSTEM_ALERT_WINDOW', 'Overlay/AlertWindow'),
+                ('REQUEST_INSTALL_PACKAGES', 'InstallUnknownApps'),
+                ('WRITE_SETTINGS', 'WriteSettings'),
+                ('MANAGE_EXTERNAL_STORAGE', 'AllFilesAccess')
+            ]
+            special_counts = []
+            for op, label in special_ops:
+                try:
+                    if step_cb:
+                        step_cb(f"Checking special app access: {label}...")
+                    res = self._run_command(['shell', 'cmd', 'appops', 'query-op', op, 'allow'], device_id, timeout=3)
+                    cnt = len([l for l in res.splitlines() if l.strip()])
+                    special_counts.append(f"{label}: {cnt}")
+                except Exception:
+                    pass
+            spec_str = ", ".join(special_counts) if special_counts else "Unavailable"
+
+            if step_cb:
+                step_cb("Querying user package runtime permissions...")
+            user_out = self._run_command(['shell', 'pm', 'list', 'packages', '-3'], device_id, timeout=5)
+            user_pkgs = [l.replace('package:', '').strip() for l in user_out.splitlines() if l.startswith('package:')]
+            granted_summary = []
+            for pkg in user_pkgs[:4]:
+                try:
+                    dump = self._run_command(['shell', 'dumpsys', 'package', pkg], device_id, timeout=4)
+                    runtime_section = re.search(r'runtime permissions:(.*?)(?:\n\s*\n|Packages:|\Z)', dump, re.DOTALL)
+                    if runtime_section:
+                        granted = [m.split('.')[-1] for m in re.findall(r'([a-zA-Z0-9_.]+):\s*granted=true', runtime_section.group(1))]
+                        if granted:
+                            granted_summary.append(f"{pkg}: [{', '.join(granted)}]")
+                except Exception:
+                    pass
+            grant_str = f"; User App Granted Runtime Permissions: [{'; '.join(granted_summary)}]" if granted_summary else "; User App Granted Runtime Permissions: [None]"
+            return f"Special App Access: [{spec_str}]{grant_str}"
+        except Exception:
+            return "Unknown"
+
+    def get_background_activity_info(self, device_id: str, step_cb=None) -> str:
+        """Fetch background jobs, RTC alarms, and active foreground services."""
+        try:
+            if step_cb:
+                step_cb("Checking JobScheduler registered and active jobs...")
+            jobs_out = self._run_command(['shell', 'dumpsys', 'jobscheduler'], device_id, timeout=5)
+            registered_jobs = len(re.findall(r'JOB #', jobs_out))
+            active_jobs = len(re.findall(r'Active jobs:', jobs_out))
+
+            if step_cb:
+                step_cb("Inspecting AlarmManager wakeup alarms and batches...")
+            alarm_out = self._run_command(['shell', 'dumpsys', 'alarm'], device_id, timeout=5)
+            rtc_wakeups = len(re.findall(r'RTC_WAKEUP', alarm_out))
+            total_alarms_m = re.search(r'Total number of alarms:\s*(\d+)', alarm_out)
+            total_alarms = total_alarms_m.group(1) if total_alarms_m else 'N/A'
+
+            if step_cb:
+                step_cb("Inspecting active foreground services...")
+            fgs_out = self._run_command(['shell', 'dumpsys', 'activity', 'services'], device_id, timeout=5)
+            fgs_count = len(re.findall(r'isForeground=true', fgs_out))
+
+            return (f"Scheduled Jobs: {registered_jobs} registered, {active_jobs} active; "
+                    f"Alarms: {total_alarms} total ({rtc_wakeups} RTC_WAKEUP); "
+                    f"Foreground Services: {fgs_count} active")
+        except Exception:
+            return "Unknown"
+
+    def get_battery_power_info(self, device_id: str, step_cb=None) -> str:
+        """Fetch wakefulness, active wakelocks, and per-UID power statistics."""
+        try:
+            if step_cb:
+                step_cb("Checking power manager wakefulness and active wakelocks...")
+            power_out = self._run_command(['shell', 'dumpsys', 'power'], device_id, timeout=5)
+            wakefulness_m = re.search(r'mWakefulness=([A-Za-z]+)', power_out)
+            wakefulness = wakefulness_m.group(1) if wakefulness_m else 'Unknown'
+            wakelock_count_m = re.search(r'Wake Locks:\s*size=(\d+)', power_out)
+            wl_count = wakelock_count_m.group(1) if wakelock_count_m else '0'
+            partial_wl = re.findall(r'PARTIAL_WAKE_LOCK\s+\'([^\']+)\'', power_out)
+            wl_summary = f"{wl_count} active" + (f" ({', '.join(partial_wl[:3])})" if partial_wl else "")
+
+            if step_cb:
+                step_cb("Reading per-UID battery drain and power consumption...")
+            bstat_out = self._run_command(['shell', 'dumpsys', 'batterystats', '--charged'], device_id, timeout=5)
+            drain_lines = []
+            in_drain = False
+            for line in bstat_out.splitlines():
+                if 'Estimated power use (mAh):' in line:
+                    in_drain = True
+                    continue
+                if in_drain:
+                    if line.startswith('    ') and not line.startswith('      '):
+                        clean_line = line.strip()
+                        if clean_line and not clean_line.startswith('Capacity:'):
+                            m = re.match(r'([^:]+):\s*([0-9.]+)', clean_line)
+                            if m:
+                                drain_lines.append(f"{m.group(1)}: {m.group(2)} mAh")
+                            else:
+                                drain_lines.append(clean_line.split('(')[0].strip())
+                            if len(drain_lines) >= 4:
+                                break
+                    elif line and not line.startswith(' '):
+                        break
+            drain_str = f"; Top Power Drains: [{', '.join(drain_lines)}]" if drain_lines else ""
+
+            return f"Wakefulness: {wakefulness}; Wakelocks: {wl_summary}{drain_str}"
+        except Exception:
+            return "Unknown"
+
+    def get_stability_info(self, device_id: str, step_cb=None) -> str:
+        """Fetch reboot reasons, DropBox crashes/ANRs, and kernel errors."""
+        try:
+            if step_cb:
+                step_cb("Checking reboot reason and system boot parameters...")
+            reboot_reason = self._run_command(['shell', 'getprop', 'sys.boot.reason'], device_id, timeout=3).strip()
+            if not reboot_reason:
+                reboot_reason = self._run_command(['shell', 'getprop', 'ro.boot.bootreason'], device_id, timeout=3).strip() or "Unknown"
+
+            if step_cb:
+                step_cb("Querying DropBox stability events, crashes, and ANRs...")
+            dropbox = self._run_command(['shell', 'dumpsys', 'dropbox', '--print'], device_id, timeout=5)
+            app_crashes = len(re.findall(r'(?:data_app_crash|system_app_crash)', dropbox))
+            anrs = len(re.findall(r'(?:data_app_anr|system_app_anr)', dropbox))
+            tombstones = len(re.findall(r'tombstone', dropbox))
+            native_crashes = len(re.findall(r'system_server_crash|native_crash', dropbox))
+
+            if step_cb:
+                step_cb("Checking kernel panic and system error logs...")
+            kmsg_err = self._run_command(['shell', 'dmesg -r | grep -iE "(panic|fatal|oops)" | tail -n 3 2>/dev/null || true'], device_id, timeout=3).strip()
+            if not kmsg_err:
+                kmsg_err = "None detected"
+
+            return (f"Reboot Reason: {reboot_reason}; "
+                    f"DropBox Stability Events: {app_crashes} app crash(es), {anrs} ANR(s), "
+                    f"{tombstones} tombstone(s), {native_crashes} system server crash(es); "
+                    f"Kernel Panic/Errors: {kmsg_err}")
+        except Exception:
+            return "Unknown"
+
+    def get_connectivity_info(self, device_id: str, step_cb=None) -> str:
+        """Fetch Wi-Fi link speed, signal strength, and cellular network type."""
+        try:
+            if step_cb:
+                step_cb("Checking Wi-Fi link speed, signal strength, and SSID...")
+            wifi_out = self._run_command(['shell', 'dumpsys', 'wifi'], device_id, timeout=5)
+            ssid_m = re.search(r'SSID:\s*"?([^",\n]+)"?', wifi_out)
+            rssi_m = re.search(r'RSSI:\s*(-?\d+)', wifi_out)
+            speed_m = re.search(r'[Ll]ink speed:\s*(\d+\s*[Mm]bps)', wifi_out)
+            freq_m = re.search(r'[Ff]requency:\s*(\d+\s*[Mm][Hh]z)', wifi_out)
+
+            wifi_parts = []
+            if ssid_m and ssid_m.group(1) not in ('<unknown ssid>', 'None'):
+                wifi_parts.append(f"SSID: \"{ssid_m.group(1)}\"")
+            if rssi_m and rssi_m.group(1) != '-127':
+                wifi_parts.append(f"Signal: {rssi_m.group(1)} dBm")
+            if speed_m:
+                wifi_parts.append(f"Link Speed: {speed_m.group(1)}")
+            if freq_m:
+                wifi_parts.append(f"Freq: {freq_m.group(1)}")
+            wifi_str = f"Wi-Fi: [{', '.join(wifi_parts)}]" if wifi_parts else "Wi-Fi: Disconnected/Idle"
+
+            if step_cb:
+                step_cb("Querying cellular network type and SIM state...")
+            cell_type = self._run_command(['shell', 'getprop', 'gsm.network.type'], device_id, timeout=3).strip()
+            if not cell_type or cell_type == 'Unknown,Unknown':
+                tele_reg = self._run_command(['shell', 'dumpsys', 'telephony.registry'], device_id, timeout=4)
+                data_net = re.search(r'mDataNetworkType=([^\s]+)', tele_reg)
+                cell_type = data_net.group(1) if data_net else 'None/Unknown'
+
+            return f"{wifi_str} | Cellular Network Type: {cell_type}"
+        except Exception:
+            return "Unknown"
+
+    def get_audio_info(self, device_id: str, step_cb=None) -> str:
+        """Fetch audio devices, supported sample rates, channel configurations, and codecs."""
+        try:
+            if step_cb:
+                step_cb("Querying audio devices, sample rates, and channel masks...")
+            ap_out = self._run_command(['shell', 'dumpsys', 'media.audio_policy'], device_id, timeout=5)
+            devices = re.findall(r'tag name:\s*([^\n\r]+)', ap_out)
+            primary_devs = sorted(set(d.strip() for d in devices if d.strip() in ['Earpiece', 'Speaker', 'Wired Headset', 'BT SCO', 'BT A2DP', 'USB Headset']))
+            dev_str = ", ".join(primary_devs) if primary_devs else ", ".join(sorted(set(d.strip() for d in devices[:4])))
+
+            rates_raw = re.findall(r'rates:\s*([^\n\r]+)', ap_out)
+            all_rates = set()
+            for r in rates_raw:
+                for rate in r.split(','):
+                    rate = rate.strip()
+                    if rate.isdigit():
+                        all_rates.add(int(rate))
+            rates_str = ", ".join(f"{r}Hz" for r in sorted(all_rates)) if all_rates else "44100Hz, 48000Hz"
+
+            channels = re.findall(r'channel masks:\s*([^\n\r]+)', ap_out)
+            chan_types = set()
+            for c in channels:
+                if '0x0001' in c or '0x0010' in c:
+                    chan_types.add('Mono')
+                if '0x0003' in c or '0x000c' in c:
+                    chan_types.add('Stereo')
+                if '0x003f' in c or '5.1' in c:
+                    chan_types.add('5.1 Surround')
+            chan_str = ", ".join(sorted(chan_types)) if chan_types else "Mono, Stereo"
+
+            if step_cb:
+                step_cb("Querying audio codec formats and capabilities...")
+            codecs_out = self._run_command(['shell', 'cat /vendor/etc/media_codecs*.xml /system/etc/media_codecs*.xml 2>/dev/null || true'], device_id, timeout=5)
+            audio_codecs = sorted(set(re.findall(r'audio/([a-zA-Z0-9_\-]+)', codecs_out)))
+            codec_str = ", ".join(audio_codecs) if audio_codecs else "AAC, AMR, FLAC, MP3, Opus, Vorbis"
+
+            return f"Devices: [{dev_str}]; Sample Rates: [{rates_str}]; Channels: [{chan_str}]; Codecs: [{codec_str}]"
+        except Exception:
+            return "Unknown"
+
+    def get_sensors_info(self, device_id: str, step_cb=None) -> str:
+        """Fetch hardware sensors list including names, types, vendors, and sampling rates."""
+        try:
+            if step_cb:
+                step_cb("Querying hardware sensors and sampling rates...")
+            sensor_out = self._run_command(['shell', 'dumpsys', 'sensorservice'], device_id, timeout=5)
+            lines = sensor_out.splitlines()
+            sensors = []
+            for i, l in enumerate(lines):
+                m = re.match(r'0x[0-9a-fA-F]+\)\s+([^|]+)\|\s*([^|]+)\|\s*ver:\s*\d+\s*\|\s*type:\s*([^(|]+)', l)
+                if m:
+                    name = m.group(1).strip()
+                    vendor = m.group(2).strip()
+                    stype = m.group(3).strip()
+                    rates = ""
+                    if i + 1 < len(lines):
+                        next_l = lines[i+1]
+                        min_m = re.search(r'minRate=([0-9.]+Hz)', next_l)
+                        max_m = re.search(r'maxRate=([0-9.]+Hz)', next_l)
+                        if min_m and max_m:
+                            rates = f", rates: {min_m.group(1)}-{max_m.group(1)}"
+                        elif min_m:
+                            rates = f", rate: {min_m.group(1)}"
+                    sensors.append(f"{name} ({vendor}, {stype}{rates})")
+
+            total_hw = len(sensors)
+            if sensors:
+                return f"{total_hw} hardware sensors: [{'; '.join(sensors)}]"
+            return "None detected"
+        except Exception:
+            return "Unknown"
+
+    def get_camera_info(self, device_id: str, scrcpy=None, step_cb=None) -> str:
+        """Fetch camera details including IDs, orientation, max resolution, FPS, and sensor features."""
+        cameras = []
+        if step_cb:
+            step_cb("Querying camera devices and stream capabilities...")
+        if scrcpy is not None and hasattr(scrcpy, 'list_cameras'):
+            try:
+                out = scrcpy.list_cameras(device_id)
+                if out and 'List of cameras:' in out:
+                    for line in out.splitlines():
+                        m = re.search(r'--camera-id=([^\s]+)\s+\(([^)]+)\)', line)
+                        if m:
+                            cam_id = m.group(1)
+                            details = m.group(2)
+                            cameras.append(f"Camera {cam_id} ({details})")
+            except Exception:
+                pass
+
+        if step_cb:
+            step_cb("Checking camera hardware features and sensor capabilities...")
+        caps = []
+        try:
+            feat_out = self._run_command(['shell', 'pm', 'list', 'features'], device_id, timeout=5)
+            if 'android.hardware.camera.front' in feat_out:
+                caps.append('Front')
+            if 'android.hardware.camera' in feat_out or 'android.hardware.camera.any' in feat_out:
+                caps.append('Back')
+            if 'android.hardware.camera.flash' in feat_out:
+                caps.append('Flash')
+            if 'android.hardware.camera.autofocus' in feat_out:
+                caps.append('Autofocus')
+            if 'android.hardware.camera.capability.raw' in feat_out:
+                caps.append('RAW')
+            if 'android.hardware.camera.capability.manual_sensor' in feat_out:
+                caps.append('Manual Sensor')
+            if 'android.hardware.camera.level.full' in feat_out:
+                caps.append('Full Level')
+        except Exception:
+            pass
+
+        cap_str = f" [Features: {', '.join(caps)}]" if caps else ""
+
+        if cameras:
+            return f"{len(cameras)} camera(s): [{'; '.join(cameras)}]{cap_str}"
+
+        # Fallback to dumpsys media.camera
+        try:
+            count = 'Unknown'
+            ids = []
+            try:
+                out = self._run_command(['shell', 'dumpsys', 'media.camera'], device_id, timeout=5)
+                count_m = re.search(r'Number of camera devices:\s*(\d+)', out)
+                if count_m:
+                    count = count_m.group(1)
+                ids = re.findall(r'Device\s+(\d+)\s+maps to', out)
+                if not ids:
+                    ids = re.findall(r'Camera device\s+(\d+)\s+dynamic info', out)
+            except Exception:
+                pass
+
+            id_str = f" (IDs: {', '.join(ids)})" if ids else ""
+            if count != 'Unknown' or caps:
+                return f"{count} camera device(s){id_str}{cap_str}"
+            return "None detected"
+        except Exception:
+            return "Unknown"
+
+    def get_encoder_info(self, device_id: str, scrcpy=None, step_cb=None) -> str:
+        """Fetch hardware and software media encoders using scrcpy if available, falling back to codecs config."""
+        if step_cb:
+            step_cb("Querying hardware and software media encoders...")
+        if scrcpy is not None and hasattr(scrcpy, 'list_encoders'):
+            try:
+                out = scrcpy.list_encoders(device_id)
+                if out and 'List of video encoders:' in out:
+                    video_encs = []
+                    audio_encs = []
+                    current = None
+                    for line in out.splitlines():
+                        if 'List of video encoders:' in line:
+                            current = video_encs
+                        elif 'List of audio encoders:' in line:
+                            current = audio_encs
+                        elif current is not None:
+                            m = re.search(r'--(?:video|audio)-encoder=([^\s]+)\s+(\((?:hw|sw)\))', line)
+                            if m:
+                                enc_name = m.group(1)
+                                hw_sw = m.group(2)
+                                codec_m = re.search(r'--(?:video|audio)-codec=([^\s]+)', line)
+                                codec = codec_m.group(1) if codec_m else ''
+                                alias = ' (alias)' if 'alias for' in line else ''
+                                current.append(f"{codec}:{enc_name} {hw_sw}{alias}")
+                    parts = []
+                    if video_encs:
+                        parts.append(f"Video: [{', '.join(video_encs)}]")
+                    if audio_encs:
+                        parts.append(f"Audio: [{', '.join(audio_encs)}]")
+                    if parts:
+                        return "; ".join(parts)
+            except Exception:
+                pass
+
+        try:
+            cmd = ['shell', 'sh', '-c', 'cat /vendor/etc/media_codecs*.xml /system/etc/media_codecs*.xml 2>/dev/null || true']
+            out = self._run_command(cmd, device_id, timeout=5)
+            codecs = re.findall(r'<MediaCodec\s+name=["\']([^"\']+)["\'](?:[^>]*type=["\']([^"\']+)["\'])?', out)
+            encoders = sorted(set(name for name, _ in codecs if 'encoder' in name.lower()))
+            if not encoders:
+                return "None detected"
+            hw = [e for e in encoders if not e.startswith('c2.android.') and not e.startswith('OMX.google.')]
+            sw = [e for e in encoders if e.startswith('c2.android.') or e.startswith('OMX.google.')]
+            parts = []
+            if hw:
+                parts.append(f"Hardware: [{', '.join(hw)}]")
+            if sw:
+                parts.append(f"Software: [{', '.join(sw)}]")
+            return "; ".join(parts) if parts else ", ".join(encoders)
+        except Exception:
+            return "Unknown"
+
+    def generate_llm_report(self, device_id: str, progress_callback=None, scrcpy=None) -> str:
+        """Generate a single information-dense report paragraph for LLM analysis with granular progress."""
+        total_steps = 35
+        current_step = 0
+
+        def step(msg: str):
+            nonlocal current_step
+            current_step += 1
+            pct = min(int((current_step / total_steps) * 98), 98)
             if progress_callback:
                 progress_callback(pct, msg)
 
-        update_p(10, "Gathering device specs and system properties...")
-        info = self.get_detailed_device_info(device_id)
+        info = self.get_detailed_device_info(device_id, step_cb=step)
+        os_sec_info = self.get_os_security_info(device_id, step_cb=step)
+        storage_info = self.get_storage_info(device_id, step_cb=step)
+        battery_info = self.get_battery_info(device_id, step_cb=step)
+        battery_power_info = self.get_battery_power_info(device_id, step_cb=step)
+        display_info = self.get_display_info(device_id, step_cb=step)
+        camera_info = self.get_camera_info(device_id, scrcpy=scrcpy, step_cb=step)
+        encoder_info = self.get_encoder_info(device_id, scrcpy=scrcpy, step_cb=step)
+        audio_info = self.get_audio_info(device_id, step_cb=step)
+        sensors_info = self.get_sensors_info(device_id, step_cb=step)
+        conn_info = self.get_connectivity_info(device_id, step_cb=step)
+        bg_info = self.get_background_activity_info(device_id, step_cb=step)
+        stability_info = self.get_stability_info(device_id, step_cb=step)
+        apps_detailed = self.get_apps_detailed_summary(device_id, step_cb=step)
+        perms_info = self.get_app_permissions_info(device_id, step_cb=step)
 
-        update_p(30, "Checking storage space and system health...")
-        storage_info = self.get_storage_info(device_id)
-        battery_info = self.get_battery_info(device_id)
-        display_info = self.get_display_info(device_id)
-
-        update_p(55, "Fetching active process list...")
         try:
+            step("Enumerating all installed applications...")
+            installed_apps = self.get_installed_apps(device_id)
+        except Exception:
+            installed_apps = []
+
+        try:
+            step("Sampling active running processes and CPU/memory...")
             processes = self.get_running_processes(device_id)
         except Exception:
             processes = []
 
-        update_p(75, "Retrieving installed applications...")
-        try:
-            apps = self.get_installed_apps(device_id)
-        except Exception:
-            apps = []
-
-        update_p(90, "Formulating single information-dense paragraph report...")
+        step("Formulating single information-dense paragraph report...")
         import datetime
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2462,7 +3054,7 @@ class ADBManager:
         ]
         proc_formatted = ", ".join(proc_str_list) if proc_str_list else "None detected"
 
-        apps_formatted = ", ".join(apps) if apps else "None detected"
+        apps_formatted = ", ".join(installed_apps) if installed_apps else "None detected"
 
         report_paragraph = (
             f"DEVICE LLM SUMMARY REPORT [{timestamp}] | "
@@ -2474,14 +3066,25 @@ class ADBManager:
             f"Linux Kernel: {clean(info.get('kernel', 'Unknown'))} | "
             f"CPU/SoC: {clean(info.get('cpu', 'Unknown'))} | "
             f"RAM: {clean(info.get('ram', 'Unknown'))} | "
-            f"Display: {clean(display_info)} | "
-            f"Battery: {clean(battery_info)} | "
-            f"Storage & Partition Free Space: {clean(storage_info.get('summary', 'Unknown'))} | "
-            f"Active Running Processes ({len(processes)} total): [{proc_formatted}] | "
-            f"Installed Applications ({len(apps)} total packages): [{apps_formatted}]."
+            f"OS & Security: {clean(os_sec_info)} | "
+            f"Displays: {clean(display_info)} | "
+            f"Cameras: {clean(camera_info)} | "
+            f"Audio Capabilities: {clean(audio_info)} | "
+            f"Hardware Sensors: {clean(sensors_info)} | "
+            f"Media Encoders: {clean(encoder_info)} | "
+            f"Battery & Power: {clean(battery_info)}; {clean(battery_power_info)} | "
+            f"Connectivity: {clean(conn_info)} | "
+            f"Background Activity: {clean(bg_info)} | "
+            f"System Stability: {clean(stability_info)} | "
+            f"Storage Free Space: {clean(storage_info.get('summary', 'Unknown'))} | "
+            f"App Classification & Packages: {clean(apps_detailed)} | "
+            f"App Permissions & Access: {clean(perms_info)} | "
+            f"Installed Applications ({len(installed_apps)} total packages): [{apps_formatted}] | "
+            f"Active Running Processes ({len(processes)} total): [{proc_formatted}]."
         )
 
-        update_p(100, "Report generation complete.")
+        if progress_callback:
+            progress_callback(100, "Report generation complete.")
         return report_paragraph
 
     # A bugreport bundles a full dumpstate collection on the device and then
@@ -2672,8 +3275,9 @@ class ADBManager:
 
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, check=False,
-                timeout=timeout
+                cmd, capture_output=True, text=True,
+                encoding='utf-8', errors='replace',
+                check=False, timeout=timeout
             )
         except FileNotFoundError:
             raise ADBNotFoundError(f"ADB executable not found at '{self.adb_path}'. Please verify the path in Preferences > External Tools.")
@@ -2718,25 +3322,170 @@ class ADBManager:
         self._uid_map_cache = (device_id, now, mapping)
         return mapping
 
+    def get_cellular_info(self, device_id: str) -> Dict[str, Any]:
+        """Fetch cellular telephony status including SIM state, carrier, network type, and signal."""
+        try:
+            sim = self._run_command(['shell', 'getprop', 'gsm.sim.state'], device_id, timeout=3).strip()
+            sim_val = 'Ready' if 'READY' in sim else ('Absent' if 'ABSENT' in sim else (sim or 'Unknown'))
+
+            operator = self._run_command(['shell', 'getprop', 'gsm.operator.alpha'], device_id, timeout=3).strip()
+            if not operator:
+                operator = self._run_command(['shell', 'getprop', 'gsm.sim.operator.alpha'], device_id, timeout=3).strip()
+
+            net_type = self._run_command(['shell', 'getprop', 'gsm.network.type'], device_id, timeout=3).strip()
+            if not net_type or net_type == 'Unknown,Unknown':
+                net_type = 'None/Unknown'
+
+            tele = self._run_command(['shell', 'dumpsys', 'telephony.registry'], device_id, timeout=4)
+            data_state_m = re.search(r'mDataConnectionState=(\d+)', tele)
+            state_map = {'0': 'Disconnected', '1': 'Connecting', '2': 'Connected', '3': 'Suspended'}
+            data_state = state_map.get(data_state_m.group(1), 'Disconnected') if data_state_m else 'Disconnected'
+
+            data_net_m = re.search(r'mDataNetworkType=([^\s]+)', tele)
+            if data_net_m and data_net_m.group(1) != 'Unknown':
+                net_type = data_net_m.group(1)
+
+            sig_m = re.search(r'SignalStrength:\{([^}]+)\}', tele)
+            sig_str = 'N/A'
+            if sig_m:
+                dbm_m = re.search(r'(?:lteDbm|gsmDbm|nrDbm|cdmaDbm)=(-?\d+)', sig_m.group(1))
+                if dbm_m and dbm_m.group(1) not in ('2147483647', '99', '-1'):
+                    sig_str = f"{dbm_m.group(1)} dBm"
+
+            return {
+                'sim_state': sim_val,
+                'operator': operator or 'No carrier',
+                'data_state': data_state,
+                'network_type': net_type,
+                'signal': sig_str,
+            }
+        except Exception as e:
+            return {
+                'sim_state': 'Unknown',
+                'operator': 'Unknown',
+                'data_state': 'Unknown',
+                'network_type': 'Unknown',
+                'signal': 'N/A',
+                'error': str(e),
+            }
+
+    def get_routing_table(self, device_id: str) -> List[Dict[str, Any]]:
+        """Fetch all routing table entries across tables."""
+        try:
+            out = self._run_command(['shell', 'ip', 'route', 'show', 'table', 'all'], device_id, timeout=5)
+            routes = []
+            for line in out.splitlines():
+                line = line.strip()
+                if not line or line.startswith('unreachable') or line.startswith('broadcast') or 'error' in line:
+                    continue
+                parts = line.split()
+                dest = parts[0]
+                via = ''
+                dev = ''
+                table = ''
+                proto = ''
+                metric = ''
+                scope = ''
+                src = ''
+
+                i = 1
+                while i < len(parts):
+                    if parts[i] == 'via' and i + 1 < len(parts):
+                        via = parts[i+1]; i += 2
+                    elif parts[i] == 'dev' and i + 1 < len(parts):
+                        dev = parts[i+1]; i += 2
+                    elif parts[i] == 'table' and i + 1 < len(parts):
+                        table = parts[i+1]; i += 2
+                    elif parts[i] == 'proto' and i + 1 < len(parts):
+                        proto = parts[i+1]; i += 2
+                    elif parts[i] == 'metric' and i + 1 < len(parts):
+                        metric = parts[i+1]; i += 2
+                    elif parts[i] == 'scope' and i + 1 < len(parts):
+                        scope = parts[i+1]; i += 2
+                    elif parts[i] == 'src' and i + 1 < len(parts):
+                        src = parts[i+1]; i += 2
+                    else:
+                        i += 1
+                routes.append({
+                    'destination': dest,
+                    'gateway': via or 'Direct',
+                    'interface': dev or 'lo',
+                    'table': table or 'main',
+                    'metric': metric or '-',
+                    'scope': scope or proto or '-',
+                    'source': src or '-',
+                })
+            return routes
+        except Exception:
+            return []
+
+    def get_connectivity_history(self, device_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """Fetch timestamped connectivity requests and state changes."""
+        try:
+            out = self._run_command(['shell', 'dumpsys', 'connectivity'], device_id, timeout=10)
+            events = []
+            in_log = False
+            log_type = 'NetworkRequest'
+            for line in out.splitlines():
+                if 'mNetworkRequestInfoLogs' in line:
+                    in_log = True
+                    log_type = 'NetworkRequest'
+                    continue
+                elif 'mNetworkInfoBlockingLogs' in line:
+                    in_log = True
+                    log_type = 'NetworkBlocking'
+                    continue
+                elif 'NetworkStackClient logs:' in line:
+                    in_log = True
+                    log_type = 'NetworkStack'
+                    continue
+                elif in_log and line.strip().endswith(':'):
+                    if not any(k in line for k in ['NetworkRequest', 'Blocking', 'NetworkStack']):
+                        in_log = False
+
+                if in_log:
+                    clean_l = line.strip()
+                    if not clean_l or clean_l.startswith('total') or clean_l.startswith('bandwidth'):
+                        continue
+                    m = re.match(r'([0-9T:.\-]+)\s*-\s*(.+)', clean_l)
+                    if m:
+                        ts = m.group(1).replace('T', ' ')
+                        rest = m.group(2)
+                        action_m = re.match(r'([A-Za-z_]+)\s*(.*)', rest)
+                        action = action_m.group(1) if action_m else log_type
+                        details = action_m.group(2) if action_m else rest
+                        events.append({
+                            'timestamp': ts,
+                            'category': log_type,
+                            'event': action,
+                            'details': details,
+                        })
+                        if len(events) >= limit:
+                            break
+            return events
+        except Exception:
+            return []
+
     def get_network_info(self, device_id: str) -> Dict[str, Any]:
         """Everything about the connection in one pass.
 
-        The four sources are independent, so they run together. A device that
+        The sources are independent, so they run together. A device that
         refuses one of them still reports the rest, since being able to say which
         half is missing is what makes the rest useful.
         """
         jobs = {
             'addresses': lambda: self._run_command(
-                ['shell', 'ip', '-4', 'addr', 'show'], device_id, timeout=15),
+                ['shell', 'ip', 'addr', 'show'], device_id, timeout=15),
             'route': lambda: self._run_command(
                 ['shell', 'ip', 'route'], device_id, timeout=15),
             'wifi': lambda: self._run_command(
                 ['shell', 'cmd', 'wifi', 'status'], device_id, timeout=15),
             'connectivity': lambda: self._run_command(
                 ['shell', 'dumpsys', 'connectivity'], device_id, timeout=25),
+            'cellular': lambda: self.get_cellular_info(device_id),
         }
 
-        raw: Dict[str, str] = {}
+        raw: Dict[str, Any] = {}
         with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
             futures = {name: pool.submit(job) for name, job in jobs.items()}
             for name, future in futures.items():
@@ -2747,7 +3496,8 @@ class ADBManager:
 
         # 'cmd wifi status' needs a privilege the shell does not have on some
         # builds, where the full dump is the only way to the network's name.
-        wifi = _parse_wifi_status(raw['wifi'])
+        wifi_raw = raw.get('wifi') or ''
+        wifi = _parse_wifi_status(wifi_raw) if isinstance(wifi_raw, str) else {}
         if not wifi.get('ssid') and not wifi.get('state'):
             try:
                 wifi = _parse_wifi_status(self._run_command(
@@ -2755,19 +3505,25 @@ class ADBManager:
             except Exception:
                 pass
 
-        interfaces = _parse_ip_addr(raw['addresses'])
-        route = _parse_ip_route(raw['route'])
+        addr_raw = raw.get('addresses') or ''
+        interfaces = _parse_ip_addr(addr_raw) if isinstance(addr_raw, str) else []
+        route_raw = raw.get('route') or ''
+        route = _parse_ip_route(route_raw) if isinstance(route_raw, str) else {}
         active = _pick_active_interface(interfaces)
 
-        default_network = _CONNECTIVITY_DEFAULT.search(raw['connectivity'])
+        conn_raw = raw.get('connectivity') or ''
+        default_network = _CONNECTIVITY_DEFAULT.search(conn_raw) if isinstance(conn_raw, str) else None
+        cellular = raw.get('cellular') if isinstance(raw.get('cellular'), dict) else self.get_cellular_info(device_id)
+
         return {
             'wifi': wifi,
+            'cellular': cellular,
             'interfaces': interfaces,
             'active_interface': active,
             'gateway': route.get('gateway', ''),
             'route_interface': route.get('interface', ''),
             'source_address': route.get('source', ''),
-            'dns': _parse_dns_servers(raw['connectivity']),
+            'dns': _parse_dns_servers(conn_raw) if isinstance(conn_raw, str) else [],
             'default_network': default_network.group(1) if default_network else '',
         }
 
@@ -2892,6 +3648,383 @@ class ADBManager:
         except Exception:
             pass
 
+    def _ensure_icon_extractor(self, device_id: str) -> bool:
+        """Ensure icon_extractor.jar is available on device at /data/local/tmp/droidmgr_icon.jar."""
+        if not hasattr(self, '_icon_extractor_ready'):
+            self._icon_extractor_ready = set()
+        if device_id in self._icon_extractor_ready:
+            return True
+
+        jar_candidates = [
+            Path(__file__).resolve().parent.parent / 'assets' / 'icon_extractor.jar',
+            Path(__file__).resolve().parent.parent / 'ui' / 'assets' / 'icon_extractor.jar',
+            Path(getattr(sys, '_MEIPASS', '')) / 'assets' / 'icon_extractor.jar',
+        ]
+        local_jar = None
+        for p in jar_candidates:
+            if p.is_file():
+                local_jar = str(p)
+                break
+        if not local_jar:
+            return False
+
+        try:
+            self._run_command(['push', local_jar, '/data/local/tmp/droidmgr_icon.jar'], device_id, timeout=10)
+            self._icon_extractor_ready.add(device_id)
+            return True
+        except Exception:
+            return False
+
+    def get_app_labels(self, device_id: str, packages: Optional[List[str]] = None) -> Dict[str, str]:
+        """Query official, localized application labels via on-device PackageManager."""
+        labels: Dict[str, str] = {}
+        if not device_id or not self._ensure_icon_extractor(device_id):
+            return labels
+
+        try:
+            cmd = [
+                'shell',
+                'CLASSPATH=/data/local/tmp/droidmgr_icon.jar',
+                'app_process', '/',
+                'com.droidmgr.IconExtractor',
+                '--labels'
+            ]
+            if packages:
+                chunk_size = 50
+                for i in range(0, len(packages), chunk_size):
+                    chunk = packages[i:i + chunk_size]
+                    out = self._run_command([*cmd, *chunk], device_id, timeout=15)
+                    for line in out.splitlines():
+                        if line.startswith('LABEL:'):
+                            parts = line[6:].split('\t', 1)
+                            if len(parts) == 2 and parts[1].strip():
+                                labels[parts[0].strip()] = parts[1].strip()
+            else:
+                out = self._run_command(cmd, device_id, timeout=25)
+                for line in out.splitlines():
+                    if line.startswith('LABEL:'):
+                        parts = line[6:].split('\t', 1)
+                        if len(parts) == 2 and parts[1].strip():
+                            labels[parts[0].strip()] = parts[1].strip()
+        except Exception:
+            pass
+
+        return labels
+
+    def get_dev_options(self, device_id: str) -> Dict[str, Any]:
+        """Query Developer Options and QA toggles (animation scales, touches, density, etc.)."""
+        opts: Dict[str, Any] = {
+            'window_animation_scale': '1.0',
+            'transition_animation_scale': '1.0',
+            'animator_duration_scale': '1.0',
+            'show_touches': False,
+            'pointer_location': False,
+            'stay_awake': False,
+            'font_scale': '1.0',
+            'night_mode': 'auto',
+            'density': '',
+            'density_override': '',
+            'size': '',
+            'size_override': '',
+        }
+        if not device_id:
+            return opts
+
+        try:
+            batch_cmd = (
+                "echo WIN:$(settings get global window_animation_scale 2>/dev/null); "
+                "echo TRANS:$(settings get global transition_animation_scale 2>/dev/null); "
+                "echo ANIM:$(settings get global animator_duration_scale 2>/dev/null); "
+                "echo TAPS:$(settings get system show_touches 2>/dev/null); "
+                "echo PTR:$(settings get system pointer_location 2>/dev/null); "
+                "echo AWAKE:$(settings get global stay_on_while_plugged_in 2>/dev/null); "
+                "echo FONT:$(settings get system font_scale 2>/dev/null); "
+                "echo NIGHT:$(settings get secure ui_night_mode 2>/dev/null); "
+                "echo DENSITY:$(wm density 2>/dev/null); "
+                "echo SIZE:$(wm size 2>/dev/null)"
+            )
+            out = self._run_command(['shell', batch_cmd], device_id, timeout=10)
+            for line in out.splitlines():
+                line = line.strip()
+                if line.startswith('WIN:'):
+                    val = line[4:].strip()
+                    if val and val != 'null':
+                        opts['window_animation_scale'] = val
+                elif line.startswith('TRANS:'):
+                    val = line[6:].strip()
+                    if val and val != 'null':
+                        opts['transition_animation_scale'] = val
+                elif line.startswith('ANIM:'):
+                    val = line[5:].strip()
+                    if val and val != 'null':
+                        opts['animator_duration_scale'] = val
+                elif line.startswith('TAPS:'):
+                    opts['show_touches'] = line[5:].strip() == '1'
+                elif line.startswith('PTR:'):
+                    opts['pointer_location'] = line[4:].strip() == '1'
+                elif line.startswith('AWAKE:'):
+                    val = line[6:].strip()
+                    try:
+                        opts['stay_awake'] = int(val) > 0
+                    except (ValueError, TypeError):
+                        opts['stay_awake'] = False
+                elif line.startswith('FONT:'):
+                    val = line[5:].strip()
+                    if val and val != 'null':
+                        opts['font_scale'] = val
+                elif line.startswith('NIGHT:'):
+                    val = line[6:].strip()
+                    if val in ('2', 'yes'):
+                        opts['night_mode'] = 'dark'
+                    elif val in ('1', 'no'):
+                        opts['night_mode'] = 'light'
+                    else:
+                        opts['night_mode'] = 'auto'
+                elif line.startswith('DENSITY:') or 'density:' in line.lower():
+                    for sub in line.split('\n'):
+                        if 'Physical density:' in sub:
+                            opts['density'] = sub.split(':', 1)[1].strip()
+                        elif 'Override density:' in sub:
+                            opts['density_override'] = sub.split(':', 1)[1].strip()
+                elif line.startswith('SIZE:') or 'size:' in line.lower():
+                    for sub in line.split('\n'):
+                        if 'Physical size:' in sub:
+                            opts['size'] = sub.split(':', 1)[1].strip()
+                        elif 'Override size:' in sub:
+                            opts['size_override'] = sub.split(':', 1)[1].strip()
+        except Exception:
+            pass
+
+        return opts
+
+    def set_dev_option(self, device_id: str, key: str, value: Any) -> Tuple[bool, str]:
+        """Apply a Developer Option / QA toggle on the device.
+
+        Returns (success: bool, error_or_output_msg: str).
+        """
+        if not device_id:
+            return False, "No device selected."
+
+        cmd = ""
+        if key == 'window_animation_scale':
+            cmd = f"settings put global window_animation_scale {value}"
+        elif key == 'transition_animation_scale':
+            cmd = f"settings put global transition_animation_scale {value}"
+        elif key == 'animator_duration_scale':
+            cmd = f"settings put global animator_duration_scale {value}"
+        elif key == 'all_animation_scales':
+            cmd = (
+                f"settings put global window_animation_scale {value}; "
+                f"settings put global transition_animation_scale {value}; "
+                f"settings put global animator_duration_scale {value}"
+            )
+        elif key == 'show_touches':
+            v = '1' if value else '0'
+            cmd = f"settings put system show_touches {v}"
+        elif key == 'pointer_location':
+            v = '1' if value else '0'
+            cmd = f"settings put system pointer_location {v}"
+        elif key == 'stay_awake':
+            v = '7' if value else '0'
+            cmd = f"settings put global stay_on_while_plugged_in {v}"
+        elif key == 'font_scale':
+            cmd = f"settings put system font_scale {value}"
+        elif key == 'night_mode':
+            if str(value).lower() in ('dark', 'yes', '2', 'true'):
+                cmd = "cmd uimode night yes; settings put secure ui_night_mode 2"
+            elif str(value).lower() in ('light', 'no', '1', 'false'):
+                cmd = "cmd uimode night no; settings put secure ui_night_mode 1"
+            else:
+                cmd = "cmd uimode night auto; settings put secure ui_night_mode 0"
+        elif key == 'density':
+            if str(value).lower() == 'reset':
+                cmd = "wm density reset"
+            else:
+                cmd = f"wm density {value}"
+        elif key == 'size':
+            if str(value).lower() == 'reset':
+                cmd = "wm size reset"
+            else:
+                cmd = f"wm size {value}"
+        else:
+            return False, f"Unknown developer option key: '{key}'"
+
+        try:
+            out = self._run_command(['shell', cmd], device_id, timeout=10)
+            lowered = out.lower()
+            if 'securityexception' in lowered or 'permission denial' in lowered or 'write_secure_settings' in lowered:
+                return False, (
+                    "Permission Denial: Writing system settings via ADB requires enabling "
+                    "'USB debugging (Security settings)' in Developer Options on your phone "
+                    "(common on Xiaomi/MIUI/realme), or granting WRITE_SECURE_SETTINGS via ADB."
+                )
+            if 'error' in lowered or 'exception' in lowered:
+                return False, out.strip() or "Failed to update setting"
+            return True, "OK"
+        except Exception as ex:
+            return False, str(ex)
+
+    def get_users(self, device_id: str) -> List[Dict[str, Any]]:
+        """List Android user profiles (pm list users, am get-current-user)."""
+        users: List[Dict[str, Any]] = []
+        if not device_id:
+            return users
+        try:
+            out = self._run_command(['shell', 'pm list users; echo CURRENT:$(am get-current-user 2>/dev/null)'], device_id, timeout=10)
+            current_id = None
+            for line in out.splitlines():
+                line = line.strip()
+                if line.startswith('CURRENT:'):
+                    current_id = line.split(':', 1)[1].strip()
+
+            user_pattern = re.compile(r'UserInfo\{(\d+):([^:]+):([0-9a-fA-Fx]+)\}(.*)')
+            for line in out.splitlines():
+                line = line.strip()
+                m = user_pattern.search(line)
+                if m:
+                    u_id, u_name, u_flags, rest = m.groups()
+                    is_running = 'running' in rest.lower()
+                    is_current = (u_id == current_id)
+                    users.append({
+                        'id': u_id,
+                        'name': u_name,
+                        'flags': u_flags,
+                        'running': is_running,
+                        'current': is_current,
+                        'raw': line
+                    })
+        except Exception:
+            pass
+        return users
+
+    def switch_user(self, device_id: str, user_id: str) -> Tuple[bool, str]:
+        """Switch active user via am switch-user."""
+        if not device_id:
+            return False, "No device selected."
+        try:
+            out = self._run_command(['shell', f'am switch-user {user_id}'], device_id, timeout=10)
+            if 'error' in out.lower() or 'exception' in out.lower():
+                return False, out.strip()
+            return True, "Switched user successfully."
+        except Exception as ex:
+            return False, str(ex)
+
+    def create_user(self, device_id: str, name: str, user_type: str = 'standard') -> Tuple[bool, str]:
+        """Create new user profile (pm create-user).
+        user_type can be 'standard', 'guest', or 'managed' (work profile).
+        """
+        if not device_id:
+            return False, "No device selected."
+        name = name.strip()
+        if not name:
+            return False, "User name cannot be empty."
+        flags = ""
+        if user_type == 'guest':
+            flags = "--guest "
+        elif user_type == 'managed':
+            flags = "--profileOf 0 --managed "
+        
+        try:
+            out = self._run_command(['shell', f'pm create-user {flags}"{name}"'], device_id, timeout=15)
+            if 'success' in out.lower():
+                return True, out.strip()
+            return False, out.strip() or "Failed to create user."
+        except Exception as ex:
+            return False, str(ex)
+
+    def remove_user(self, device_id: str, user_id: str) -> Tuple[bool, str]:
+        """Remove a user profile via pm remove-user."""
+        if not device_id:
+            return False, "No device selected."
+        if str(user_id) == '0':
+            return False, "Cannot remove primary owner (User 0)."
+        try:
+            out = self._run_command(['shell', f'pm remove-user {user_id}'], device_id, timeout=15)
+            if 'success' in out.lower():
+                return True, out.strip()
+            return False, out.strip() or f"Failed to remove user {user_id}."
+        except Exception as ex:
+            return False, str(ex)
+
+    def extract_app_icons_batch(
+        self,
+        device_id: str,
+        packages: List[str],
+        output_dir: str,
+        cancel_check: Optional[any] = None,
+    ) -> Dict[str, str]:
+        """Batch extract launcher icons using on-device PackageManager via app_process.
+        
+        Returns a mapping of {package_name: local_png_path} for all successfully extracted icons.
+        """
+        results: Dict[str, str] = {}
+        if not packages or not device_id:
+            return results
+
+        os.makedirs(output_dir, exist_ok=True)
+        device_key = hashlib.sha256(device_id.encode('utf-8')).hexdigest()[:10]
+
+        to_fetch = []
+        for pkg in packages:
+            local_icon_path = os.path.join(output_dir, f"{pkg}_{device_key}_latest_icon.png")
+            if os.path.isfile(local_icon_path) and os.path.getsize(local_icon_path) > 0:
+                results[pkg] = local_icon_path
+            else:
+                to_fetch.append(pkg)
+
+        if not to_fetch or not self._ensure_icon_extractor(device_id):
+            return results
+
+        chunk_size = 40
+        for i in range(0, len(to_fetch), chunk_size):
+            if cancel_check and cancel_check():
+                break
+            chunk = to_fetch[i:i + chunk_size]
+            try:
+                cmd = [
+                    'shell',
+                    'CLASSPATH=/data/local/tmp/droidmgr_icon.jar',
+                    'app_process', '/',
+                    'com.droidmgr.IconExtractor',
+                    '--out=/data/local/tmp/droidmgr_icons',
+                    *chunk
+                ]
+                out = self._run_command(cmd, device_id, timeout=25)
+                succeeded = []
+                for line in out.splitlines():
+                    if line.startswith("OK:"):
+                        parts = line.split(":", 1)
+                        if len(parts) > 1:
+                            succeeded.append(parts[1].strip())
+
+                if succeeded:
+                    staging_dir = tempfile.mkdtemp(prefix='droidmgr_icons_pull_')
+                    try:
+                        remote_paths = [f"/data/local/tmp/droidmgr_icons/{p}.png" for p in succeeded]
+                        try:
+                            self._run_command(['pull', *remote_paths, staging_dir], device_id, timeout=15)
+                        except Exception:
+                            for p in succeeded:
+                                try:
+                                    self._run_command(['pull', f'/data/local/tmp/droidmgr_icons/{p}.png', os.path.join(staging_dir, f"{p}.png")], device_id, timeout=5)
+                                except Exception:
+                                    pass
+
+                        for pkg_ok in succeeded:
+                            if cancel_check and cancel_check():
+                                break
+                            staged_file = os.path.join(staging_dir, f"{pkg_ok}.png")
+                            if os.path.isfile(staged_file) and os.path.getsize(staged_file) > 0:
+                                target_path = os.path.join(output_dir, f"{pkg_ok}_{device_key}_latest_icon.png")
+                                shutil.move(staged_file, target_path)
+                                results[pkg_ok] = target_path
+                    finally:
+                        shutil.rmtree(staging_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        return results
+
     def extract_app_icon(
         self,
         device_id: str,
@@ -2899,6 +4032,7 @@ class ADBManager:
         output_dir: str,
         cache_token: Optional[str] = None,
         icon_res_ids: Optional[List[int]] = None,
+        known_apk_path: Optional[str] = None,
     ) -> Optional[str]:
         """Extract the launcher icon declared in the installed APKs.
 
@@ -2918,14 +4052,36 @@ class ADBManager:
             if os.path.isfile(local_icon_path) and os.path.getsize(local_icon_path) > 0:
                 return local_icon_path
 
-            path_output = self._run_command(['shell', 'pm', 'path', package], device_id)
-            apk_paths = []
-            for line in path_output.splitlines():
-                line = line.strip()
-                if line.startswith('package:'):
-                    p = line.replace('package:', '').strip()
-                    if p.endswith('.apk'):
-                        apk_paths.append(p)
+            # Fast path: Use on-device PackageManager via app_process
+            if self._ensure_icon_extractor(device_id):
+                try:
+                    cmd = [
+                        'shell',
+                        'CLASSPATH=/data/local/tmp/droidmgr_icon.jar',
+                        'app_process', '/',
+                        'com.droidmgr.IconExtractor',
+                        '--out=/data/local/tmp/droidmgr_icons',
+                        package
+                    ]
+                    res = self._run_command(cmd, device_id, timeout=8)
+                    if f"OK:{package}" in res:
+                        self._run_command(['pull', f'/data/local/tmp/droidmgr_icons/{package}.png', local_icon_path], device_id, timeout=6)
+                        if os.path.isfile(local_icon_path) and os.path.getsize(local_icon_path) > 0:
+                            return local_icon_path
+                except Exception:
+                    pass
+
+            if known_apk_path and known_apk_path.endswith('.apk'):
+                apk_paths = [known_apk_path]
+            else:
+                path_output = self._run_command(['shell', 'pm', 'path', package], device_id)
+                apk_paths = []
+                for line in path_output.splitlines():
+                    line = line.strip()
+                    if line.startswith('package:'):
+                        p = line.replace('package:', '').strip()
+                        if p.endswith('.apk'):
+                            apk_paths.append(p)
             if not apk_paths:
                 return None
             apk_paths.sort(key=lambda path: (0 if posixpath.basename(path) == 'base.apk' else 1, path))
@@ -3166,7 +4322,8 @@ class ADBManager:
         system = platform.system().lower()
         try:
             if system == 'windows':
-                out = subprocess.run(['ipconfig'], capture_output=True, text=True, timeout=3).stdout
+                out = subprocess.run(['ipconfig'], capture_output=True, text=True,
+                                     encoding='utf-8', errors='replace', timeout=3).stdout
                 sections = re.split(r'\r?\n(?=[^\s])', out)
                 # First priority: Wireless / Wi-Fi adapter
                 for sec in sections:
@@ -3182,7 +4339,8 @@ class ADBManager:
                     if m:
                         return m.group(1).strip()
             else:
-                out = subprocess.run(['ip', 'route', 'show', 'default'], capture_output=True, text=True, timeout=3).stdout
+                out = subprocess.run(['ip', 'route', 'show', 'default'], capture_output=True, text=True,
+                                     encoding='utf-8', errors='replace', timeout=3).stdout
                 m = re.search(r'default\s+via\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\s+dev\s+([a-zA-Z0-9_\-]+)', out)
                 if m:
                     gw, dev = m.group(1), m.group(2).lower()
@@ -3433,7 +4591,9 @@ class ADBManager:
         try:
             result = subprocess.run(
                 [executable] + args,
-                capture_output=True, text=True, check=False,
+                capture_output=True, text=True,
+                encoding='utf-8', errors='replace',
+                check=False,
                 timeout=timeout
             )
         except FileNotFoundError:
@@ -3782,6 +4942,44 @@ class ADBManager:
         except ADBError:
             return False
         return True
+
+    def send_keyevent(self, device_id: str, keycode: int) -> bool:
+        """Send an Android keyevent to the device."""
+        try:
+            self._run_command(['shell', 'input', 'keyevent', str(keycode)], device_id, timeout=8)
+            return True
+        except Exception:
+            return False
+
+    def send_text(self, device_id: str, text: str) -> bool:
+        """Send text input to the device via adb shell input text."""
+        try:
+            escaped = text.replace(' ', '%s').replace('&', '\\&').replace('"', '\\"').replace("'", "\\'")
+            self._run_command(['shell', 'input', 'text', escaped], device_id, timeout=8)
+            return True
+        except Exception:
+            return False
+
+    def set_clipboard_text(self, device_id: str, text: str) -> bool:
+        """Set device clipboard text via cmd clipboard set-text."""
+        try:
+            self._run_command(['shell', 'cmd', 'clipboard', 'set-text', text], device_id, timeout=8)
+            return True
+        except Exception:
+            return False
+
+    def rotate_display(self, device_id: str) -> int:
+        """Rotate screen orientation to the next 90-degree step."""
+        try:
+            cur = self._run_command(['shell', 'settings', 'get', 'system', 'user_rotation'], device_id, timeout=8).strip()
+            val = int(cur) if cur.isdigit() else 0
+            nxt = (val + 1) % 4
+            self._run_command(['shell', 'settings', 'put', 'system', 'accelerometer_rotation', '0'], device_id, timeout=8)
+            self._run_command(['shell', 'settings', 'put', 'system', 'user_rotation', str(nxt)], device_id, timeout=8)
+            return nxt
+        except Exception:
+            return 0
+
 
 
 def _looks_like_unzip_error(data: bytes) -> bool:

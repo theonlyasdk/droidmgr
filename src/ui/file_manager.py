@@ -247,6 +247,8 @@ class FileManager:
 
     def set_device(self, device_id, force_refresh=False):
         changed = (self.selected_device != device_id)
+        if changed:
+            self._last_rendered_path = None
         self.selected_device = device_id
         if not device_id:
             self._clear_list()
@@ -296,11 +298,20 @@ class FileManager:
             except Exception:
                 pass
 
+        query_path = self.current_path
+        if not query_path.endswith('/'):
+            query_path += '/'
+
+        selected_names = set()
+        for item_id in self.file_tree.selection():
+            vals = self.file_tree.item(item_id, 'values')
+            if vals:
+                selected_names.add(vals[0])
+        yview = self.file_tree.yview()
+
         def task():
             try:
-                path = self.current_path
-                if not path.endswith('/'):
-                    path += '/'
+                path = query_path
                 
                 show_hidden = self.config.get('file_manager', 'show_hidden', False)
                 use_exact = self.config.get('file_manager', 'use_exact_sizes', False)
@@ -313,14 +324,27 @@ class FileManager:
                 
                 def update():
                     self.is_current_path_writable = is_writable
+                    is_same_dir = (path == getattr(self, '_last_rendered_path', None))
                     # Clear the list inside the main thread just before inserting to avoid duplicates and concurrency bugs
                     self._clear_list()
+                    restored_ids = []
                     for f in files:
                         icon = "[DIR]" if f['is_dir'] else "[FILE]"
                         item_id = self.file_tree.insert('', tk.END, text=icon,
                                             values=(f['name'], f['size'], f['permissions']),
                                             tags=('directory' if f['is_dir'] else 'file',))
                         self.files_data[item_id] = f
+                        if is_same_dir and f['name'] in selected_names:
+                            restored_ids.append(item_id)
+
+                    if restored_ids:
+                        self.file_tree.selection_set(restored_ids)
+                        self.file_tree.focus(restored_ids[0])
+
+                    if is_same_dir and yview:
+                        self.file_tree.yview_moveto(yview[0])
+
+                    self._last_rendered_path = path
                     self._set_status(f"Browsing {self.current_path}")
                     self._update_navigation_buttons()
                     self._update_selection_buttons()

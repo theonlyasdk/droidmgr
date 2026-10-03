@@ -6,12 +6,14 @@ from .about_dialog import AboutDialog
 from .preferences_dialog import PreferencesDialog
 from .file_manager import FileManager
 from .scrcpy_output_dialog import ScrcpyOutputDialog
+from .scrcpy_overlay import ScrcpyOverlayToolbar
 from .device_details_dialog import DeviceDetailsDialog
 from .process_graph import ProcessHistoryWindow
 from .forward_dialog import ForwardDialog
 from .file_drop import enable_file_drop
 from .logcat_view import LogcatView
 from .shell_view import ShellView
+from .network_inspector import NetworkInspector
 from .capture import (
     take_screenshot,
     record_screen,
@@ -38,12 +40,14 @@ __all__ = [
     'PreferencesDialog',
     'FileManager',
     'ScrcpyOutputDialog',
+    'ScrcpyOverlayToolbar',
     'DeviceDetailsDialog',
     'ProcessHistoryWindow',
     'ForwardDialog',
     'enable_file_drop',
     'LogcatView',
     'ShellView',
+    'NetworkInspector',
     'take_screenshot',
     'record_screen',
     'ScreenRecordDialog',

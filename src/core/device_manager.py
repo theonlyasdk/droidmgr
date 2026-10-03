@@ -294,9 +294,57 @@ class DeviceManager:
         self.adb.make_directory(device_id, path)
 
 
+    def get_display_info(self, device_id: str) -> str:
+        """Fetch screen resolution and display characteristics."""
+        return self.adb.get_display_info(device_id)
+
+    def get_camera_info(self, device_id: str) -> str:
+        """Fetch camera count, resolution, FPS, and sensor capabilities."""
+        return self.adb.get_camera_info(device_id, scrcpy=self.scrcpy)
+
+    def get_encoder_info(self, device_id: str) -> str:
+        """Fetch media encoders from the device."""
+        return self.adb.get_encoder_info(device_id, scrcpy=self.scrcpy)
+
+    def get_os_security_info(self, device_id: str) -> str:
+        """Fetch OS fingerprint, security patch dates, and bootloader status."""
+        return self.adb.get_os_security_info(device_id)
+
+    def get_apps_detailed_summary(self, device_id: str) -> str:
+        """Fetch breakdown of system/user apps, sources, and target SDKs."""
+        return self.adb.get_apps_detailed_summary(device_id)
+
+    def get_app_permissions_info(self, device_id: str) -> str:
+        """Fetch special app access counts and granted runtime permissions."""
+        return self.adb.get_app_permissions_info(device_id)
+
+    def get_background_activity_info(self, device_id: str) -> str:
+        """Fetch background jobs, RTC alarms, and foreground services."""
+        return self.adb.get_background_activity_info(device_id)
+
+    def get_battery_power_info(self, device_id: str) -> str:
+        """Fetch wakefulness, wakelocks, and per-UID power statistics."""
+        return self.adb.get_battery_power_info(device_id)
+
+    def get_stability_info(self, device_id: str) -> str:
+        """Fetch reboot reasons, DropBox crashes/ANRs, and kernel errors."""
+        return self.adb.get_stability_info(device_id)
+
+    def get_connectivity_info(self, device_id: str) -> str:
+        """Fetch Wi-Fi link speed, signal strength, and cellular network type."""
+        return self.adb.get_connectivity_info(device_id)
+
+    def get_audio_info(self, device_id: str) -> str:
+        """Fetch audio devices, sample rates, channels, and codec capabilities."""
+        return self.adb.get_audio_info(device_id)
+
+    def get_sensors_info(self, device_id: str) -> str:
+        """Fetch hardware sensors list, types, vendors, and sampling rates."""
+        return self.adb.get_sensors_info(device_id)
+
     def generate_llm_report(self, device_id: str, progress_callback=None) -> str:
         """Generate a single information-dense report paragraph for LLM analysis."""
-        return self.adb.generate_llm_report(device_id, progress_callback)
+        return self.adb.generate_llm_report(device_id, progress_callback=progress_callback, scrcpy=self.scrcpy)
 
     def collect_bugreport(self, device_id: str, output_path: str) -> str:
         """Collect a bugreport from a device into a zip at output_path.
@@ -346,6 +394,18 @@ class DeviceManager:
             device_id: Device ID
         """
         return self.adb.get_active_connections(device_id)
+
+    def get_cellular_info(self, device_id: str) -> Dict[str, Any]:
+        """Cellular telephony status: SIM, carrier, network type, and data state."""
+        return self.adb.get_cellular_info(device_id)
+
+    def get_routing_table(self, device_id: str) -> List[Dict[str, Any]]:
+        """Routing table entries across routing tables."""
+        return self.adb.get_routing_table(device_id)
+
+    def get_connectivity_history(self, device_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """Timestamped connectivity requests and state changes."""
+        return self.adb.get_connectivity_history(device_id, limit=limit)
 
     def get_network_requests(self, device_id: str) -> List[Dict[str, Any]]:
         """Which apps have registered for network access, and on what.
@@ -429,6 +489,22 @@ class DeviceManager:
                     version: str = '') -> Dict[str, Any]:
         """Pull an installed package's APK, and its splits, to a local folder."""
         return self.adb.extract_apk(device_id, package, destination, version)
+
+    def send_keyevent(self, device_id: str, keycode: int) -> bool:
+        """Send an Android keyevent to the device."""
+        return self.adb.send_keyevent(device_id, keycode)
+
+    def send_text(self, device_id: str, text: str) -> bool:
+        """Send text input to the device."""
+        return self.adb.send_text(device_id, text)
+
+    def set_clipboard_text(self, device_id: str, text: str) -> bool:
+        """Set device clipboard text."""
+        return self.adb.set_clipboard_text(device_id, text)
+
+    def rotate_display(self, device_id: str) -> int:
+        """Rotate screen orientation to the next 90-degree step."""
+        return self.adb.rotate_display(device_id)
 
     def cleanup(self) -> None:
         """Cleanup all resources."""

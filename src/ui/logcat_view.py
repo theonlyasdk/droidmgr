@@ -1,5 +1,6 @@
 """Logcat viewer widget for streaming `adb logcat -v brief` output."""
 
+from collections import deque
 import queue
 import re
 import threading
@@ -59,7 +60,8 @@ class LogcatView:
         self.selected_device = None
         self.process = None
         self.reader_thread = None
-        self.queue: queue.Queue = queue.Queue()
+        self._session_id = 0
+        self.queue: queue.Queue = queue.Queue(maxsize=2000)
         self.running = False
         self.paused = False
         self.autoscroll = tk.BooleanVar(value=True)
@@ -68,13 +70,13 @@ class LogcatView:
         self.search_var = tk.StringVar(value='')
 
         # (raw_line_without_newline, level)
-        self.buffer = []
+        self.buffer = deque(maxlen=MAX_BUFFER_LINES)
         self.buffer_lock = threading.Lock()
         self.displayed_count = 0
         self._poll_after_id = None
+        self._search_after_id = None
 
         self._create_widgets()
-        self._schedule_poll()
 
     # -- widget construction -------------------------------------------
 
@@ -191,40 +193,32 @@ class LogcatView:
                     return
             except Exception:
                 pass
+
+        # Thoroughly stop any stale session/process first
+        self.stop()
+
         try:
             self.process = self.device_manager.get_logcat(self.selected_device)
         except Exception as exc:
             self._show_error("Logcat Error", f"Could not start logcat:\n{exc}")
             self._set_hint(f"Could not start logcat: {exc}")
             return
+
+        self._session_id += 1
+        current_session = self._session_id
         self.running = True
         self._set_hint(f"Streaming logcat from {self.selected_device} ...")
-        self.reader_thread = threading.Thread(target=self._read_loop, daemon=True)
+
+        self.reader_thread = threading.Thread(
+            target=self._read_loop,
+            args=(current_session, self.process),
+            daemon=True
+        )
         self.reader_thread.start()
+        self._schedule_poll()
 
     def stop(self):
-        self.running = False
-        proc, self.process = self.process, None
-        if proc is not None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=2)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-        # Drain stale queued lines from the previous stream
-        try:
-            while True:
-                self.queue.get_nowait()
-        except queue.Empty:
-            pass
-
-    def destroy(self):
+        self._session_id += 1
         self.running = False
         if self._poll_after_id is not None:
             try:
@@ -232,6 +226,51 @@ class LogcatView:
             except Exception:
                 pass
             self._poll_after_id = None
+
+        proc, self.process = self.process, None
+        reader, self.reader_thread = self.reader_thread, None
+
+        if proc is not None or reader is not None:
+            def _cleanup_bg(p, r):
+                if p is not None:
+                    try:
+                        if p.stdout:
+                            p.stdout.close()
+                    except Exception:
+                        pass
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        p.wait(timeout=0.5)
+                    except Exception:
+                        try:
+                            p.kill()
+                        except Exception:
+                            pass
+                if r is not None and r.is_alive() and threading.current_thread() != r:
+                    try:
+                        r.join(timeout=0.5)
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_cleanup_bg, args=(proc, reader), daemon=True).start()
+
+        # Drain stale queued lines from previous session
+        try:
+            while True:
+                self.queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    def destroy(self):
+        if getattr(self, '_search_after_id', None):
+            try:
+                self.frame.after_cancel(self._search_after_id)
+            except Exception:
+                pass
+            self._search_after_id = None
         self.stop()
 
     # -- filtering helpers ----------------------------------------------
@@ -262,32 +301,57 @@ class LogcatView:
     def _refilter(self):
         self._clear_view()
         with self.buffer_lock:
-            snapshot = list(self.buffer[-MAX_RENDER_LINES:])
-        for line, level in snapshot:
-            if self._line_visible(line, level):
-                self._append_line(line, level)
+            snapshot = list(self.buffer)
+        visible = [(line, level) for line, level in snapshot if self._line_visible(line, level)]
+        to_render = visible[-MAX_RENDER_LINES:]
+        self._append_lines_batch(to_render)
         self._update_status()
+        if self.autoscroll.get() and to_render:
+            try:
+                self.log_text.see(tk.END)
+            except Exception:
+                pass
 
     # -- streaming -------------------------------------------------------
 
-    def _read_loop(self):
-        proc = self.process
+    def _read_loop(self, session_id: int, proc):
         try:
-            while self.running and proc is not None and proc.stdout is not None:
+            while self.running and self._session_id == session_id and proc is not None and proc.stdout is not None:
                 line = proc.stdout.readline()
                 if not line:
                     break
-                self.queue.put(line)
+                try:
+                    self.queue.put((session_id, 'line', line), timeout=0.1)
+                except queue.Full:
+                    pass
         except Exception as exc:
+            if self.running and self._session_id == session_id:
+                try:
+                    self.queue.put(
+                        (session_id, 'line', f"E/droidmgr(    0): [logcat reader error: {exc}]\n"),
+                        timeout=0.1
+                    )
+                except Exception:
+                    pass
+        finally:
             try:
-                self.queue.put(f"E/droidmgr(    0): [logcat reader error: {exc}]\n")
+                if proc is not None and proc.stdout is not None:
+                    proc.stdout.close()
             except Exception:
                 pass
-        finally:
-            if self.running:
-                self.queue.put(None)
+            if self.running and self._session_id == session_id:
+                try:
+                    self.queue.put((session_id, 'exit', None), timeout=0.1)
+                except Exception:
+                    pass
 
     def _schedule_poll(self):
+        if self._poll_after_id is not None:
+            try:
+                self.frame.after_cancel(self._poll_after_id)
+            except Exception:
+                pass
+            self._poll_after_id = None
         self._poll()
 
     def _poll(self):
@@ -295,23 +359,28 @@ class LogcatView:
             lines = []
             while True:
                 try:
-                    item = self.queue.get_nowait()
+                    session_id, kind, item = self.queue.get_nowait()
                 except queue.Empty:
                     break
-                if item is None:
+                if session_id != self._session_id:
+                    continue
+                if kind == 'exit':
                     if self.running:
                         self.running = False
                         self._set_hint("logcat stream ended (device disconnected?).")
                     continue
-                lines.append(item)
+                if kind == 'line':
+                    lines.append(item)
             if lines:
                 self._handle_new_lines(lines)
         finally:
             try:
-                if self.frame.winfo_exists():
+                if self.frame.winfo_exists() and self.running:
                     self._poll_after_id = self.frame.after(100, self._poll)
+                else:
+                    self._poll_after_id = None
             except Exception:
-                pass
+                self._poll_after_id = None
 
     def _handle_new_lines(self, lines):
         new_visible = []
@@ -320,8 +389,6 @@ class LogcatView:
                 line = raw.rstrip('\r\n')
                 level = parse_brief_level(line)
                 self.buffer.append((line, level))
-                if len(self.buffer) > MAX_BUFFER_LINES:
-                    del self.buffer[:len(self.buffer) - MAX_BUFFER_LINES]
                 if self._line_visible(line, level):
                     new_visible.append((line, level))
         if self.paused:
@@ -331,8 +398,7 @@ class LogcatView:
         if len(new_visible) > MAX_RENDER_LINES:
             self._refilter()
             return
-        for line, level in new_visible:
-            self._append_line(line, level)
+        self._append_lines_batch(new_visible)
         self._update_status()
         if self.autoscroll.get() and new_visible:
             try:
@@ -342,31 +408,45 @@ class LogcatView:
 
     # -- view helpers -----------------------------------------------------
 
-    def _append_line(self, line: str, level: str):
+    def _append_lines_batch(self, lines_to_add: list):
+        if not lines_to_add:
+            return
         try:
             self.log_text.configure(state=tk.NORMAL)
-            tag = level if level in ('V', 'D', 'I', 'W', 'E', 'F') else None
-            if tag:
-                self.log_text.insert(tk.END, line + '\n', tag)
-            else:
-                self.log_text.insert(tk.END, line + '\n')
-            self.displayed_count += 1
+            for line, level in lines_to_add:
+                tag = level if level in ('V', 'D', 'I', 'W', 'E', 'F') else None
+                if tag:
+                    self.log_text.insert(tk.END, line + '\n', tag)
+                else:
+                    self.log_text.insert(tk.END, line + '\n')
+
             # Trim the widget to bound memory on long streams.
             widget_lines = int(self.log_text.index('end-1c').split('.')[0])
             if widget_lines > MAX_RENDER_LINES + 500:
-                self.log_text.delete('1.0', f'{widget_lines - MAX_RENDER_LINES}.0')
+                delete_count = widget_lines - MAX_RENDER_LINES
+                self.log_text.delete('1.0', f'{delete_count + 1}.0')
                 self.displayed_count = MAX_RENDER_LINES
-            self.log_text.configure(state=tk.DISABLED)
+            else:
+                self.displayed_count = widget_lines
         except Exception:
             pass
+        finally:
+            try:
+                self.log_text.configure(state=tk.DISABLED)
+            except Exception:
+                pass
 
     def _clear_view(self):
         try:
             self.log_text.configure(state=tk.NORMAL)
             self.log_text.delete('1.0', tk.END)
-            self.log_text.configure(state=tk.DISABLED)
         except Exception:
             pass
+        finally:
+            try:
+                self.log_text.configure(state=tk.DISABLED)
+            except Exception:
+                pass
         self.displayed_count = 0
 
     def _set_hint(self, message: str):
