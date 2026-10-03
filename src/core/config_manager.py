@@ -37,7 +37,13 @@ class ConfigManager:
             'file_manager': {
                 'show_hidden': False,
                 'use_exact_sizes': False,
-                'confirm_rename': True
+                'confirm_rename': True,
+                'view_mode': 'list',
+                'grid_animations': True,
+                'skeleton_delay_ms': 150
+            },
+            'applications': {
+                'view_mode': 'grid'
             },
             'backup': {
                 'exclude_paths': list(DEFAULT_BACKUP_EXCLUSIONS),
@@ -182,6 +188,21 @@ class ConfigManager:
             else:
                 print(f"Warning: Dropping malformed shell preset {item!r}.")
         shell['presets'] = cleaned
+
+        # Validate view modes (must be 'list' or 'grid')
+        file_manager = self.settings.setdefault('file_manager', {})
+        if file_manager.get('view_mode') not in ('list', 'grid'):
+            file_manager['view_mode'] = 'list'
+        if not isinstance(file_manager.get('grid_animations'), bool):
+            file_manager['grid_animations'] = True
+        try:
+            delay = int(file_manager.get('skeleton_delay_ms', 150))
+            file_manager['skeleton_delay_ms'] = max(0, min(1000, delay))
+        except (TypeError, ValueError):
+            file_manager['skeleton_delay_ms'] = 150
+        applications = self.settings.setdefault('applications', {})
+        if applications.get('view_mode') not in ('list', 'grid'):
+            applications['view_mode'] = 'grid'
 
         # Validate capture settings (screenshot/recording defaults)
         capture = self.settings.setdefault('capture', {})

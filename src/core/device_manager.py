@@ -7,9 +7,15 @@ import subprocess
 from .adb_manager import ADBManager
 from .scrcpy_manager import ScrcpyManager
 from .dependency_manager import DependencyManager
+from .device_registry import DeviceRegistry
+from .device_files import _DeviceFilesMixin
+from .device_diag import _DeviceDiagMixin
+from .device_net import _DeviceNetMixin
+from .device_shell import _DeviceShellMixin
 
 
-class DeviceManager:
+class DeviceManager(_DeviceFilesMixin, _DeviceDiagMixin, _DeviceNetMixin,
+                      _DeviceShellMixin):
     """High-level manager coordinating all device operations."""
     
     def __init__(self, adb_path=None, scrcpy_path=None):
@@ -31,6 +37,8 @@ class DeviceManager:
         # Initialize managers
         self.adb = ADBManager(adb_path)
         self.scrcpy = ScrcpyManager(scrcpy_path)
+        # File-backed database of every device ever connected.
+        self.registry = DeviceRegistry()
     
     def get_devices(self) -> List[Dict[str, str]]:
         """Get list of all connected devices with additional info.
@@ -200,6 +208,41 @@ class DeviceManager:
         """Report root availability for a device."""
         return self.adb.get_root_status(device_id)
 
+    def get_empty_dirs(self, device_id: str, path: str) -> set:
+        """Names of immediate subdirectories of path that contain no entries."""
+        return self.adb.get_empty_dirs(device_id, path)
+
+    def enrich_device_record(self, device_id: str) -> bool:
+        """Fetch stable facts + root status once and store them in the registry.
+
+        Returns True when this call did the work. At most one caller per
+        session per device gets True (claim_enrichment); the work runs on the
+        caller's thread, so call it from a background thread. Returns False
+        when another call already handles it or the device is not ready.
+        """
+        registry = getattr(self, 'registry', None)
+        if registry is None or not device_id:
+            return False
+        if not self.is_device_ready(device_id):
+            return False
+        if not registry.claim_enrichment(device_id):
+            return False
+        try:
+            try:
+                details = self.adb.get_detailed_device_info(device_id)
+                if details and not details.get('error'):
+                    registry.record_details(device_id, details)
+            except Exception:
+                pass
+            try:
+                registry.record_root(device_id, self.adb.get_root_status(device_id))
+            except Exception:
+                pass
+            return True
+        except Exception:
+            registry.release_enrichment(device_id)
+            return False
+
     def reconnect_devices(self, offline: bool = False) -> str:
         """Ask the adb server to re-establish device connections."""
         return self.adb.reconnect_devices(offline)
@@ -219,295 +262,5 @@ class DeviceManager:
     def remove_all_forwards(self, device_id: Optional[str] = None, reverse: bool = False) -> str:
         """Remove all forwards, for one device or for all of them."""
         return self.adb.remove_all_forwards(device_id, reverse)
-
-
-    
-    def list_files(self, device_id: str, path: str = '/sdcard/', show_hidden: bool = True, use_exact_sizes: bool = False) -> List[Dict[str, Any]]:
-        """List files in a directory on a device.
-        
-        Args:
-            device_id: Device ID
-            path: Directory path
-            show_hidden: Whether to show hidden files
-            use_exact_sizes: Whether to show sizes in bytes
-            
-        Returns:
-            List of file dictionaries
-        """
-        return self.adb.list_files(device_id, path, show_hidden, use_exact_sizes)
-    
-    def download_file(self, device_id: str, remote_path: str, local_path: str) -> None:
-        """Download a file from a device.
-        
-        Args:
-            device_id: Device ID
-            remote_path: Path on device
-            local_path: Local destination path
-        """
-        self.adb.download_file(device_id, remote_path, local_path)
-
-    def backup_filesystem(self, device_id: str, destination: str, cancel_event, progress_callback=None,
-                          remote_root: str = '/', parallelism: int = 4, exclusions=None, only_paths=None,
-                          verify_checksums=False) -> bool:
-        """Back up accessible device files after indexing the filesystem."""
-        return self.adb.backup_filesystem(
-            device_id, destination, cancel_event, progress_callback, remote_root, parallelism, exclusions,
-            only_paths, verify_checksums
-        )
-
-    def estimate_filesystem_size(self, device_id: str, remote_root: str = '/', cancel_event=None):
-        return self.adb.estimate_filesystem_size(device_id, remote_root, cancel_event)
-    
-    def upload_file(self, device_id: str, local_path: str, remote_path: str, cancel_event=None) -> None:
-        """Upload a file to a device.
-        
-        Args:
-            device_id: Device ID
-            local_path: Local file path
-            remote_path: Destination path on device
-        """
-        self.adb.upload_file(device_id, local_path, remote_path, cancel_event)
-    
-    def delete_file(self, device_id: str, remote_path: str) -> None:
-        """Delete a file on a device.
-        
-        Args:
-            device_id: Device ID
-            remote_path: Path on device
-        """
-        self.adb.delete_file(device_id, remote_path)
-
-    def rename_file(self, device_id: str, old_path: str, new_path: str) -> None:
-        """Rename a file on a device."""
-        self.adb.rename_file(device_id, old_path, new_path)
-
-    def move_file(self, device_id: str, src_path: str, dest_path: str) -> None:
-        """Move a file on a device."""
-        self.adb.move_file(device_id, src_path, dest_path)
-
-    def copy_file(self, device_id: str, src_path: str, dest_path: str) -> None:
-        """Copy a file on a device."""
-        self.adb.copy_file(device_id, src_path, dest_path)
-
-    def make_directory(self, device_id: str, path: str) -> None:
-        """Create a directory on the device."""
-        self.adb.make_directory(device_id, path)
-
-
-    def get_display_info(self, device_id: str) -> str:
-        """Fetch screen resolution and display characteristics."""
-        return self.adb.get_display_info(device_id)
-
-    def get_camera_info(self, device_id: str) -> str:
-        """Fetch camera count, resolution, FPS, and sensor capabilities."""
-        return self.adb.get_camera_info(device_id, scrcpy=self.scrcpy)
-
-    def get_encoder_info(self, device_id: str) -> str:
-        """Fetch media encoders from the device."""
-        return self.adb.get_encoder_info(device_id, scrcpy=self.scrcpy)
-
-    def get_os_security_info(self, device_id: str) -> str:
-        """Fetch OS fingerprint, security patch dates, and bootloader status."""
-        return self.adb.get_os_security_info(device_id)
-
-    def get_apps_detailed_summary(self, device_id: str) -> str:
-        """Fetch breakdown of system/user apps, sources, and target SDKs."""
-        return self.adb.get_apps_detailed_summary(device_id)
-
-    def get_app_permissions_info(self, device_id: str) -> str:
-        """Fetch special app access counts and granted runtime permissions."""
-        return self.adb.get_app_permissions_info(device_id)
-
-    def get_background_activity_info(self, device_id: str) -> str:
-        """Fetch background jobs, RTC alarms, and foreground services."""
-        return self.adb.get_background_activity_info(device_id)
-
-    def get_battery_power_info(self, device_id: str) -> str:
-        """Fetch wakefulness, wakelocks, and per-UID power statistics."""
-        return self.adb.get_battery_power_info(device_id)
-
-    def get_stability_info(self, device_id: str) -> str:
-        """Fetch reboot reasons, DropBox crashes/ANRs, and kernel errors."""
-        return self.adb.get_stability_info(device_id)
-
-    def get_connectivity_info(self, device_id: str) -> str:
-        """Fetch Wi-Fi link speed, signal strength, and cellular network type."""
-        return self.adb.get_connectivity_info(device_id)
-
-    def get_audio_info(self, device_id: str) -> str:
-        """Fetch audio devices, sample rates, channels, and codec capabilities."""
-        return self.adb.get_audio_info(device_id)
-
-    def get_sensors_info(self, device_id: str) -> str:
-        """Fetch hardware sensors list, types, vendors, and sampling rates."""
-        return self.adb.get_sensors_info(device_id)
-
-    def generate_llm_report(self, device_id: str, progress_callback=None) -> str:
-        """Generate a single information-dense report paragraph for LLM analysis."""
-        return self.adb.generate_llm_report(device_id, progress_callback=progress_callback, scrcpy=self.scrcpy)
-
-    def collect_bugreport(self, device_id: str, output_path: str) -> str:
-        """Collect a bugreport from a device into a zip at output_path.
-
-        Args:
-            device_id: Device ID
-            output_path: Host path the zip is written to
-        """
-        return self.adb.collect_bugreport(device_id, output_path)
-
-    def build_bugreport_briefing(self, device_id: str, zip_path: str,
-                                 elapsed_seconds: float) -> str:
-        """Summarise a collected bugreport for the user to read.
-
-        Args:
-            device_id: Device ID
-            zip_path: Host path of the collected zip
-            elapsed_seconds: How long the collection took
-        """
-        return self.adb.build_bugreport_briefing(device_id, zip_path,
-                                                 elapsed_seconds)
-
-    def get_network_info(self, device_id: str) -> Dict[str, Any]:
-        """Connection details: network name, address, gateway and name servers.
-
-        Args:
-            device_id: Device ID
-
-        Returns:
-            Dict with the wifi reading, every interface, the active one,
-            the default route and the name servers in use.
-        """
-        return self.adb.get_network_info(device_id)
-
-    def get_app_network_usage(self, device_id: str) -> List[Dict[str, Any]]:
-        """Per-app received and sent bytes since boot, largest first.
-
-        Args:
-            device_id: Device ID
-        """
-        return self.adb.get_app_network_usage(device_id)
-
-    def get_active_connections(self, device_id: str) -> List[Dict[str, Any]]:
-        """Sockets the device currently holds open, with their owning app.
-
-        Args:
-            device_id: Device ID
-        """
-        return self.adb.get_active_connections(device_id)
-
-    def get_cellular_info(self, device_id: str) -> Dict[str, Any]:
-        """Cellular telephony status: SIM, carrier, network type, and data state."""
-        return self.adb.get_cellular_info(device_id)
-
-    def get_routing_table(self, device_id: str) -> List[Dict[str, Any]]:
-        """Routing table entries across routing tables."""
-        return self.adb.get_routing_table(device_id)
-
-    def get_connectivity_history(self, device_id: str, limit: int = 100) -> List[Dict[str, Any]]:
-        """Timestamped connectivity requests and state changes."""
-        return self.adb.get_connectivity_history(device_id, limit=limit)
-
-    def get_network_requests(self, device_id: str) -> List[Dict[str, Any]]:
-        """Which apps have registered for network access, and on what.
-
-        Args:
-            device_id: Device ID
-        """
-        return self.adb.get_network_requests(device_id)
-
-    def ping_host(self, device_id: str, host: str, count: int = 4) -> Dict[str, Any]:
-        """Time the round trip to a host from the device itself.
-
-        Args:
-            device_id: Device ID
-            host: Hostname or address to ping
-            count: Packets to send, 1 to 10
-
-        Returns:
-            Dict of the round-trip times, the loss and any error the host gave.
-        """
-        return self.adb.ping_host(device_id, host, count)
-    
-    def is_directory_writable(self, device_id: str, path: str) -> bool:
-        """Check dynamically if a directory on the device is writable."""
-        return self.adb.is_directory_writable(device_id, path)
-
-    def enable_tcpip(self, device_id: str, port: int = 5555) -> str:
-        """Enable ADB over TCP/IP on the device."""
-        return self.adb.enable_tcpip(device_id, port)
-
-    def get_device_ip(self, device_id: Optional[str] = None) -> Optional[str]:
-        """Get the Wi-Fi or Hotspot IP address of the device or network."""
-        return self.adb.get_device_ip(device_id)
-
-    def connect_device(self, host: str, port: int = 5555) -> str:
-        """Connect to an ADB device over network."""
-        return self.adb.connect_device(host, port)
-
-    def pair_device(self, host: str, port: int, pairing_code: str) -> str:
-        """Pair with an Android device over Wi-Fi using a pairing code (Android 11+)."""
-        return self.adb.pair_device(host, port, pairing_code)
-
-    def disconnect_device(self, address: str) -> str:
-        """Disconnect an ADB device over network."""
-        return self.adb.disconnect_device(address)
-
-    def get_logcat(self, device_id: str):
-        """Start streaming `adb logcat -v brief` for a device."""
-        return self.adb.get_logcat(device_id)
-
-    def clear_logcat(self, device_id: str) -> None:
-        """Clear the on-device logcat buffers (`adb logcat -c`)."""
-        self.adb.clear_logcat(device_id)
-
-    def run_shell_command(self, device_id: str, command: str, timeout: int = 30):
-        """Run a single shell command on a device, returning (returncode, stdout, stderr)."""
-        return self.adb.run_shell_command(device_id, command, timeout)
-
-    def start_shell_session(self, device_id: str, allocate_tty: bool = True):
-        """Start an interactive `adb shell` session for a device."""
-        return self.adb.start_shell_session(device_id, allocate_tty)
-
-    def capture_screenshot(self, device_id: str) -> bytes:
-        """Capture the current screen as PNG bytes."""
-        return self.adb.capture_screenshot(device_id)
-
-    def start_screenrecord(self, device_id: str, remote_path: str, time_limit: int = 180,
-                           bit_rate: Optional[str] = None, size: Optional[str] = None):
-        """Start `adb shell screenrecord`, writing the video to a device path."""
-        return self.adb.start_screenrecord(device_id, remote_path, time_limit, bit_rate, size)
-
-    def stop_screenrecord(self, device_id: str) -> bool:
-        """Ask an on-device screenrecord to stop and finalize the MP4."""
-        return self.adb.stop_screenrecord(device_id)
-
-    def get_apk_paths(self, device_id: str, package: str) -> List[Dict[str, str]]:
-        """List the APK files behind an installed package."""
-        return self.adb.get_apk_paths(device_id, package)
-
-    def extract_apk(self, device_id: str, package: str, destination: str,
-                    version: str = '') -> Dict[str, Any]:
-        """Pull an installed package's APK, and its splits, to a local folder."""
-        return self.adb.extract_apk(device_id, package, destination, version)
-
-    def send_keyevent(self, device_id: str, keycode: int) -> bool:
-        """Send an Android keyevent to the device."""
-        return self.adb.send_keyevent(device_id, keycode)
-
-    def send_text(self, device_id: str, text: str) -> bool:
-        """Send text input to the device."""
-        return self.adb.send_text(device_id, text)
-
-    def set_clipboard_text(self, device_id: str, text: str) -> bool:
-        """Set device clipboard text."""
-        return self.adb.set_clipboard_text(device_id, text)
-
-    def rotate_display(self, device_id: str) -> int:
-        """Rotate screen orientation to the next 90-degree step."""
-        return self.adb.rotate_display(device_id)
-
-    def cleanup(self) -> None:
-        """Cleanup all resources."""
-        self.scrcpy.stop_all()
 
 
