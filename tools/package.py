@@ -66,7 +66,7 @@ def main():
     print()
 
     # ── Cleanup ──
-    cleanup(keep_dist=False)
+    cleanup(keep_dist=True)
 
     # ── Summary ──
     print()
