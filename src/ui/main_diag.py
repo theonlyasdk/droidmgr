@@ -19,7 +19,7 @@ class _DiagMixin:
     """_DiagMixin for MainWindow (see main_window.py)."""
 
     def _take_screenshot(self):
-        """Tools > Take Screenshot: one click, then a save dialog."""
+        """Device/Tools > Take Screenshot: capture with adb and open save dialog."""
         if not self._require_device():
             return
         take_screenshot(self.root, self.device_manager, self.selected_device,

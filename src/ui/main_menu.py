@@ -40,6 +40,7 @@ class _MenuMixin:
         device_menu.add_separator()
         device_menu.add_command(label="Start Mirroring", command=self._toggle_mirroring)
         self.mirror_menu_index = device_menu.index('end')
+        device_menu.add_command(label="Take Screenshot", command=self._take_screenshot)
         device_menu.add_separator()
         device_menu.add_command(label="Connect Wirelessly...", command=self._show_connect_wireless_dialog)
         device_menu.add_command(label="Disconnect Wireless Device", command=self._disconnect_wireless_device)

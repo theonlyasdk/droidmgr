@@ -42,6 +42,13 @@ def _existing_dir(configured: str, fallback: Path) -> str:
     for candidate in (configured, str(fallback)):
         if candidate and Path(candidate).is_dir():
             return candidate
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+        return str(fallback)
+    except OSError:
+        pass
+    if fallback.parent.is_dir():
+        return str(fallback.parent)
     return str(Path.home())
 
 
