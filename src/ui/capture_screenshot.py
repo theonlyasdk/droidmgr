@@ -58,8 +58,7 @@ def take_screenshot(root, device_manager, device_id, set_status, show_error, sho
     """Screenshot current screen with ADB and open save dialog remembering last location.
 
     Smart checks:
-    - If the screen is off (or black), alert the user and do not save a blank screen.
-    - If completely white, warn only and open save dialog.
+    - If the screenshot is completely black or white, ask the user for confirmation before saving.
     """
     if show_warning is None:
         def show_warning(msg):
@@ -77,29 +76,13 @@ def take_screenshot(root, device_manager, device_id, set_status, show_error, sho
             root.after(0, lambda: show_error("Screenshot Error", message))
             return
 
-        # Smart checks for screen off (black) and all-white edge case
+        # Smart checks for completely black or completely white screenshots
         color = detect_uniform_color(data)
-        screen_on = True
-        if color == 'black':
-            try:
-                if hasattr(device_manager, 'is_screen_on'):
-                    screen_on = device_manager.is_screen_on(device_id)
-            except Exception:
-                pass
 
         def on_captured():
             from tkinter import messagebox
 
-            if color == 'black' or not screen_on:
-                if not screen_on:
-                    show_error(
-                        "Screenshot Error",
-                        "The device screen is off (the screenshot is completely black).\n"
-                        "Please turn on the device screen and try again."
-                    )
-                    set_status("Screenshot failed: device screen is off")
-                    return
-                # Screen was reported on, but the captured image is solid black (e.g. DRM/FLAG_SECURE or dark app)
+            if color == 'black':
                 if not messagebox.askyesno(
                     "Black Screenshot",
                     "The captured screenshot is completely black (the screen may be off or showing protected content).\n\n"
@@ -107,12 +90,19 @@ def take_screenshot(root, device_manager, device_id, set_status, show_error, sho
                     parent=root,
                     default=messagebox.NO
                 ):
-                    set_status("Screenshot cancelled: black screenshot")
+                    set_status("Screenshot cancelled")
                     return
 
             elif color == 'white':
-                # Edge case: completely white (warn only)
-                show_warning("The captured screenshot is completely white (empty or blank screen).")
+                if not messagebox.askyesno(
+                    "White Screenshot",
+                    "The captured screenshot is completely white (empty or blank screen).\n\n"
+                    "Do you want to save it anyway?",
+                    parent=root,
+                    default=messagebox.NO
+                ):
+                    set_status("Screenshot cancelled")
+                    return
 
             _save_screenshot_dialog(root, data, set_status, show_error, show_info)
 
