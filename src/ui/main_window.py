@@ -232,6 +232,8 @@ class MainWindow(
         sel_state = tk.NORMAL if has_selection else tk.DISABLED
         
         self.mirror_btn.config(state=ready_state)
+        if hasattr(self, 'screenshot_btn'):
+            self.screenshot_btn.config(state=ready_state)
         
         if has_selection:
             is_mirroring = self.device_manager.scrcpy.is_mirroring(self.selected_device)

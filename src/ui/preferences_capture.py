@@ -32,6 +32,13 @@ class PreferencesCaptureMixin:
             ttk.Label(folders, text=f"Empty = {hint}", foreground="gray").grid(
                 row=row, column=3, sticky=tk.W, padx=(5, 0), pady=4)
 
+        self.screenshot_ask_var = tk.BooleanVar()
+        ttk.Checkbutton(
+            folders,
+            text="Ask every time where to save screenshot (confirm default location or choose another)",
+            variable=self.screenshot_ask_var,
+        ).grid(row=len(rows), column=0, columnspan=4, sticky=tk.W, pady=(6, 2))
+
         rec = ttk.LabelFrame(tab, text="Screen Recording Defaults", padding=10)
         rec.pack(fill=tk.X, padx=10, pady=10)
         rec.columnconfigure(1, weight=1)
@@ -62,6 +69,7 @@ class PreferencesCaptureMixin:
     def _load_capture_settings(self):
         get = self.config.get
         self.screenshot_dir_var.set(get('capture', 'screenshot_dir', '') or '')
+        self.screenshot_ask_var.set(get('capture', 'screenshot_ask_everytime', True))
         self.record_dir_var.set(get('capture', 'record_dir', '') or '')
         self.apk_dir_var.set(get('capture', 'apk_dir', '') or '')
         self.record_limit_var.set(str(get('capture', 'record_time_limit', 30)))
@@ -81,6 +89,7 @@ class PreferencesCaptureMixin:
                     parent=self.dialog)
                 return False
             self.config.set('capture', key, value)
+        self.config.set('capture', 'screenshot_ask_everytime', bool(self.screenshot_ask_var.get()))
         try:
             limit = max(1, min(180, int(self.record_limit_var.get().strip() or 30)))
         except (TypeError, ValueError):

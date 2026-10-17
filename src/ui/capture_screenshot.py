@@ -6,7 +6,7 @@ from tkinter import filedialog
 from typing import Optional
 from core import ConfigManager
 from .capture_utils import (
-    _default_dir, _existing_dir, _timestamp, remember_folder,
+    _default_dir, _existing_dir, _timestamp, _unique_path, remember_folder,
 )
 
 
@@ -59,6 +59,7 @@ def take_screenshot(root, device_manager, device_id, set_status, show_error, sho
 
     Smart checks:
     - If the screenshot is completely black or white, ask the user for confirmation before saving.
+    - If ask_everytime is enabled, ask if user wants to save to the default folder or choose another.
     """
     if show_warning is None:
         def show_warning(msg):
@@ -104,24 +105,76 @@ def take_screenshot(root, device_manager, device_id, set_status, show_error, sho
                     set_status("Screenshot cancelled")
                     return
 
-            _save_screenshot_dialog(root, data, set_status, show_error, show_info)
+            config = ConfigManager()
+            _handle_screenshot_save(root, data, config, set_status, show_error, show_info)
 
         root.after(0, on_captured)
 
     threading.Thread(target=task, daemon=True).start()
 
 
-def _save_screenshot_dialog(root, data, set_status, show_error, show_info) -> None:
-    config = ConfigManager()
-    initial_dir = _existing_dir(
+def _handle_screenshot_save(root, data: bytes, config: ConfigManager, set_status, show_error, show_info) -> None:
+    from tkinter import messagebox
+
+    dest_dir = Path(_existing_dir(
         config.get('capture', 'screenshot_dir', ''),
         _default_dir('screenshot'),
-    )
+    ))
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    ask_everytime = config.get('capture', 'screenshot_ask_everytime', True)
+    target_path = _unique_path(dest_dir, f"screenshot-{_timestamp()}", ".png")
+
+    if ask_everytime:
+        choice = messagebox.askyesnocancel(
+            "Save Screenshot",
+            f"Save screenshot here?\n\n{dest_dir}\n\n"
+            f"File: {target_path.name}\n\n"
+            f"• Yes: Save here\n"
+            f"• No: Choose another location\n"
+            f"• Cancel: Do not save",
+            parent=root,
+        )
+        if choice is None:
+            set_status("Screenshot cancelled")
+            return
+        if choice is False:
+            _save_screenshot_dialog(
+                root, data, config, set_status, show_error, show_info,
+                initial_dir=str(dest_dir), initial_file=target_path.name,
+            )
+            return
+
+    # Direct save when ask_everytime is False or user confirmed Yes
+    try:
+        target_path.write_bytes(data)
+    except OSError as exc:
+        show_error("Screenshot Error", f"Could not write the file:\n{exc}")
+        return
+
+    folder = str(target_path.parent)
+    config.set('capture', 'screenshot_dir', folder)
+    _on_screenshot_saved(root, str(target_path), config, set_status, show_info)
+
+
+def _save_screenshot_dialog(root, data: bytes, config: ConfigManager, set_status, show_error, show_info,
+                            initial_dir: Optional[str] = None, initial_file: Optional[str] = None) -> None:
+    if not initial_dir:
+        initial_dir = _existing_dir(
+            config.get('capture', 'screenshot_dir', ''),
+            _default_dir('screenshot'),
+        )
+    if not initial_file:
+        initial_file = f"screenshot-{_timestamp()}.png"
+
     path = filedialog.asksaveasfilename(
         parent=root,
         title="Save Screenshot",
         initialdir=initial_dir,
-        initialfile=f"screenshot-{_timestamp()}.png",
+        initialfile=initial_file,
         defaultextension=".png",
         filetypes=[("PNG image", "*.png"), ("All files", "*.*")],
     )

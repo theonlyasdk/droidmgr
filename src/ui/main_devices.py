@@ -68,6 +68,9 @@ class _DevicesTabMixin:
         self.mirror_btn = ttk.Button(btn_frame, text="Start Mirroring", command=self._toggle_mirroring)
         self.mirror_btn.pack(side=tk.LEFT, padx=2)
         
+        self.screenshot_btn = ttk.Button(btn_frame, text="Take Screenshot", command=self._take_screenshot)
+        self.screenshot_btn.pack(side=tk.LEFT, padx=2)
+        
         self.scrcpy_settings_btn = ttk.Button(btn_frame, text="scrcpy Settings", command=self._show_scrcpy_settings)
         self.scrcpy_settings_btn.pack(side=tk.LEFT, padx=2)
 
@@ -338,6 +341,10 @@ class _DevicesTabMixin:
         menu.add_command(
             label="Stop Mirroring" if is_mirroring else "Start Mirroring",
             command=self._toggle_mirroring
+        )
+        menu.add_command(
+            label="Take Screenshot",
+            command=self._take_screenshot
         )
         menu.add_separator()
         if ":" not in self.selected_device:

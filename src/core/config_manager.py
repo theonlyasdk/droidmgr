@@ -60,6 +60,7 @@ class ConfigManager:
             },
             'capture': {
                 'screenshot_dir': '',
+                'screenshot_ask_everytime': True,
                 'record_dir': '',
                 'apk_dir': '',
                 'record_time_limit': 30,
@@ -209,6 +210,8 @@ class ConfigManager:
         for key in ('screenshot_dir', 'record_dir', 'apk_dir', 'record_bit_rate', 'record_size'):
             if not isinstance(capture.get(key), str):
                 capture[key] = ''
+        if not isinstance(capture.get('screenshot_ask_everytime'), bool):
+            capture['screenshot_ask_everytime'] = True
         try:
             limit = capture.get('record_time_limit')
             if isinstance(limit, bool) or not isinstance(limit, (int, float)):
