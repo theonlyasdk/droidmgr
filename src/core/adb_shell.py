@@ -125,6 +125,36 @@ class _ShellMixin:
             )
         return data
 
+    def is_screen_on(self, device_id: str) -> bool:
+        """Check if the device screen is currently on / awake.
+
+        Inspects dumpsys power and display for wakefulness and display power states.
+        Returns True if awake or undetermined, False if asleep/dozing/off.
+        """
+        if not device_id or not device_id.strip():
+            return True
+        try:
+            ret, stdout, _ = self.run_shell_command(device_id, 'dumpsys power', timeout=5)
+            if ret == 0 and stdout:
+                if 'mWakefulness=Awake' in stdout or 'Display Power: state=ON' in stdout:
+                    return True
+                if 'mWakefulness=Asleep' in stdout or 'mWakefulness=Dozing' in stdout or 'Display Power: state=OFF' in stdout:
+                    return False
+        except Exception:
+            pass
+
+        try:
+            ret, stdout, _ = self.run_shell_command(device_id, 'dumpsys display', timeout=5)
+            if ret == 0 and stdout:
+                if 'mScreenState=ON' in stdout or 'state=ON' in stdout:
+                    return True
+                if 'mScreenState=OFF' in stdout or 'state=OFF' in stdout:
+                    return False
+        except Exception:
+            pass
+
+        return True
+
     def start_screenrecord(self, device_id: str, remote_path: str, time_limit: int = 180,
                            bit_rate: Optional[str] = None,
                            size: Optional[str] = None) -> subprocess.Popen:

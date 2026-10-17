@@ -23,7 +23,8 @@ class _DiagMixin:
         if not self._require_device():
             return
         take_screenshot(self.root, self.device_manager, self.selected_device,
-                        self._set_status, self._show_error, self._show_info)
+                        self._set_status, self._show_error, self._show_info,
+                        self._show_warning)
 
     def _record_screen(self):
         """Tools > Record Screen: parameter dialog, then record, pull and open."""

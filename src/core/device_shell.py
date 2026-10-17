@@ -44,6 +44,10 @@ class _DeviceShellMixin:
         """Capture the current screen as PNG bytes."""
         return self.adb.capture_screenshot(device_id)
 
+    def is_screen_on(self, device_id: str) -> bool:
+        """Check if the device screen is currently on."""
+        return self.adb.is_screen_on(device_id)
+
     def start_screenrecord(self, device_id: str, remote_path: str, time_limit: int = 180,
                            bit_rate: Optional[str] = None, size: Optional[str] = None):
         """Start `adb shell screenrecord`, writing the video to a device path."""
