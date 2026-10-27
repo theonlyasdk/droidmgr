@@ -43,7 +43,7 @@ class AboutDialog:
 
         tk.Label(
             main_frame,
-            text="Version 1.3.0",
+            text="Version 1.4.0",
             font=_light_font(12),
             fg='gray'
         ).pack()
