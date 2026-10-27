@@ -6,6 +6,7 @@ import posixpath
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, TYPE_CHECKING
@@ -58,12 +59,19 @@ class _IconsMixin:
         if not local_jar:
             return False
 
-        try:
-            self._run_command(['push', local_jar, '/data/local/tmp/droidmgr_icon.jar'], device_id, timeout=10)
-            self._icon_extractor_ready.add(device_id)
-            return True
-        except Exception:
-            return False
+        # Parallel icon workers must not interleave their pushes to the same
+        # remote path; re-check after waiting for the winner's push.
+        if not hasattr(self, '_icon_extractor_lock'):
+            self._icon_extractor_lock = threading.Lock()
+        with self._icon_extractor_lock:
+            if device_id in self._icon_extractor_ready:
+                return True
+            try:
+                self._run_command(['push', local_jar, '/data/local/tmp/droidmgr_icon.jar'], device_id, timeout=10)
+                self._icon_extractor_ready.add(device_id)
+                return True
+            except Exception:
+                return False
 
     def extract_app_icons_batch(
         self,

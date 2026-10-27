@@ -199,6 +199,12 @@ class AppInfoDialog(AppInspectionMixin, tk.Toplevel):
         self._build_component_view(self.srv_tab, 'srv')
         self._build_component_view(self.rec_tab, 'rec')
 
+        # The runtime state lives on the device, so it is its own tab, filled
+        # asynchronously next to the static APK inspection above.
+        self.runtime_tab = ttk.Frame(self.comp_notebook)
+        self.comp_notebook.add(self.runtime_tab, text="Runtime Permissions")
+        self._build_runtime_permissions_view()
+
     def _build_component_view(self, parent_frame, kind):
         top = ttk.Frame(parent_frame, padding=4)
         top.pack(fill=tk.X)
@@ -236,6 +242,139 @@ class AppInfoDialog(AppInspectionMixin, tk.Toplevel):
         btn_row.pack(fill=tk.X)
         ttk.Button(btn_row, text="Copy Selected", command=lambda: self._copy_selected_component(kind)).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_row, text="Copy All", command=lambda: self._copy_all_components(kind)).pack(side=tk.LEFT, padx=2)
+
+    def _build_runtime_permissions_view(self):
+        """The device-side runtime permission list with grant/revoke actions."""
+        top = ttk.Frame(self.runtime_tab, padding=4)
+        top.pack(fill=tk.X)
+
+        self.runtime_status_lbl = ttk.Label(
+            top, text="Loading device permissions...",
+            font=('Segoe UI', 9, 'italic'), foreground="#444444")
+        self.runtime_status_lbl.pack(side=tk.LEFT)
+
+        self.runtime_grant_btn = ttk.Button(top, text="Grant", width=9,
+                                            state=tk.DISABLED,
+                                            command=self._grant_selected_permission)
+        self.runtime_revoke_btn = ttk.Button(top, text="Revoke", width=9,
+                                             state=tk.DISABLED,
+                                             command=self._revoke_selected_permission)
+        ttk.Button(top, text="Refresh", width=9,
+                   command=self._reload_runtime_permissions).pack(side=tk.RIGHT,
+                                                                  padx=2)
+        self.runtime_revoke_btn.pack(side=tk.RIGHT, padx=2)
+        self.runtime_grant_btn.pack(side=tk.RIGHT, padx=2)
+
+        tree_frame = ttk.Frame(self.runtime_tab)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        self.runtime_tree = ttk.Treeview(tree_frame, columns=('perm', 'state'),
+                                         show='headings', selectmode='browse')
+        self.runtime_tree.heading('perm', text='Permission')
+        self.runtime_tree.heading('state', text='Granted')
+        self.runtime_tree.column('perm', stretch=True)
+        self.runtime_tree.column('state', width=110, anchor='center', stretch=False)
+        scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL,
+                               command=self.runtime_tree.yview)
+        self.runtime_tree.configure(yscrollcommand=scroll.set)
+        self.runtime_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.runtime_tree.tag_configure('granted', foreground='#2e7d32')
+        self.runtime_tree.tag_configure('not_granted', foreground='#616161')
+        self.runtime_tree.bind('<<TreeviewSelect>>', self._update_runtime_buttons)
+
+        if self.device_id and self.device_manager:
+            self._reload_runtime_permissions()
+        else:
+            self.runtime_status_lbl.config(
+                text="No device link. Runtime permissions need a device.")
+
+    def _reload_runtime_permissions(self):
+        if not (self.device_id and self.device_manager):
+            return
+        self.runtime_status_lbl.config(text="Loading device permissions...")
+        package = self.app_info.get('package', '')
+        device_manager = self.device_manager
+        device_id = self.device_id
+        win = self
+
+        def task():
+            try:
+                perms = device_manager.adb.get_runtime_permissions(device_id, package)
+            except Exception as e:
+                win.after(0, lambda: win._on_runtime_error(
+                    f"Could not read runtime permissions: {e}"))
+                return
+            win.after(0, lambda: win._fill_runtime_permissions(perms))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _fill_runtime_permissions(self, perms):
+        self._runtime_perms = perms
+        try:
+            self.comp_notebook.tab(self.runtime_tab,
+                                   text=f"Runtime Permissions ({len(perms)})")
+            for item in self.runtime_tree.get_children():
+                self.runtime_tree.delete(item)
+            for name in sorted(perms):
+                granted = perms[name]
+                self.runtime_tree.insert(
+                    '', tk.END, values=(name, 'yes' if granted else 'no'),
+                    tags=('granted',) if granted else ('not_granted',))
+            if perms:
+                self.runtime_status_lbl.config(
+                    text=f"{sum(perms.values())} of {len(perms)} granted")
+            else:
+                self.runtime_status_lbl.config(
+                    text="No runtime permissions requested.")
+            self._update_runtime_buttons()
+        except tk.TclError:
+            pass
+
+    def _update_runtime_buttons(self, event=None):
+        try:
+            selected = self.runtime_tree.selection()
+            state = tk.NORMAL if selected else tk.DISABLED
+            self.runtime_grant_btn.config(state=state)
+            self.runtime_revoke_btn.config(state=state)
+        except tk.TclError:
+            pass
+
+    def _set_runtime_permission(self, action):
+        """Run one grant/revoke on the device, then reload the list."""
+        package = self.app_info.get('package', '')
+        selected = self.runtime_tree.selection()
+        if not selected:
+            return
+        permission = self.runtime_tree.item(selected[0], 'values')[0]
+        device_manager = self.device_manager
+        device_id = self.device_id
+        win = self
+
+        def task():
+            try:
+                getattr(device_manager.adb, f'{action}_permission')(
+                    device_id, package, permission)
+            except Exception as e:
+                win.after(0, lambda: win._on_runtime_error(
+                    f"{action.title()} failed: {e}"))
+                return
+            win.after(0, win._reload_runtime_permissions)
+
+        self.runtime_status_lbl.config(
+            text=f"{action.title()}ting {permission}...")
+        threading.Thread(target=task, daemon=True).start()
+
+    def _grant_selected_permission(self):
+        self._set_runtime_permission('grant')
+
+    def _revoke_selected_permission(self):
+        self._set_runtime_permission('revoke')
+
+    def _on_runtime_error(self, message):
+        messagebox.showerror("Runtime Permission Error", message, parent=self)
+        self.runtime_status_lbl.config(text="Reload to retry.")
 
     def _copy_to_clip(self, text):
         if not text:

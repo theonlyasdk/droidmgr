@@ -170,7 +170,8 @@ class _AppsMixin:
 
         return info
 
-    def install_apk(self, device_id: str, apk_path: str) -> None:
+    def install_apk(self, device_id: str, apk_path: str,
+                    options: Optional[Dict[str, bool]] = None) -> None:
         path = Path(apk_path)
         if not path.exists():
             raise FileNotFoundError(f"APK file does not exist: {apk_path}")
@@ -182,34 +183,32 @@ class _AppsMixin:
             raise PermissionError(f"APK file is not readable: {apk_path}")
 
         AuditLogger.log(device_id, "INSTALL_APK", str(path))
-        output = self._run_command(['install', '-r', str(path)], device_id)
-        if "Failure" in output or "Success" not in output:
-            error_reason = output
-            match = re.search(r'Failure\s*\[(.*?)\]', output)
-            if match:
-                code = match.group(1)
-                friendly_messages = {
-                    'INSTALL_FAILED_ALREADY_EXISTS': 'Application with the same package name already exists.',
-                    'INSTALL_FAILED_INVALID_APK': 'The APK file is invalid or corrupted.',
-                    'INSTALL_FAILED_INSUFFICIENT_STORAGE': 'Device has insufficient storage space.',
-                    'INSTALL_FAILED_DUPLICATE_PACKAGE': 'Duplicate package name found on device.',
-                    'INSTALL_FAILED_NO_SHARED_USER': 'Shared user does not exist.',
-                    'INSTALL_FAILED_UPDATE_INCOMPATIBLE': 'Update is incompatible with currently installed version.',
-                    'INSTALL_FAILED_SHARED_USER_INCOMPATIBLE': 'Shared user signature mismatch.',
-                    'INSTALL_FAILED_MISSING_SHARED_LIBRARY': 'Required shared library is missing on device.',
-                    'INSTALL_FAILED_REPLACE_COULDNT_DELETE': 'Failed to replace existing installation.',
-                    'INSTALL_FAILED_DEXOPT': 'DEX optimization failed.',
-                    'INSTALL_FAILED_OLDER_SDK': 'APK requires a newer Android version (minSdk higher than device SDK).',
-                    'INSTALL_FAILED_CONFLICTING_PROVIDER': 'Conflicting content provider exists on device.',
-                    'INSTALL_FAILED_NEWER_SDK': 'APK requires an older Android version.',
-                    'INSTALL_FAILED_TEST_ONLY': 'APK is marked test-only.',
-                    'INSTALL_FAILED_CPU_ABI_INCOMPATIBLE': 'Native CPU architecture (ABI) is incompatible with device.',
-                    'INSTALL_PARSE_FAILED_INCONSISTENT_CERTIFICATES': 'Package certificates mismatch.',
-                    'INSTALL_FAILED_VERSION_DOWNGRADE': 'Cannot downgrade application to an older version code.'
-                }
-                explanation = friendly_messages.get(code, code)
-                error_reason = f"{code}: {explanation}"
-            raise RuntimeError(f"Installation failed: {error_reason}")
+        args = ['install'] + _install_flags(options) + [str(path)]
+        output = self._run_command(args, device_id)
+        _raise_install_failure(output)
+
+    def install_apk_set(self, device_id: str, apk_paths: List[str],
+                        options: Optional[Dict[str, bool]] = None) -> None:
+        """Install one app made of a base APK plus its splits, one command.
+
+        Split packages cannot go install-by-install: the device rejects a
+        base APK whose splits are missing. This hands every member of the
+        same app to a single `adb install-multiple`, base APK first.
+        """
+        paths = [Path(p) for p in apk_paths]
+        if not paths:
+            raise ValueError("No APK paths were given.")
+        for path in paths:
+            if not path.exists() or not path.is_file():
+                raise FileNotFoundError(f"APK file does not exist: {path}")
+            if not os.access(path, os.R_OK):
+                raise PermissionError(f"APK file is not readable: {path}")
+
+        names = ', '.join(path.name for path in paths)
+        AuditLogger.log(device_id, "INSTALL_APK", f"set of {len(paths)}: {names}")
+        args = ['install-multiple'] + _install_flags(options) + [str(path) for path in paths]
+        output = self._run_command(args, device_id)
+        _raise_install_failure(output)
 
     def get_apk_paths(self, device_id: str, package: str) -> List[Dict[str, str]]:
         """List the APK files behind an installed package using `pm path`.
@@ -290,11 +289,90 @@ class _AppsMixin:
                     members.append(entry['name'])
         return {'path': str(archive), 'members': members, 'is_split': True}
 
-    def uninstall_app(self, device_id: str, package: str) -> None:
-        """Uninstall an application from the device."""
+    def uninstall_app(self, device_id: str, package: str,
+                      keep_data: bool = False, all_users: bool = False) -> None:
+        """Uninstall an application, optionally keeping its data as well.
+
+        Args:
+            keep_data: `pm uninstall -k` - the app leaves the launcher and its
+                data plus cache stay on the device
+            all_users: `--user all` - remove the app for every device user,
+                not just the one adb talks to
+        """
         _validate_package(package)
+        args = ['shell', 'pm', 'uninstall']
+        if keep_data:
+            args.append('-k')
+        if all_users:
+            args.extend(['--user', 'all'])
+        args.append(package)
         AuditLogger.log(device_id, "UNINSTALL_APP", package)
-        self._run_command(['uninstall', package], device_id)
+        self._run_command(args, device_id)
+
+    def get_runtime_permissions(self, device_id: str, package: str) -> Dict[str, bool]:
+        """Runtime permissions reported by `dumpsys package`, name -> granted.
+
+        The same permission can appear once per device user block; a later
+        line replaces the earlier one, which keeps the last user's state.
+        """
+        _validate_package(package)
+        output = self._run_command(['shell', 'dumpsys', 'package', package], device_id)
+        perms: Dict[str, bool] = {}
+        pattern = re.compile(r'^([a-zA-Z][\w.]*): granted=(true|false)$')
+        for line in output.splitlines():
+            match = pattern.match(line.strip())
+            if match:
+                perms[match.group(1)] = match.group(2) == 'true'
+        return perms
+
+    def grant_permission(self, device_id: str, package: str, permission: str) -> None:
+        """Give one runtime permission to an app (`pm grant`)."""
+        _validate_package(package)
+        AuditLogger.log(device_id, "GRANT_PERMISSION", f"{package}: {permission}")
+        self._run_command(['shell', 'pm', 'grant', package, permission], device_id)
+
+    def revoke_permission(self, device_id: str, package: str, permission: str) -> None:
+        """Take one runtime permission away from an app (`pm revoke`)."""
+        _validate_package(package)
+        AuditLogger.log(device_id, "REVOKE_PERMISSION", f"{package}: {permission}")
+        self._run_command(['shell', 'pm', 'revoke', package, permission], device_id)
+
+    def grant_all_runtime_permissions(self, device_id: str, package: str) -> Dict[str, Any]:
+        """Try to grant every runtime permission the app requests, via root.
+
+        The shell user can only change runtime grants of an app it installed
+        itself; for the usual case this needs `su`, so failures carry the
+        device's own message.
+
+        Returns:
+            {'granted': [names], 'failed': {name: reason}, 'requested': [names]}
+        """
+        _validate_package(package)
+        output = self._run_command(['shell', 'dumpsys', 'package', package], device_id)
+
+        requested: List[str] = []
+        in_block = False
+        for line in output.splitlines():
+            text = line.strip()
+            if text.startswith('requested permissions:'):
+                in_block = True
+                continue
+            if in_block:
+                if not text or text.endswith('permissions:'):
+                    in_block = False
+                    continue
+                requested.append(text)
+
+        granted: List[str] = []
+        failed: Dict[str, str] = {}
+        for name in requested:
+            try:
+                self._run_command(['shell', 'su', '-c', f'pm grant {package} {name}'],
+                                  device_id)
+                granted.append(name)
+            except Exception as exc:
+                failed[name] = str(exc)
+        return {'granted': granted, 'failed': failed, 'requested': requested}
 
     def start_app(self, device_id: str, package: str) -> None:
         _validate_package(package)
@@ -364,3 +442,47 @@ _PACKAGE_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+$')
 def _validate_package(package: str) -> None:
     if not package or not _PACKAGE_RE.match(package):
         raise ValueError(f"Invalid package name: {package!r}")
+
+
+def _install_flags(options: Optional[Dict[str, bool]]) -> List[str]:
+    """The pm switches an install options dict describes; -r stays default."""
+    options = options or {}
+    flags = []
+    if options.get('replace', True):
+        flags.append('-r')
+    if options.get('allow_downgrade'):
+        flags.append('-d')
+    if options.get('test_only'):
+        flags.append('-t')
+    return flags
+
+
+def _raise_install_failure(output: str) -> None:
+    """Turn a pm-install output containing Failure into the friendly error."""
+    if "Failure" in output or "Success" not in output:
+        error_reason = output
+        match = re.search(r'Failure\s*\[(.*?)\]', output)
+        if match:
+            code = match.group(1)
+            friendly_messages = {
+                'INSTALL_FAILED_ALREADY_EXISTS': 'Application with the same package name already exists.',
+                'INSTALL_FAILED_INVALID_APK': 'The APK file is invalid or corrupted.',
+                'INSTALL_FAILED_INSUFFICIENT_STORAGE': 'Device has insufficient storage space.',
+                'INSTALL_FAILED_DUPLICATE_PACKAGE': 'Duplicate package name found on device.',
+                'INSTALL_FAILED_NO_SHARED_USER': 'Shared user does not exist.',
+                'INSTALL_FAILED_UPDATE_INCOMPATIBLE': 'Update is incompatible with currently installed version.',
+                'INSTALL_FAILED_SHARED_USER_INCOMPATIBLE': 'Shared user signature mismatch.',
+                'INSTALL_FAILED_MISSING_SHARED_LIBRARY': 'Required shared library is missing on device.',
+                'INSTALL_FAILED_REPLACE_COULDNT_DELETE': 'Failed to replace existing installation.',
+                'INSTALL_FAILED_DEXOPT': 'DEX optimization failed.',
+                'INSTALL_FAILED_OLDER_SDK': 'APK requires a newer Android version (minSdk higher than device SDK).',
+                'INSTALL_FAILED_CONFLICTING_PROVIDER': 'Conflicting content provider exists on device.',
+                'INSTALL_FAILED_NEWER_SDK': 'APK requires an older Android version.',
+                'INSTALL_FAILED_TEST_ONLY': 'APK is marked test-only.',
+                'INSTALL_FAILED_CPU_ABI_INCOMPATIBLE': 'Native CPU architecture (ABI) is incompatible with device.',
+                'INSTALL_PARSE_FAILED_INCONSISTENT_CERTIFICATES': 'Package certificates mismatch.',
+                'INSTALL_FAILED_VERSION_DOWNGRADE': 'Cannot downgrade application to an older version code.'
+            }
+            explanation = friendly_messages.get(code, code)
+            error_reason = f"{code}: {explanation}"
+        raise RuntimeError(f"Installation failed: {error_reason}")

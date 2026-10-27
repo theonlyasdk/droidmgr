@@ -31,6 +31,20 @@ class NetworkPollingMixin:
 
     def _clear_all(self):
         self.stop_polling()
+        if getattr(self, 'capture_toggle', None) is not None:
+            try:
+                self.capture_toggle.config(text='Start polling')
+            except Exception:
+                pass
+        # A fresh device starts a fresh capture.
+        self._cancel_filter_after()
+        self.display_filter_var.set('')
+        self.filter_status.set('')
+        self._filter_applied = ''
+        try:
+            self.display_filter_entry.config(background='#ffffff')
+        except Exception:
+            pass
         for var in self.wifi_vars.values():
             var.set('-')
         for var in self.cell_vars.values():
@@ -95,6 +109,16 @@ class NetworkPollingMixin:
             return
         interval = self.get_polling_interval_ms()
         self._poll_job = self.after(interval, self._poll_tick)
+
+    def toggle_capture(self):
+        """Wireshark-style capture switch for the periodic auto-refresh."""
+        if getattr(self, '_poll_job', None):
+            self.stop_polling()
+            self.capture_toggle.config(text='Start polling')
+            self.status_label.config(text='Polling paused')
+        else:
+            self.start_polling()
+            self.capture_toggle.config(text='Stop polling')
 
     def stop_polling(self):
         """Stop periodic auto-refresh."""

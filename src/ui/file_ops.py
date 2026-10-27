@@ -1,11 +1,20 @@
 """FileManager mixin: mutating operations and the context menu."""
 
+import hashlib
+import os
 import posixpath
+import re
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from .file_dialogs import FolderSelectorDialog
+
+# Small, likely-text files offered remote editing (pull/edit/watch/push round trip).
+_EDITABLE_EXTENSIONS = ('.txt', '.xml', '.json', '.log', '.ini', '.cfg',
+                        '.conf', '.md', '.properties')
+_EDIT_MAX_BYTES = 2 * 1024 * 1024
+_EDIT_POLL_MS = 3000
 
 
 class _FileOpsMixin:
@@ -335,6 +344,9 @@ class _FileOpsMixin:
         write_state = tk.NORMAL if (is_writable and has_selection) else tk.DISABLED
         upload_state = tk.NORMAL if is_writable else tk.DISABLED
 
+        selected_info = self._context_selection_info()
+        edit_state = tk.NORMAL if self._is_editable_file(selected_info) else tk.DISABLED
+
         menu.add_command(label="Download", command=self._download_file, state=download_state)
         menu.add_command(label="Upload", command=self._upload_file, state=upload_state)
         menu.add_command(label="New Folder", command=self._create_folder, state=upload_state)
@@ -342,10 +354,19 @@ class _FileOpsMixin:
 
         menu.add_separator()
 
+        menu.add_command(label="Edit...", command=self._edit_file, state=edit_state)
         menu.add_command(label="Rename", command=self._rename_file, state=write_state)
         menu.add_command(label="Copy To...", command=self._copy_file, state=download_state)
         menu.add_command(label="Move To...", command=self._move_file, state=write_state)
         menu.add_command(label="Delete", command=self._delete_file, state=write_state)
+
+        watch_key = None
+        if selected_info is not None and self.selected_device:
+            watch_key = (self.selected_device, selected_info.get('full_path'))
+        if watch_key in getattr(self, '_edit_watches', {}):
+            menu.add_command(
+                label=f"Stop Watching '{selected_info.get('name')}'",
+                command=lambda key=watch_key: self._stop_edit_watch(key))
 
         try:
             menu.tk_popup(x_root, y_root)
@@ -375,4 +396,153 @@ class _FileOpsMixin:
             self.frame.clipboard_clear()
             self.frame.clipboard_append(name)
             self._set_status(f"Copied filename: {name}")
+
+    # -- remote text-file editing (pull, watch, push back) -----------------------
+
+    def _context_selection_info(self):
+        """Info dict of the single selected row, else None."""
+        selection = self.file_tree.selection()
+        if len(selection) != 1:
+            return None
+        return self.files_data.get(selection[0])
+
+    def _is_editable_file(self, info):
+        """True for a regular file with a small, likely-text extension."""
+        if not info or info.get('is_dir'):
+            return False
+        name = (info.get('name') or '').lower()
+        return any(name.endswith(ext) for ext in _EDITABLE_EXTENSIONS)
+
+    def _edit_file(self):
+        if getattr(self, '_loading', False):
+            return
+        if not self._require_device():
+            return
+        info = self._context_selection_info()
+        name = (info.get('name') if info else '') or ''
+        if not self._is_editable_file(info):
+            messagebox.showinfo("Edit", f"'{name}' is not an editable text file type.")
+            return
+        raw = str(info.get('size_raw') or '')
+        if not raw.isdigit():
+            messagebox.showinfo(
+                "Edit",
+                f"The size of '{name}' could not be determined, so it was not opened for editing.")
+            return
+        if int(raw) > _EDIT_MAX_BYTES:
+            messagebox.showinfo(
+                "Edit",
+                f"'{name}' is too large to edit remotely (over 2 MB).\n\n"
+                "Download it and edit a local copy instead.")
+            return
+
+        remote_path = info.get('full_path') or (self.current_path.rstrip('/') + '/' + name)
+        key = (self.selected_device, remote_path)
+        digest = hashlib.sha1(
+            f"{self.selected_device}\0{remote_path}".encode('utf-8', 'replace')).hexdigest()[:12]
+        safe_name = re.sub(r'[^A-Za-z0-9._\-]', '_', name) or 'file'
+        local_dir = Path(self.config.get_cache_dir('remote_edit')) / digest
+        local_path = local_dir / safe_name
+        device_id = self.selected_device
+
+        def task():
+            try:
+                local_dir.mkdir(parents=True, exist_ok=True)
+                self.device_manager.download_file(device_id, remote_path, str(local_path))
+                stat = local_path.stat()
+                fingerprint = (stat.st_mtime_ns, stat.st_size)
+            except Exception as e:
+                msg = str(e)
+                self.frame.after(0, lambda: self._show_error("Edit Error", msg))
+                return
+
+            def open_editor():
+                old = self._edit_watches.get(key)
+                if old and old.get('after_id') is not None:
+                    try:
+                        self.frame.after_cancel(old['after_id'])
+                    except Exception:
+                        pass
+                watch = {'local_path': str(local_path), 'name': name,
+                         'remote_path': remote_path,
+                         'fingerprint': fingerprint, 'after_id': None}
+                self._edit_watches[key] = watch
+                try:
+                    os.startfile(str(local_path))
+                except OSError as e:
+                    self._edit_watches.pop(key, None)
+                    self._set_status(f"Could not open an editor for '{name}': {e}")
+                    return
+                watch['after_id'] = self.frame.after(
+                    _EDIT_POLL_MS, lambda: self._poll_edit_watch(key))
+                self._set_status(f"Watching '{name}' for edits ({remote_path})")
+            self.frame.after(0, open_editor)
+
+        self._set_status(f"Pulling '{name}' for editing...")
+        threading.Thread(target=task, daemon=True).start()
+
+    def _poll_edit_watch(self, key):
+        watch = self._edit_watches.get(key)
+        if watch is None:
+            return
+        try:
+            if not self.frame.winfo_exists():
+                return  # tab gone: stop silently
+        except Exception:
+            return
+        local_path = Path(watch['local_path'])
+        try:
+            stat = local_path.stat()
+        except OSError:
+            self._edit_watches.pop(key, None)
+            self._set_status(f"Stopped watching '{watch['name']}' (temp copy removed).")
+            return
+        fingerprint = (stat.st_mtime_ns, stat.st_size)
+        if fingerprint == watch['fingerprint']:
+            watch['after_id'] = self.frame.after(
+                _EDIT_POLL_MS, lambda: self._poll_edit_watch(key))
+            return
+
+        # Consume the change so the same edit is not offered twice.
+        watch['fingerprint'] = fingerprint
+        name = watch['name']
+        push_it = messagebox.askyesno(
+            "File Changed On Disk",
+            f"'{name}' was modified while editing.\n\n"
+            "Push the edited copy back to the device?")
+        if self._edit_watches.get(key) is not watch:
+            return  # canceled elsewhere meanwhile
+        if not push_it:
+            self._stop_edit_watch(key)
+            self._set_status(f"Stopped watching '{name}'.")
+            return
+
+        def push_back():
+            try:
+                self.device_manager.upload_file(key[0], str(local_path), key[1])
+                self.invalidate_cache()
+                self.frame.after(0, self.refresh)
+                self.frame.after(0, lambda: self._set_status(
+                    f"Pushed edited '{name}' back to {key[1]}"))
+            except Exception as e:
+                msg = str(e)
+                self.frame.after(0, lambda: self._show_error("Edit Push Error", msg))
+
+        self._set_status(f"Pushing edited '{name}'...")
+        threading.Thread(target=push_back, daemon=True).start()
+        watch['after_id'] = self.frame.after(
+            _EDIT_POLL_MS, lambda: self._poll_edit_watch(key))
+
+    def _stop_edit_watch(self, key):
+        """Cancel one watcher (user said no, or picked 'Stop Watching')."""
+        watch = self._edit_watches.pop(key, None)
+        if watch and watch.get('after_id') is not None:
+            try:
+                self.frame.after_cancel(watch['after_id'])
+            except Exception:
+                pass
+
+    def _cancel_all_edit_watches(self):
+        for key in list(getattr(self, '_edit_watches', {}) or {}):
+            self._stop_edit_watch(key)
 

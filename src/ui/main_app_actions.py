@@ -1,15 +1,100 @@
 """MainWindow mixin: per-app actions (start/stop/clear/uninstall/APK)."""
 
+import shutil
+import tempfile
 import threading
+import time
 import tkinter as tk
+import zipfile
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog
 from typing import Dict, List, Optional
-from .apk_extract import extract_apk
+from .apk_extract import extract_apk, extract_many
 from .app_info_dialog import AppInfoDialog
-from .apk_install_progress import APKInstallProgressDialog
+from .apk_install_options import APKInstallOptionsDialog
+from .apk_install_progress import APKInstallProgressDialog, format_elapsed
+from .uninstall_options import UninstallOptionsDialog
 from .main_utils import (_is_clear_denied, _CLEAR_DENIED_MESSAGE,
     _looks_like_system_package)
+
+
+def _extract_apk_container(container: Path, scratch: Path):
+    """Pull the .apk members of an .xapk/.apks bundle out to scratch.
+
+    The base APK is written first, so the resulting list is ready to hand to
+    `install-multiple` in the required order.
+    """
+    with zipfile.ZipFile(container) as bundle:
+        names = [name for name in bundle.namelist()
+                 if name.lower().endswith('.apk')]
+        if not names:
+            raise ValueError("The bundle contains no .apk files.")
+        ordered = sorted(names, key=lambda name: (
+            0 if Path(name).name.lower() == 'base.apk' else 1, name.lower()))
+        members = []
+        for name in ordered:
+            target = scratch / Path(name).name
+            with bundle.open(name) as source, open(target, 'wb') as sink:
+                shutil.copyfileobj(source, sink)
+            members.append(target)
+        return members
+
+
+def _group_plain_apks(plain):
+    """Chunk plain APKs into install sets plus singles.
+
+    A dropped base.apk next to split_*.apk files is one app: the group is
+    installed together with `install-multiple`. Everything else installs on
+    its own, exactly as before.
+    """
+    lower = {path: path.name.lower() for path in plain}
+    splits = [path for path in plain if lower[path].startswith('split_')]
+    if any(name == 'base.apk' for name in lower.values()) and splits:
+        ordered = sorted(plain, key=lambda path: (
+            0 if lower[path] == 'base.apk' else 1, lower[path]))
+        return [(ordered, True)]
+    return [([path], False) for path in plain]
+
+
+def _apk_package_name(apk_path: Path) -> str:
+    """The package an APK declares, read offline; '' when it cannot be read."""
+    try:
+        from core.apk_inspect import inspect_apk
+    except Exception:
+        return ''
+    try:
+        return inspect_apk(str(apk_path)).get('package') or ''
+    except Exception:
+        return ''
+
+
+def _grant_all_note(watcher, device_id: str, apk_path: Path) -> str:
+    """One report line for the grant-all outcome of an installed APK.
+
+    Runs on the background install thread; it only touches device_manager
+    and reads local files, never Tk.
+    """
+    package = _apk_package_name(apk_path)
+    if not package:
+        return (f"Grant-all skipped: the package name inside '{apk_path.name}' "
+                "could not be read from its manifest.")
+    try:
+        outcome = watcher.device_manager.adb.grant_all_runtime_permissions(
+            device_id, package)
+    except Exception as e:
+        return f"Grant-all on {package} failed: {e}"
+
+    granted_count = len(outcome['granted'])
+    failed = outcome['failed']
+    if not outcome['requested']:
+        return f"Grant-all: {package} requests no permissions."
+    if failed:
+        first_name = next(iter(failed))
+        return (f"Grant-all on {package}: {granted_count} of "
+                f"{len(outcome['requested'])} permissions granted; {len(failed)} "
+                f"failed, e.g. {first_name}: {failed[first_name]}")
+    return (f"Grant-all: all {granted_count} runtime permissions of {package} "
+            "granted (root).")
 
 
 class _AppActionsMixin:
@@ -140,8 +225,17 @@ class _AppActionsMixin:
 
         device_id = self.selected_device
 
+        options_dialog = UninstallOptionsDialog(self.root, packages)
+        self.root.wait_window(options_dialog)
+        options = options_dialog.result
+        if not options:
+            return
+        keep_data = options['keep_data']
+        all_users = options['all_users']
+
         if len(packages) > 1:
-            self._confirm_bulk_uninstall(packages)
+            if not self._confirm_bulk_uninstall(packages):
+                return
         else:
             if not self._confirm_single_uninstall(device_id, packages[0]):
                 return
@@ -150,24 +244,31 @@ class _AppActionsMixin:
                          f"application{'s' if len(packages) > 1 else ''}...")
 
         def task():
-            failed = []
+            failed = {}
             for package in packages:
                 try:
-                    self.device_manager.uninstall_app(device_id, package)
-                except Exception:
-                    failed.append(package)
+                    self.device_manager.uninstall_app(device_id, package,
+                                                      keep_data, all_users)
+                except Exception as e:
+                    failed[package] = str(e)
             self.root.after(0, self._refresh_apps)
+            suffix = ' (data kept)' if keep_data else ''
             if failed:
-                detail = '\n'.join(failed)
+                detail = '\n'.join(f"  - {pkg}: {msg}"
+                                   for pkg, msg in list(failed.items())[:10])
+                if len(failed) > 10:
+                    detail += f"\n  ... and {len(failed) - 10} more"
                 self.root.after(0, lambda: self._show_error(
                     "Uninstall Error",
-                    f"{len(failed)} of {len(packages)} could not be uninstalled:\n{detail}"))
+                    f"{len(failed)} of {len(packages)} could not be "
+                    f"uninstalled:\n{detail}"))
             elif len(packages) == 1:
                 self.root.after(0, lambda: messagebox.showinfo(
-                    "Success", f"Successfully uninstalled {packages[0]}"))
+                    "Success", f"Successfully uninstalled {packages[0]}{suffix}"))
             else:
                 self.root.after(0, lambda: messagebox.showinfo(
-                    "Success", f"Successfully uninstalled {len(packages)} applications"))
+                    "Success", f"Successfully uninstalled {len(packages)} "
+                               f"applications{suffix}"))
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -249,92 +350,171 @@ class _AppActionsMixin:
         return True
 
     def _install_apk(self):
-        """Ask for an APK file and install it."""
+        """Ask for APK files or an APK bundle and install them."""
         if not self._require_device():
             return
 
         apk_path = filedialog.askopenfilename(
-            title="Select APK file",
-            filetypes=[("APK files", "*.apk"), ("All files", "*.*")]
+            title="Select APK file or bundle",
+            filetypes=[("APK files", "*.apk *.xapk *.apks"),
+                       ("All files", "*.*")]
         )
 
         if apk_path:
             self._install_apk_paths([apk_path])
 
     def _install_apk_paths(self, paths):
-        """Install one or more APK files in turn, from the picker or a drop."""
+        """Install APKs from the picker or a drop; bundles are opened first.
+
+        Plain files install one by one, as before. An .xapk/.apks bundle, or
+        a base.apk dropped beside its split_*.apk files, is installed as one
+        set through `install-multiple`. Every gate waits for a click in a
+        dialog: the options-and-confirm window, one indeterminate progress
+        window, then the outcome with a copyable report.
+        """
         if not self._require_device():
             return
 
-        apks = [Path(p) for p in paths if Path(p).suffix.lower() == '.apk']
-        if not apks:
-            self._show_error("No APKs", "None of the selected files are .apk files.")
+        if getattr(self, '_apk_install_active', False):
+            self._show_warning(
+                "An APK installation is already running. Please wait for it to finish.")
             return
 
-        sizes = []
-        for path in apks:
+        raw = [Path(p) for p in paths]
+        plain = [path for path in raw if path.suffix.lower() == '.apk']
+        containers = [path for path in raw
+                      if path.suffix.lower() in ('.xapk', '.apks')]
+        if not plain and not containers:
+            self._show_error("No APKs",
+                             "None of the selected files are .apk, .xapk or .apks files.")
+            return
+
+        for path in plain:
             if not path.exists() or not path.is_file():
-                self._show_error("Invalid File", f"This file does not exist or is invalid:\n{path}")
-                return
-            sizes.append(path.stat().st_size / (1024 * 1024))
-
-        biggest_index = sizes.index(max(sizes))
-        if sizes[biggest_index] > 500:
-            msg = (
-                f"{apks[biggest_index].name} is very large ({sizes[biggest_index]:.1f} MB).\n\n"
-                "Installing large applications over ADB may take several minutes.\n\n"
-                "Do you want to proceed with the installation?"
-            )
-            if not messagebox.askyesno("Large File Warning", msg, icon=messagebox.WARNING):
+                self._show_error("Invalid File",
+                                 f"This file does not exist or is invalid:\n{path}")
                 return
 
-        total_mb = sum(sizes)
-        label = apks[0].name if len(apks) == 1 else f"{len(apks)} APKs"
-        progress_dialog = None
-        if total_mb > 50:
-            progress_dialog = APKInstallProgressDialog(self.root, label, total_mb)
+        install_sets = []
+        scratch = tempfile.TemporaryDirectory(prefix='droidmgr-apk-') if containers else None
+        try:
+            if scratch is not None:
+                scratch_path = Path(scratch.name)
+                for container in containers:
+                    try:
+                        members = _extract_apk_container(container, scratch_path)
+                    except Exception as e:
+                        raise ValueError(f"'{container.name}' could not be "
+                                         f"opened as an APK bundle:\n{e}")
+                    if not members:
+                        raise ValueError(f"'{container.name}' holds no APKs.")
+                    total_mb = sum(m.stat().st_size for m in members) / (1024 * 1024)
+                    install_sets.append({
+                        'label': f"{container.name} ({len(members)} APKs)",
+                        'paths': members,
+                        'is_set': True,
+                        'size_mb': total_mb,
+                    })
+        except Exception as e:
+            if scratch is not None:
+                scratch.cleanup()
+            self._show_error("Bad APK Bundle", str(e))
+            return
+
+        for group_paths, is_set in _group_plain_apks(plain):
+            total_mb = sum(path.stat().st_size for path in group_paths) / (1024 * 1024)
+            label = (f"{group_paths[0].name} (+{len(group_paths) - 1} splits)"
+                     if is_set else group_paths[0].name)
+            install_sets.append({
+                'label': label,
+                'paths': group_paths,
+                'is_set': is_set,
+                'size_mb': total_mb,
+            })
+
+        entries = [(item['label'], item['size_mb']) for item in install_sets]
+        biggest_mb = max(item['size_mb'] for item in install_sets)
+        big_note = ''
+        if biggest_mb > 500:
+            big_note = (f"Note: the largest file is {biggest_mb:.1f} MB. Installing "
+                        "large applications over ADB may take several minutes.")
+
+        dialog = APKInstallOptionsDialog(self.root, self.selected_device, entries,
+                                         big_note=big_note)
+        self.root.wait_window(dialog)
+        options = dialog.result
+        if not options:
+            if scratch is not None:
+                scratch.cleanup()
+            return
+
+        label = install_sets[0]['label'] if len(install_sets) == 1 \
+            else f"{len(install_sets)} install set(s)"
+        total_mb = sum(item['size_mb'] for item in install_sets)
+        progress_dialog = APKInstallProgressDialog(self.root, label, total_mb)
         device_id = self.selected_device
+        self._apk_install_active = True
+        self._apk_install_scratch = scratch
+        grant_all = options.get('grant_all')
 
         def task():
-            installed, failures = [], []
-            for path, size_mb in zip(apks, sizes):
+            installed, failures, notes = [], [], []
+            started = time.monotonic()
+            for item in install_sets:
+                label = item['label']
                 try:
-                    self.device_manager.adb.install_apk(device_id, str(path))
-                    installed.append(path.name)
+                    if item['is_set']:
+                        self.device_manager.adb.install_apk_set(
+                            device_id, [str(path) for path in item['paths']], options)
+                    else:
+                        self.device_manager.adb.install_apk(
+                            device_id, str(item['paths'][0]), options)
+                    installed.append(label)
+
+                    if grant_all:
+                        notes.append(_grant_all_note(
+                            self, device_id, item['paths'][0]))
                 except Exception as e:
-                    failures.append(f"{path.name}: {e}")
-            if progress_dialog:
-                self.root.after(0, progress_dialog.close)
-            self.root.after(0, lambda: self._on_apks_installed(installed, failures))
+                    failures.append(f"{label}: {e}")
+            elapsed = time.monotonic() - started
+            self.root.after(0, lambda: self._finish_apk_install(
+                progress_dialog, label, elapsed, installed, failures, notes))
 
         self._set_status(f"Installing {label}...")
         threading.Thread(target=task, daemon=True).start()
 
-    def _on_apks_installed(self, installed, failures):
-        """Report the outcome of a batch install."""
+    def _finish_apk_install(self, progress_dialog, label, elapsed, installed,
+                            failures, notes=None):
+        """Report the finished install in the install dialog and refresh the list."""
+        self._apk_install_active = False
+        scratch = getattr(self, '_apk_install_scratch', None)
+        self._apk_install_scratch = None
+        if scratch is not None:
+            scratch.cleanup()
+        progress_dialog.finish(elapsed, installed, failures, notes)
         if failures:
-            details = '\n'.join(failures)
-            if installed:
-                succeeded = '\n'.join(f'  {name}' for name in installed)
-                details = f"Installed:\n{succeeded}\n\nFailed:\n{details}"
-            self._show_error("Install APK Error", details)
-        elif len(installed) > 1:
-            names = '\n'.join(installed)
-            self._show_info(f"Installed {len(installed)} APKs:\n{names}")
+            self._set_status(f"Install Error: {len(failures)} of "
+                             f"{len(installed) + len(failures)} install(s) failed")
         else:
-            self._show_info("APK installed successfully")
+            self._set_status(f"Installed '{label}' in {format_elapsed(elapsed)}")
         self._refresh_apps()
 
     def _extract_apk(self):
-        """Applications > Extract APK: pull the selected package off the device."""
+        """Applications > Extract APK: pull the selected package(s) off the device."""
         if not self._require_device():
             return
-        package = self._get_selected_package()
-        if not package:
+        packages = self._get_selected_packages()
+        if not packages:
             self._show_warning("Please select an application first")
             return
-        extract_apk(self.root, self.device_manager, self.selected_device, package,
-                    self._set_status, self._show_error, self._show_info)
+        if len(packages) == 1:
+            extract_apk(self.root, self.device_manager, self.selected_device,
+                        packages[0], self._set_status, self._show_error,
+                        self._show_info)
+            return
+        extract_many(self.root, self.device_manager, self.selected_device,
+                     packages, self._set_status, self._show_error,
+                     self._show_info)
 
 
 

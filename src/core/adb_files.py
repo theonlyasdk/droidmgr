@@ -203,6 +203,95 @@ class _FilesMixin:
                 empty.add(line[2:])
         return empty
 
+    def get_dir_sizes(self, device_id: str, path: str) -> Dict[str, int]:
+        """Best-effort on-device `du -sk` for each subdirectory of path.
+
+        Returns a map name -> size in KB. Any failure (bad path, permission,
+        unparseable output) yields {} so callers can simply leave sizes blank.
+        """
+        query = (path.rstrip('/') or '/')
+        script = (
+            f'cd {self._sh_quote(query)} 2>/dev/null || exit 0; '
+            'for d in */ .*/; do '
+            'case "$d" in "./"|"../") continue;; esac; '
+            'du -sk -- "$d" 2>/dev/null; '
+            'done'
+        )
+        try:
+            output = self._run_command(['shell', script], device_id)
+        except Exception:
+            return {}
+        sizes = {}
+        for line in (output or '').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            size_str, sep, name = line.partition('\t')
+            if not sep:
+                # Fallback for devices that separate size and name with spaces.
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    size_str, name = parts
+                else:
+                    continue
+            if not size_str.strip().isdigit():
+                continue
+            name = name.strip()
+            while name.endswith('/'):
+                name = name[:-1]
+            if not name:
+                continue
+            sizes[name] = int(size_str.strip())
+        return sizes
+
+    def get_device_free_space(self, device_id: str, path: str = '/sdcard/') -> Optional[int]:
+        """Available bytes on the filesystem containing path, best-effort.
+
+        Returns KB or None when parsing fails; callers never need to error.
+        """
+        usage = self.get_storage_usage(device_id, path)
+        return usage['free'] if usage else None
+
+    def get_storage_usage(self, device_id: str,
+                          path: str = '/sdcard/') -> Optional[Dict[str, int]]:
+        """Total and free space on the filesystem containing path, best-effort.
+
+        Parses `df -k` without trusting exact headers ('Available' vs
+        'Avail'), picking the row with the most free space (overlays and
+        repeated mounts can differ). Returns KB values in {'total', 'free'},
+        or None when parsing fails; callers never need to error.
+        """
+        target = (path or '/sdcard/').rstrip('/') or '/'
+        try:
+            output = self._run_command(['shell', 'df', '-k', self._sh_quote(target)], device_id)
+        except Exception:
+            return None
+        best = None
+        for line in (output or '').splitlines():
+            parts = line.split()
+            if not parts or parts[0] == 'Filesystem':
+                continue
+            columns = None
+            for i, part in enumerate(parts):
+                # Data rows end the numeric columns with the use-percent field:
+                # Filesystem 1K-blocks Used Available Use% Mounted on
+                if part.endswith('%') and part[:-1].isdigit() and i > 0 and parts[i - 1].isdigit():
+                    window = parts[max(0, i - 3):i]
+                    if len(window) == 3 and all(col.isdigit() for col in window):
+                        columns = window
+                    break
+            if columns is None:
+                numerics = [p for p in parts[1:] if p.isdigit()]
+                if len(numerics) >= 3:
+                    columns = numerics[:3]
+                else:
+                    continue
+            free_kb = int(columns[2])
+            row = {'total': int(columns[0]), 'free': free_kb}
+            if best is None or free_kb > best['free']:
+                best = row
+        return best
+
     def download_file(self, device_id: str, remote_path: str, local_path: str) -> None:
         self._run_command(['pull', remote_path, local_path], device_id)
 

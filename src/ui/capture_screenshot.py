@@ -8,6 +8,7 @@ from core import ConfigManager
 from .capture_utils import (
     _default_dir, _existing_dir, _timestamp, _unique_path, remember_folder,
 )
+from .screenshot_gallery import register_screenshot
 
 
 def detect_uniform_color(png_bytes: bytes) -> Optional[str]:
@@ -106,14 +107,16 @@ def take_screenshot(root, device_manager, device_id, set_status, show_error, sho
                     return
 
             config = ConfigManager()
-            _handle_screenshot_save(root, data, config, set_status, show_error, show_info)
+            _handle_screenshot_save(root, data, config, set_status, show_error, show_info,
+                                    device_id)
 
         root.after(0, on_captured)
 
     threading.Thread(target=task, daemon=True).start()
 
 
-def _handle_screenshot_save(root, data: bytes, config: ConfigManager, set_status, show_error, show_info) -> None:
+def _handle_screenshot_save(root, data: bytes, config: ConfigManager, set_status, show_error, show_info,
+                            device_id: str = '') -> None:
     from tkinter import messagebox
 
     dest_dir = Path(_existing_dir(
@@ -145,6 +148,7 @@ def _handle_screenshot_save(root, data: bytes, config: ConfigManager, set_status
             _save_screenshot_dialog(
                 root, data, config, set_status, show_error, show_info,
                 initial_dir=str(dest_dir), initial_file=target_path.name,
+                device_id=device_id,
             )
             return
 
@@ -157,11 +161,12 @@ def _handle_screenshot_save(root, data: bytes, config: ConfigManager, set_status
 
     folder = str(target_path.parent)
     config.set('capture', 'screenshot_dir', folder)
-    _on_screenshot_saved(root, str(target_path), config, set_status, show_info)
+    _on_screenshot_saved(root, str(target_path), config, set_status, show_info, device_id)
 
 
 def _save_screenshot_dialog(root, data: bytes, config: ConfigManager, set_status, show_error, show_info,
-                            initial_dir: Optional[str] = None, initial_file: Optional[str] = None) -> None:
+                            initial_dir: Optional[str] = None, initial_file: Optional[str] = None,
+                            device_id: str = '') -> None:
     if not initial_dir:
         initial_dir = _existing_dir(
             config.get('capture', 'screenshot_dir', ''),
@@ -190,8 +195,10 @@ def _save_screenshot_dialog(root, data: bytes, config: ConfigManager, set_status
 
     folder = str(Path(path).parent)
     config.set('capture', 'screenshot_dir', folder)
-    _on_screenshot_saved(root, path, config, set_status, show_info)
+    _on_screenshot_saved(root, path, config, set_status, show_info, device_id)
 
 
-def _on_screenshot_saved(root, path, config, set_status, show_info) -> None:
+def _on_screenshot_saved(root, path, config, set_status, show_info, device_id: str = '') -> None:
+    # Every screenshot that reached disk joins this run's session gallery.
+    register_screenshot(path, device_id)
     remember_folder(root, config, 'screenshot_dir', 'Screenshot', path, set_status, show_info)

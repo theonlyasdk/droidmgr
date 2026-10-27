@@ -46,13 +46,8 @@ class _AppsTabMixin:
         self.app_count_label = ttk.Label(app_toolbar, text="", foreground="gray")
         self.app_count_label.pack(side=tk.LEFT, padx=4)
 
-        # Right-aligned view switcher and actions
-        self.refresh_apps_btn = ttk.Button(app_toolbar, text="Refresh", command=self._refresh_apps, width=8)
-        self.refresh_apps_btn.pack(side=tk.RIGHT, padx=(4, 0))
-
-        self.install_apk_btn = ttk.Button(app_toolbar, text="+ Install APK", command=self._install_apk)
-        self.install_apk_btn.pack(side=tk.RIGHT, padx=4)
-
+        # Right-aligned actions: the view switcher sits after the Install APK
+        # and Refresh buttons, the same far-right spot the Files nav bar uses.
         if not hasattr(self, 'app_view_mode_var') or self.app_view_mode_var is None:
             self.app_view_mode_var = tk.StringVar(
                 value=self.config.get('applications', 'view_mode', 'grid'))
@@ -65,6 +60,12 @@ class _AppsTabMixin:
             app_toolbar, text="Grid", variable=self.app_view_mode_var,
             value="grid", command=self._switch_app_view_mode)
         self.app_grid_mode_btn.pack(side=tk.RIGHT, padx=2)
+
+        self.refresh_apps_btn = ttk.Button(app_toolbar, text="Refresh", command=self._refresh_apps, width=8)
+        self.refresh_apps_btn.pack(side=tk.RIGHT, padx=4)
+
+        self.install_apk_btn = ttk.Button(app_toolbar, text="+ Install APK", command=self._install_apk)
+        self.install_apk_btn.pack(side=tk.RIGHT, padx=4)
 
         # Container for List and Grid views
         list_frame = ttk.LabelFrame(tab, text="Installed Applications")
@@ -110,6 +111,20 @@ class _AppsTabMixin:
             empty_text="No applications found",
         )
         self.app_grid.pack(fill=tk.BOTH, expand=True)
+
+        # 3. Loading state: an indeterminate bar that takes the place of both
+        #    views while the installed-app list is queried.
+        self._apps_loading_active = False
+        self.app_loading_frame = ttk.Frame(self.app_view_container)
+        loading_inner = ttk.Frame(self.app_loading_frame)
+        loading_inner.place(relx=0.5, rely=0.5, anchor='center')
+        self.app_loading_label = ttk.Label(
+            loading_inner, text="Loading installed applications...",
+            foreground='gray', anchor='center')
+        self.app_loading_label.pack(pady=(0, 8))
+        self.app_loading_bar = ttk.Progressbar(
+            loading_inner, mode='indeterminate', length=scale_size(220, self.root))
+        self.app_loading_bar.pack()
 
         # Show whichever view the View menu / toolbar currently selects.
         if self.app_view_mode_var.get() == "grid":
@@ -161,13 +176,46 @@ class _AppsTabMixin:
     def _switch_app_view_mode(self):
         mode = self.app_view_mode_var.get()
         self.config.set('applications', 'view_mode', mode)
+        if self._apps_loading_active:
+            # The loading bar owns the view area; the mode is applied when it ends.
+            return
+        self._pack_current_app_view()
         if mode == "grid":
+            self._render_app_grid()
+
+    # -- loading state (takes the place of the grid/list views) ---------
+
+    def _pack_current_app_view(self):
+        """Show whichever of grid/list the current view mode selects."""
+        if self.app_view_mode_var.get() == "grid":
             self.app_list_container.pack_forget()
             self.app_grid_container.pack(fill=tk.BOTH, expand=True)
-            self._render_app_grid()
         else:
             self.app_grid_container.pack_forget()
             self.app_list_container.pack(fill=tk.BOTH, expand=True)
+
+    def _show_apps_loading(self, text="Loading installed applications..."):
+        """Swap both views for an indeterminate bar until the data arrives."""
+        if not hasattr(self, 'app_loading_frame'):
+            return
+        self._apps_loading_active = True
+        self.app_loading_label.config(text=text)
+        self.app_list_container.pack_forget()
+        self.app_grid_container.pack_forget()
+        self.app_loading_frame.pack(fill=tk.BOTH, expand=True)
+        self.app_loading_bar.start(12)
+
+    def _hide_apps_loading(self):
+        """Restore the view the current mode selects; cheap if not loading."""
+        if not getattr(self, '_apps_loading_active', False):
+            return
+        self._apps_loading_active = False
+        try:
+            self.app_loading_bar.stop()
+        except Exception:
+            pass
+        self.app_loading_frame.pack_forget()
+        self._pack_current_app_view()
 
     def _switch_file_view_mode(self):
         if hasattr(self, 'file_manager'):

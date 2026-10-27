@@ -18,6 +18,7 @@ class _TabsMixin:
                 self.notebook.add(self.apps_tab, text="Applications")
                 self.notebook.add(self.files_tab, text="Files")
                 self.notebook.add(self.network_tab, text="Network")
+                self.notebook.add(self.console_tab, text="Console")
                 self.notebook.add(self.logcat_tab, text="Logcat")
                 self.notebook.add(self.shell_tab, text="Shell")
                 self.notebook.add(self.misc_tab, text="Developer Options")

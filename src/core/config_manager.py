@@ -11,6 +11,8 @@ DEFAULT_SHELL_PRESETS = [
 ]
 # Android's screenrecord refuses to record for longer than this.
 MAX_RECORD_SECONDS = 180
+# Console tab command history cap (newest first, deduped).
+MAX_HISTORY_ENTRIES = 25
 
 
 class ConfigManager:
@@ -57,6 +59,18 @@ class ConfigManager:
             },
             'shell': {
                 'presets': [dict(p) for p in DEFAULT_SHELL_PRESETS],
+            },
+            'forwards': {
+                'sets': [],
+            },
+            'console': {
+                'history': [],
+            },
+            'profiles': {
+                'setups': [],
+            },
+            'macros': {
+                'macros': [],
             },
             'capture': {
                 'screenshot_dir': '',
@@ -189,6 +203,98 @@ class ConfigManager:
             else:
                 print(f"Warning: Dropping malformed shell preset {item!r}.")
         shell['presets'] = cleaned
+
+        # Validate saved forward sets (list of {'name': str, 'rows': [...]})
+        forwards = self.settings.setdefault('forwards', {})
+        sets = forwards.get('sets')
+        if not isinstance(sets, list):
+            sets = []
+        cleaned_sets = []
+        for entry in sets:
+            if not isinstance(entry, dict):
+                print(f"Warning: Dropping malformed forward set {entry!r}.")
+                continue
+            name = entry.get('name')
+            if not isinstance(name, str) or not name.strip():
+                print(f"Warning: Dropping forward set with no name: {entry!r}.")
+                continue
+            rows = []
+            for item in entry.get('rows') or []:
+                if isinstance(item, dict):
+                    local = item.get('local')
+                    remote = item.get('remote')
+                    kind = item.get('type')
+                    if (isinstance(local, str) and isinstance(remote, str)
+                            and local.strip() and remote.strip()
+                            and kind in ('forward', 'reverse')):
+                        rows.append({'local': local.strip(),
+                                     'remote': remote.strip(),
+                                     'type': kind})
+                else:
+                    print(f"Warning: Dropping malformed forward rule {item!r} from set '{name}'.")
+            if rows:
+                cleaned_sets.append({'name': name.strip(), 'rows': rows})
+        forwards['sets'] = cleaned_sets
+
+        # Validate console command history (strings, newest first, deduped, capped)
+        console = self.settings.setdefault('console', {})
+        history = console.get('history')
+        if not isinstance(history, list):
+            history = []
+        console['history'] = list(dict.fromkeys(
+            c.strip() for c in history
+            if isinstance(c, str) and c.strip()
+        ))[:MAX_HISTORY_ENTRIES]
+
+        # Validate saved device setups (list of {'name': str, 'steps': [...]})
+        profiles = self.settings.setdefault('profiles', {})
+        setups = profiles.get('setups')
+        if not isinstance(setups, list):
+            setups = []
+        cleaned_setups = []
+        for entry in setups:
+            if not isinstance(entry, dict):
+                print(f"Warning: Dropping malformed device setup {entry!r}.")
+                continue
+            name = entry.get('name')
+            if not isinstance(name, str) or not name.strip():
+                print(f"Warning: Dropping device setup with no name: {entry!r}.")
+                continue
+            steps = []
+            for item in entry.get('steps') or []:
+                if (isinstance(item, dict)
+                        and isinstance(item.get('key'), str)
+                        and item['key'].strip()):
+                    step = {'key': item['key'].strip()}
+                    address = item.get('address')
+                    if isinstance(address, str) and address.strip():
+                        step['address'] = address.strip()
+                    steps.append(step)
+                else:
+                    print(f"Warning: Dropping malformed setup step {item!r} from '{name}'.")
+            if steps:
+                cleaned_setups.append({'name': name.strip(), 'steps': steps})
+        profiles['setups'] = cleaned_setups
+
+        # Validate saved macros (list of {'name': str, 'steps': [key, ...]})
+        macros = self.settings.setdefault('macros', {})
+        saved_macros = macros.get('macros')
+        if not isinstance(saved_macros, list):
+            saved_macros = []
+        cleaned_macros = []
+        for entry in saved_macros:
+            if not isinstance(entry, dict):
+                print(f"Warning: Dropping malformed macro {entry!r}.")
+                continue
+            name = entry.get('name')
+            if not isinstance(name, str) or not name.strip():
+                print(f"Warning: Dropping macro with no name: {entry!r}.")
+                continue
+            keys = [key.strip() for key in (entry.get('steps') or [])
+                    if isinstance(key, str) and key.strip()]
+            if keys:
+                cleaned_macros.append({'name': name.strip(), 'steps': keys})
+        macros['macros'] = cleaned_macros
 
         # Validate view modes (must be 'list' or 'grid')
         file_manager = self.settings.setdefault('file_manager', {})

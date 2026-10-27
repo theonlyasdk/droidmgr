@@ -1,11 +1,43 @@
 """ADBManager mixin: device enumeration, identity, power, fastboot, root."""
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-from .adb_base import ADBCommandError, ADBDeviceNotFoundError, FastbootNotFoundError
+from .adb_base import ADBCommandError, ADBDeviceNotFoundError, ADBError, FastbootNotFoundError
+from .audit_logger import AuditLogger
+
+# Boot/recovery/vendor_boot images all open with the Android boot-image magic.
+_BOOT_IMAGE_MAGIC = b'ANDROID!'
+
+# Partitions this tool offers to flash from the Device menu. fastboot routes
+# the bare name to the active slot on A/B devices on its own.
+_FLASHABLE_BOOT_PARTITIONS = frozenset({'recovery', 'boot'})
+
+# The platform-tools 'x.y.z' build number printed by the adb/fastboot
+# version commands. Only three-part numbers count, so the bare protocol
+# version ('Android Debug Bridge version 1.0.41') does not match.
+_TOOL_VERSION_RE = re.compile(r'\b\d+\.\d+\.\d+\b')
+
+
+class FastbootFlashError(ADBError):
+    """A fastboot flash failed a validation, or was rejected by the device.
+
+    The message gathers every problem found before or during the flash:
+    validations first, then the command line, then fastboot's own output.
+    """
+    pass
+
+
+def _image_has_boot_magic(path: Path) -> Optional[bool]:
+    """Whether a file starts with the boot-image magic; None when unreadable."""
+    try:
+        with open(path, 'rb') as fh:
+            return fh.read(len(_BOOT_IMAGE_MAGIC)) == _BOOT_IMAGE_MAGIC
+    except OSError:
+        return None
 
 
 class _DevicesMixin:
@@ -220,6 +252,43 @@ class _DevicesMixin:
             return []
         return _parse_fastboot_devices(stdout)
 
+    def get_tool_versions(self) -> Dict[str, Any]:
+        """The adb and fastboot build versions, read from the binaries.
+
+        adb answers 'Android Debug Bridge version 1.0.41' plus a
+        'Version 34.0.5-...' line; fastboot answers 'fastboot version
+        34.0.5-...'. Only the shared platform-tools 'x.y.z' is reported,
+        since that is the number both tools are supposed to match.
+
+        Each call runs its own short subprocess and remembers nothing, so
+        callers should ask rarely (once at startup, from a worker thread).
+
+        Returns:
+            {'adb': '<x.y.z>' or None, 'fastboot': '<x.y.z>' or None,
+             'adb_ok': bool, 'fastboot_ok': bool}. A tool that is missing,
+             could not run, or answered in an unexpected shape reads as None
+             with ok False.
+        """
+        versions: Dict[str, Any] = {'adb': None, 'fastboot': None,
+                                    'adb_ok': False, 'fastboot_ok': False}
+
+        try:
+            output = self._run_command(['version'], timeout=15)
+            versions['adb'] = _extract_tool_version(output)
+        except Exception:
+            versions['adb'] = None
+        versions['adb_ok'] = versions['adb'] is not None
+
+        if self._fastboot_executable():
+            try:
+                stdout, _ = self._run_fastboot(['--version'], timeout=15)
+                versions['fastboot'] = _extract_tool_version(stdout)
+            except (FastbootNotFoundError, ADBCommandError, OSError):
+                versions['fastboot'] = None
+        versions['fastboot_ok'] = versions['fastboot'] is not None
+
+        return versions
+
     def fastboot_reboot(self, device_id: str, timeout: Optional[int] = 30) -> str:
         """Restart a fastboot-mode device back into Android.
 
@@ -242,6 +311,306 @@ class _DevicesMixin:
         stdout, stderr = self._run_fastboot(['-s', device_id, 'reboot'],
                                             timeout=timeout, check=True)
         return stdout or stderr or f'{device_id} is rebooting'
+
+    def validate_flash_image(self, path: Optional[str],
+                             partition: str = 'recovery') -> List[str]:
+        """Collect everything that should stop a fastboot flash before it runs.
+
+        The UI calls this as soon as an image is chosen, so every reason not
+        to flash can be reported at once instead of one per attempt.
+
+        Returns:
+            List of problems, one per line; empty when every check passed
+        """
+        problems = []
+        if partition not in _FLASHABLE_BOOT_PARTITIONS:
+            problems.append(
+                f"Partition '{partition}' is not one this tool flashes to; "
+                "expected 'recovery' or 'boot'.")
+
+        fastboot = self._fastboot_executable()
+        if not fastboot:
+            problems.append(
+                "fastboot was not found. It ships in Android platform-tools "
+                "alongside adb; install platform-tools or put fastboot on PATH.")
+
+        if not path:
+            problems.append("No image file was chosen.")
+            return problems
+
+        image = Path(path)
+        try:
+            size = image.stat().st_size
+            if size <= 0:
+                problems.append("The image file is empty (0 bytes).")
+            magic = _image_has_boot_magic(image)
+            if magic is None:
+                problems.append("The image file could not be read (permissions?).")
+            elif not magic:
+                problems.append(
+                    "The image does not start with the Android boot-image magic "
+                    "('ANDROID!'), so it is not a recovery, boot or vendor_boot "
+                    "image. Verify where the file came from and download it again.")
+        except OSError as exc:
+            problems.append(f"The image file is not usable: {exc}")
+        return problems
+
+    def flash_fastboot_image(self, device_id: str, path: str,
+                             partition: str = 'recovery',
+                             timeout: Optional[int] = 120) -> str:
+        """Write an image to a partition of a device in fastboot mode.
+
+        The image and partition are validated first (the same checks
+        validate_flash_image reports), then the device must be visible to
+        fastboot, then the full `fastboot -s <serial> flash <partition> <image>`
+        command runs. fastboot is often silent on success, so an empty output
+        is replaced by this manager's own confirmation.
+
+        Returns:
+            fastboot's output, or a written-out confirmation when it is silent
+        """
+        problems = self.validate_flash_image(path, partition)
+        if problems:
+            raise FastbootFlashError(
+                f"'{path}' cannot be flashed:\n"
+                + "\n".join(f"  - {problem}" for problem in problems))
+
+        if not device_id or not device_id.strip():
+            raise ValueError("Device serial cannot be empty.")
+        self._require_fastboot()
+
+        known = self.get_fastboot_devices()
+        if device_id not in known:
+            raise ADBDeviceNotFoundError(
+                f"Device '{device_id}' is not in fastboot mode, so nothing can be "
+                f"flashed to it. fastboot currently sees: "
+                f"{', '.join(known) if known else 'no devices'}.")
+
+        executable = self._fastboot_executable()
+        image_path = str(Path(path))
+        command = [executable, '-s', device_id, 'flash', partition, image_path]
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True,
+                encoding='utf-8', errors='replace',
+                check=False, timeout=timeout
+            )
+        except FileNotFoundError as exc:
+            AuditLogger.log(device_id, "FASTBOOT_FLASH_FAILED", f"{partition} <- {path}")
+            raise FastbootFlashError(
+                f"fastboot executable '{executable}' could not be run: {exc}")
+        except subprocess.TimeoutExpired:
+            AuditLogger.log(device_id, "FASTBOOT_FLASH_FAILED", f"{partition} <- {path}")
+            raise FastbootFlashError(
+                f"fastboot timed out after {timeout} s while flashing '{image_path}' "
+                f"to '{partition}'. The device may still be busy; leave it in "
+                "fastboot mode, keep it plugged in, and try again.")
+
+        output = '\n'.join(part for part in (result.stdout.strip(), result.stderr.strip())
+                           if part)
+        if result.returncode != 0:
+            AuditLogger.log(device_id, "FASTBOOT_FLASH_FAILED", f"{partition} <- {path}")
+            raise FastbootFlashError(
+                f"fastboot rejected the flash (exit code {result.returncode}).\n"
+                f"Command: {' '.join(command)}\n"
+                f"--- fastboot output ---\n{output or '(no output)'}")
+
+        AuditLogger.log(device_id, "FASTBOOT_FLASH", f"{partition} <- {path}")
+        return output or (f"Flashed '{image_path}' to '{partition}' on '{device_id}'.")
+
+    def fastboot_getvar(self, device_id: str, variable: str,
+                        timeout: Optional[int] = 15) -> Optional[str]:
+        """Value of one fastboot variable ('getvar <name>'), or None.
+
+        fastboot answers on stderr, typically as '( bootloader) name: value'
+        with varying spacing of the prefix. The value word is returned when
+        the variable is reported; None when nothing readable came back, so
+        the caller warns instead of guessing.
+        """
+        self._require_fastboot()
+        stdout, stderr = self._run_fastboot(['-s', device_id, 'getvar', variable],
+                                            timeout=timeout)
+        return self._parse_getvar_value(f'{stdout}\n{stderr}', variable)
+
+    def fastboot_get_unlock_ability(self, device_id: str,
+                                    timeout: Optional[int] = 15) -> Optional[str]:
+        """Value of `fastboot flashing get_unlock_ability`, or None.
+
+        '1' means the bootloader can be unlocked from fastboot (OEM unlocking
+        has been used/enabled on the device); '0' means it cannot, which is
+        worth telling the user about before a flash.
+        """
+        self._require_fastboot()
+        stdout, stderr = self._run_fastboot(
+            ['-s', device_id, 'flashing', 'get_unlock_ability'], timeout=timeout)
+        return self._parse_getvar_value(f'{stdout}\n{stderr}', 'get_unlock_ability')
+
+    def fastboot_unlocked(self, device_id: str,
+                          timeout: Optional[int] = 15) -> Optional[bool]:
+        """Whether the device reports an unlocked bootloader (getvar unlocked)."""
+        value = self.fastboot_getvar(device_id, 'unlocked', timeout=timeout)
+        if value in ('yes', 'true', '1'):
+            return True
+        if value in ('no', 'false', '0'):
+            return False
+        return None
+
+    @staticmethod
+    def _parse_getvar_value(text: str, variable: str) -> Optional[str]:
+        """Pull '<variable>: value' out of getvar-style output, case-blind."""
+        needle = f'{variable.lower()}:'
+        for line in text.splitlines():
+            cleaned = line.lower().replace('(bootloader)', ' ')
+            cleaned = cleaned.replace('( bootloader)', ' ').strip()
+            if cleaned.startswith(needle):
+                value = cleaned[len(needle):].strip()
+                return value or None
+        return None
+
+    def fastboot_boot(self, device_id: str, image_path: str,
+                      timeout: Optional[int] = 120) -> str:
+        """Boot a trigger image once from fastboot mode, writing nothing.
+
+        `fastboot boot <img>` runs a boot image from memory — useful to test
+        a recovery before committing it to a partition.
+
+        Returns:
+            fastboot's output, or a written-out confirmation when it is silent
+        """
+        if not device_id or not device_id.strip():
+            raise ValueError("Device serial cannot be empty.")
+        self._require_fastboot()
+
+        image = Path(image_path)
+        if not image.exists() or not image.is_file():
+            raise FastbootFlashError(f"Image file does not exist: {image_path}")
+        if not _image_has_boot_magic(image):
+            raise FastbootFlashError(
+                f"'{image_path}' does not start with the Android boot-image magic "
+                "('ANDROID!'), so it cannot be booted.")
+
+        known = self.get_fastboot_devices(timeout=timeout)
+        if device_id not in known:
+            raise ADBDeviceNotFoundError(
+                f"Device '{device_id}' is not in fastboot mode, so an image cannot "
+                f"be booted from there. fastboot currently sees: "
+                f"{', '.join(known) if known else 'no devices'}.")
+
+        executable = self._fastboot_executable()
+        command = [executable, '-s', device_id, 'boot', str(image)]
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True,
+                encoding='utf-8', errors='replace',
+                check=False, timeout=timeout
+            )
+        except FileNotFoundError as exc:
+            raise FastbootFlashError(
+                f"fastboot executable '{executable}' could not be run: {exc}")
+        except subprocess.TimeoutExpired:
+            raise FastbootFlashError(
+                f"fastboot timed out after {timeout} s booting '{image_path}'. "
+                "The device may already have started the image; look at its screen.")
+
+        output = '\n'.join(part for part in (result.stdout.strip(), result.stderr.strip())
+                           if part)
+        text_upper = output.upper()
+        started = 'OKAY' in text_upper or 'BOOTING' in text_upper
+        if result.returncode != 0 and not started:
+            raise FastbootFlashError(
+                f"fastboot rejected the boot (exit code {result.returncode}).\n"
+                f"Command: {' '.join(command)}\n"
+                f"--- fastboot output ---\n{output or '(no output)'}")
+
+        AuditLogger.log(device_id, "FASTBOOT_BOOT", str(image))
+        return output or f"Booted '{image_path}' on '{device_id}' (nothing was written)."
+
+    def validate_sideload_package(self, path: Optional[str]) -> List[str]:
+        """Reasons not to sideload the OTA package yet, one per line.
+
+        The device applies the package in one shot, so only cheap local
+        checks run here: existence and the zip magic of an OTA package.
+        """
+        problems = []
+        if not path:
+            problems.append("No update package was chosen.")
+            return problems
+        package = Path(path)
+        try:
+            size = package.stat().st_size
+            if size <= 0:
+                problems.append("The package file is empty (0 bytes).")
+            with open(package, 'rb') as fh:
+                magic = fh.read(4)
+            if magic != b'PK\x03\x04':
+                problems.append(
+                    "The package is not a zip archive, so it is not an OTA "
+                    "update package; OTA packages are signed zips.")
+        except OSError as exc:
+            problems.append(f"The package file is not usable: {exc}")
+        return problems
+
+    def sideload_package(self, device_id: str, zip_path: str,
+                         progress_cb=None) -> str:
+        """Apply an OTA zip with `adb sideload`, streaming the percentage.
+
+        adb prints '[ 37%]-...'-style lines while transferring; every
+        percentage goes through progress_cb(percent). The callback (if given)
+        runs on this thread, which is normally a worker thread. There is no
+        timeout by design: a big package is minutes of streaming and only a
+        device-side error ends it.
+
+        Returns:
+            adb's collected console with the final transfer stats
+        """
+        package = Path(zip_path)
+        if not package.exists() or not package.is_file():
+            raise FileNotFoundError(f"Update package does not exist: {zip_path}")
+        AuditLogger.log(device_id, "ADB_SIDELOAD", str(package))
+
+        command = [self.adb_path, '-s', device_id, 'sideload', str(package)]
+        try:
+            proc = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding='utf-8', errors='replace')
+        except FileNotFoundError as exc:
+            AuditLogger.log(device_id, "ADB_SIDELOAD_FAILED", f"{package} ({exc})")
+            raise ADBError(f"adb executable '{self.adb_path}' could not be run: {exc}")
+
+        collected: List[str] = []
+        percent = 0
+        try:
+            for line in proc.stdout:
+                _line = line.rstrip()
+                if not _line:
+                    continue
+                collected.append(_line)
+                if len(collected) > 120:
+                    collected = collected[-120:]
+                match = re.search(r'\[\s*(\d+)%', _line)
+                if match:
+                    percent = int(match.group(1))
+                    if progress_cb:
+                        try:
+                            progress_cb(percent)
+                        except Exception:
+                            pass
+            proc.wait()
+        except Exception:
+            proc.kill()
+            proc.wait()
+            AuditLogger.log(device_id, "ADB_SIDELOAD_FAILED", str(package))
+            raise
+
+        output = '\n'.join(collected)
+        if proc.returncode != 0:
+            AuditLogger.log(device_id, "ADB_SIDELOAD_FAILED",
+                            f"{package} (exit {proc.returncode})")
+            raise ADBCommandError(
+                f"adb sideload failed (exit code {proc.returncode}); the update "
+                "was not applied.\n"
+                f"--- adb output ---\n{output or '(no output)'}")
+        return output or 'The package was applied.'
 
     def shutdown_device(self, device_id: str) -> str:
         """Power a device off.
@@ -317,4 +686,21 @@ def _parse_fastboot_devices(output: str) -> List[str]:
         if fields:
             serials.append(fields[0])
     return serials
+
+
+def _extract_tool_version(output: str) -> Optional[str]:
+    """The platform-tools 'x.y.z' inside an adb/fastboot version banner.
+
+    adb also reports the USB protocol version ('Android Debug Bridge version
+    1.0.41'), which is not the build number wanted here, so only lines that
+    start with the tool's own version banner are considered. None means the
+    expected line was missing or carried no three-part number.
+    """
+    for line in output.splitlines():
+        cleaned = line.strip().lower()
+        if cleaned.startswith(('version ', 'fastboot version')):
+            match = _TOOL_VERSION_RE.search(cleaned)
+            if match:
+                return match.group(0)
+    return None
 

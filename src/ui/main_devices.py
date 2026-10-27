@@ -76,7 +76,25 @@ class _DevicesTabMixin:
 
         self.connect_wireless_btn = ttk.Button(btn_frame, text="Connect Wirelessly...", command=self._show_connect_wireless_dialog)
         self.connect_wireless_btn.pack(side=tk.LEFT, padx=2)
-        
+
+        # Tool version banner and 'Getting started' card sit above the device
+        # list; both are packed from the refresh path only when they change.
+        warning_style = ttk.Style(self.root)
+        warning_style.configure('Warning.TFrame', background='#FFF3CD')
+        warning_style.configure('Warning.TLabel', background='#FFF3CD',
+                                foreground='#856404')
+
+        self._device_list_frame = list_frame
+        self._version_banner_frame = None
+        self._tool_versions = None
+        self._tool_version_check_started = False
+        self._tool_banner_dismissed = False
+        self._checklist_signature = ()
+        self._checklist_visible = False
+        self._last_seen_devices = None
+
+        self.checklist_frame = ttk.LabelFrame(tab, text="Getting started")
+
         return tab
 
     def _schedule_device_poll(self):
@@ -120,6 +138,9 @@ class _DevicesTabMixin:
         self._device_refresh_in_progress = True
 
         def bg_query():
+            # The once-per-session adb/fastboot version check runs in its own
+            # worker off this refresh, so it never blocks the device query.
+            self._start_tool_version_check()
             try:
                 devices = self.device_manager.get_devices()
                 fastboot_devices = self._add_fastboot_devices(devices)
@@ -145,6 +166,10 @@ class _DevicesTabMixin:
         if getattr(self, '_closing', False):
             return
 
+        # What the last refresh knew, for the checklist card and the
+        # once-per-session tool version check above it.
+        self._last_seen_devices = list(devices or [])
+
         try:
             if error is not None:
                 self.has_devices = False
@@ -152,6 +177,7 @@ class _DevicesTabMixin:
                 self.logcat_view.set_device(None)
                 self._update_tab_visibility()
                 self._set_status(f"Device refresh error: {error}")
+                self._update_setup_checklist()
                 return
 
             self._fastboot_devices = fastboot_devices
@@ -222,6 +248,7 @@ class _DevicesTabMixin:
                     self.device_tree.insert('', tk.END, text=str(idx), values=row)
 
             self._set_status(f"Found {len(devices)} device(s)")
+            self._update_setup_checklist()
 
             children = self.device_tree.get_children()
             device_ids = [d['id'] for d in devices]
@@ -267,6 +294,186 @@ class _DevicesTabMixin:
                 self.root.after(50, self._refresh_devices)
             else:
                 self._schedule_device_poll()
+
+    # ---- Tool version guard banner --------------------------------------
+
+    def _start_tool_version_check(self):
+        """Run the one-off adb/fastboot version check in a worker thread.
+
+        Started once per session from the first device refresh; the result is
+        stored on the window and used by the banner and the checklist card.
+        """
+        if self._tool_version_check_started:
+            return
+        self._tool_version_check_started = True
+
+        def task():
+            versions = None
+            try:
+                versions = self.device_manager.get_tool_versions()
+            except Exception:
+                versions = None
+            try:
+                if not getattr(self, '_closing', False):
+                    self.root.after(0, lambda: self._apply_tool_versions(versions))
+            except Exception:
+                pass
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _apply_tool_versions(self, versions):
+        """Store the version check's answer and decide whether the banner shows.
+
+        Only evaluated once: if the banner does not apply, later refreshes say
+        nothing (silence is success); if the user dismisses it with ✕, it stays
+        hidden for the rest of the session.
+        """
+        self._tool_versions = versions if isinstance(versions, dict) else {}
+        self._update_setup_checklist()
+
+        if getattr(self, '_tool_banner_dismissed', False):
+            return
+
+        versions = self._tool_versions
+        adb_version = versions.get('adb') or None
+        fastboot_version = versions.get('fastboot') or None
+        adb_ok = bool(versions.get('adb_ok'))
+        fastboot_ok = bool(versions.get('fastboot_ok'))
+
+        text = None
+        if adb_ok and fastboot_ok:
+            adb_major_minor = self._tool_major_minor(adb_version)
+            fastboot_major_minor = self._tool_major_minor(fastboot_version)
+            if (adb_major_minor and fastboot_major_minor
+                    and adb_major_minor != fastboot_major_minor):
+                text = (f"adb and fastboot builds differ (adb {adb_version}, "
+                        f"fastboot {fastboot_version}): reinstall platform-tools "
+                        "so both tools come from the same bundle.")
+        elif adb_ok and not fastboot_ok:
+            text = (f"fastboot executable not found / not runnable — flashing and "
+                    f"fastboot device listing will not work (adb {adb_version}, "
+                    "fastboot not readable).")
+
+        if text:
+            self._show_version_banner(text)
+
+    @staticmethod
+    def _tool_major_minor(version):
+        """(major, minor) of an 'x.y.z' tool version, None when oddly shaped."""
+        try:
+            parts = str(version).split('.')
+            return int(parts[0]), int(parts[1])
+        except (ValueError, IndexError, AttributeError):
+            return None
+
+    def _show_version_banner(self, text):
+        """Create or update the warning banner and pack it above the list."""
+        if self._version_banner_frame is None:
+            frame = ttk.Frame(self._device_list_frame.master,
+                              style='Warning.TFrame')
+            label = ttk.Label(
+                frame,
+                style='Warning.TLabel',
+                text=text,
+                anchor='w', justify=tk.LEFT,
+                wraplength=scale_size(720, self.root))
+            close_btn = ttk.Button(
+                frame, text='✕', width=3,
+                command=self._dismiss_version_banner)
+            close_btn.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 4), pady=2)
+            label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
+                       padx=(8, 4), pady=2)
+            self._version_banner_frame = frame
+            self._version_banner_label = label
+        else:
+            self._version_banner_label.config(text=text)
+
+        anchor = self.checklist_frame if self._checklist_visible \
+            else self._device_list_frame
+        self._version_banner_frame.pack(fill=tk.X, pady=0, before=anchor)
+
+    def _dismiss_version_banner(self):
+        """Hide the version banner; it stays hidden for the rest of the session."""
+        self._tool_banner_dismissed = True
+        if self._version_banner_frame is not None:
+            self._version_banner_frame.pack_forget()
+
+    # ---- 'Getting started' checklist card --------------------------------
+
+    def _update_setup_checklist(self):
+        """Rebuild the 'Getting started' card from the last refresh's data.
+
+        Every row comes from state the refresh already collected (the device
+        list with its statuses, and the one-off tool version check); nothing
+        here queries a device. The card is packed only while it has rows, so
+        "all fine" carries no empty space, and identical row sets rebuild
+        nothing.
+        """
+        if getattr(self, '_closing', False):
+            return
+
+        rows = []  # (text, button text or None, action or None)
+
+        versions = getattr(self, '_tool_versions', None) or {}
+        if versions and not versions.get('adb_ok'):
+            rows.append(("adb was not found so the app cannot reach any device.",
+                         "Locate adb...", self._show_preferences))
+
+        devices = getattr(self, '_last_seen_devices', None)
+        if devices is not None and not devices:
+            rows.append(("No devices visible yet: plug the phone over USB, enable "
+                         "USB debugging, and tap Trust/Allow on its screen.",
+                         "Refresh", self._refresh_devices))
+
+        by_status = {}
+        for device in devices or []:
+            status = (device.get('status') or '').lower()
+            if status and status != 'device':
+                by_status.setdefault(status, []).append(device)
+        for status in sorted(by_status):
+            count = len(by_status[status])
+            subject = f"{count} devices sit" if count > 1 else "a device sits"
+            rows.append((f"{subject} in '{status}' state — "
+                         f"{self._status_hint(status)}", None, None))
+
+        signature = tuple((row[0], row[1]) for row in rows)
+        if signature == getattr(self, '_checklist_signature', None):
+            return  # same rows as before; no rebuild, no reflow
+        self._checklist_signature = signature
+        self._rebuild_checklist(rows)
+
+    @staticmethod
+    def _status_hint(status: str) -> str:
+        """The advice shown for a device sitting in a given state."""
+        if status == 'unauthorized':
+            return "approve the RSA / USB debugging prompt on its screen"
+        if status == 'offline':
+            return "replug the cable or use Device menu > Reconnect ADB"
+        if status == 'fastboot':
+            return "it is in fastboot mode by choice; Device menu > " \
+                   "Reboot from fastboot brings it back"
+        return "replug the cable; details are in the status bar"
+
+    def _rebuild_checklist(self, rows):
+        """Replace the card's rows and pack the card only when it has any."""
+        card = self.checklist_frame
+        for child in card.winfo_children():
+            child.destroy()
+        for text, button_text, action in rows:
+            row = ttk.Frame(card)
+            row.pack(fill=tk.X, padx=8, pady=3)
+            label = ttk.Label(row, text=text, anchor='w', justify=tk.LEFT,
+                              wraplength=scale_size(700, self.root))
+            label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            if button_text:
+                ttk.Button(row, text=button_text, command=action,
+                           width=12).pack(side=tk.RIGHT, padx=(8, 0), pady=1)
+        if rows:
+            card.pack(fill=tk.X, padx=5, pady=0,
+                      before=self._device_list_frame)
+        else:
+            card.pack_forget()
+        self._checklist_visible = bool(rows)
 
     def _on_device_select(self, event):
         selection = self.device_tree.selection()

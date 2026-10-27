@@ -165,9 +165,10 @@ class DeviceManager(_DeviceFilesMixin, _DeviceDiagMixin, _DeviceNetMixin,
         """
         self.adb.clear_app_data(device_id, package)
         
-    def uninstall_app(self, device_id: str, package: str) -> None:
-        """Uninstall an application from a device."""
-        self.adb.uninstall_app(device_id, package)
+    def uninstall_app(self, device_id: str, package: str,
+                      keep_data: bool = False, all_users: bool = False) -> None:
+        """Uninstall an app, optionally keeping its data or removing all users."""
+        self.adb.uninstall_app(device_id, package, keep_data, all_users)
 
     def get_installed_apps_details(self, device_id: str) -> List[Dict[str, Any]]:
         """Get detailed list of installed applications."""
@@ -189,6 +190,16 @@ class DeviceManager(_DeviceFilesMixin, _DeviceDiagMixin, _DeviceNetMixin,
         """
         return self.adb.get_fastboot_devices()
 
+    def get_tool_versions(self) -> Dict[str, Any]:
+        """The adb and fastboot build versions read from the binaries.
+
+        Returns:
+            {'adb': '<x.y.z>' or None, 'fastboot': '<x.y.z>' or None,
+             'adb_ok': bool, 'fastboot_ok': bool}; see ADBManager
+             for the exact meaning of each field.
+        """
+        return self.adb.get_tool_versions()
+
     def fastboot_reboot(self, device_id: str) -> str:
         """Restart a fastboot-mode device back into Android.
         
@@ -200,6 +211,79 @@ class DeviceManager(_DeviceFilesMixin, _DeviceDiagMixin, _DeviceNetMixin,
         """
         return self.adb.fastboot_reboot(device_id)
 
+    def validate_flash_image(self, path: Optional[str],
+                             partition: str = 'recovery') -> List[str]:
+        """Reasons not to flash the image yet (fastboot missing, bad file...).
+
+        Returns:
+            List of problems, one per line; empty when every check passed
+        """
+        return self.adb.validate_flash_image(path, partition)
+
+    def flash_fastboot_image(self, device_id: str, path: str,
+                             partition: str = 'recovery',
+                             timeout: Optional[int] = 120) -> str:
+        """Flash an image to a partition of a device in fastboot mode.
+
+        Args:
+            device_id: Device serial
+            path: Path to the image file on this PC
+            partition: 'recovery' or 'boot'
+            timeout: Seconds before fastboot is cut off
+
+        Returns:
+            Output from the fastboot flash command
+        """
+        return self.adb.flash_fastboot_image(device_id, path, partition, timeout)
+
+    def fastboot_unlocked(self, device_id: str,
+                          timeout: Optional[int] = 15) -> Optional[bool]:
+        """Whether a fastboot-mode device reports an unlocked bootloader."""
+        return self.adb.fastboot_unlocked(device_id, timeout)
+
+    def fastboot_get_unlock_ability(self, device_id: str,
+                                    timeout: Optional[int] = 15) -> Optional[str]:
+        """Whether fastboot can unlock the bootloader (get_unlock_ability)."""
+        return self.adb.fastboot_get_unlock_ability(device_id, timeout)
+
+    def fastboot_boot(self, device_id: str, image_path: str,
+                      timeout: Optional[int] = 120) -> str:
+        """Boot an image once from fastboot mode without writing anything.
+
+        User-facing facts: nothing is written to a partition; the image runs
+        from memory and the device restarts back when the image exits.
+
+        Args:
+            device_id: Device serial
+            image_path: Path to the boot image on this PC
+            timeout: Seconds before fastboot is cut off (device likely booted)
+
+        Returns:
+            Output from the fastboot boot command
+        """
+        return self.adb.fastboot_boot(device_id, image_path, timeout)
+
+    def validate_sideload_package(self, path: Optional[str]) -> List[str]:
+        """Reasons not to sideload the OTA package yet (bad file...)."""
+        return self.adb.validate_sideload_package(path)
+
+    def sideload_package(self, device_id: str, zip_path: str,
+                         progress_cb=None) -> str:
+        """Apply an OTA zip from the PC with `adb sideload`.
+
+        Streams the package to a device already sitting in the 'sideload'
+        state; percentage callbacks are raised as adb reports progress.
+
+        Args:
+            device_id: Device serial
+            zip_path: Path to the signed OTA zip on this PC
+            progress_cb: Optional callback receiving every percentage (int)
+
+        Returns:
+            adb's collected console output from the session
+        """
+        return self.adb.sideload_package(device_id, zip_path, progress_cb)
+
     def shutdown_device(self, device_id: str) -> str:
         """Power a device off."""
         return self.adb.shutdown_device(device_id)
@@ -207,6 +291,14 @@ class DeviceManager(_DeviceFilesMixin, _DeviceDiagMixin, _DeviceNetMixin,
     def get_root_status(self, device_id: str) -> Dict[str, Any]:
         """Report root availability for a device."""
         return self.adb.get_root_status(device_id)
+
+    def get_dropbox_entries(self, device_id: str) -> List[Dict[str, Any]]:
+        """Read the DropBox entries (crash/ANR and other logs) a device keeps.
+
+        Returns:
+            List of {'tag', 'time', 'size', 'data'} dicts, oldest first
+        """
+        return self.adb.dropbox_entries(device_id)
 
     def get_empty_dirs(self, device_id: str, path: str) -> set:
         """Names of immediate subdirectories of path that contain no entries."""

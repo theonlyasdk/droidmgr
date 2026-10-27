@@ -10,9 +10,11 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from typing import Dict, List, Optional
 from .capture import take_screenshot, record_screen
+from .dropbox_browser import DropboxBrowserDialog
 from .forward_dialog import ForwardDialog
 from .llm_report_dialog import LLMReportDialog, LLMReportProgressDialog
 from .bugreport_dialog import BugReportDialog, BugReportProgressDialog
+from .screenshot_gallery import ScreenshotGalleryDialog
 
 
 class _DiagMixin:
@@ -25,6 +27,23 @@ class _DiagMixin:
         take_screenshot(self.root, self.device_manager, self.selected_device,
                         self._set_status, self._show_error, self._show_info,
                         self._show_warning)
+
+    def _show_screenshot_gallery(self):
+        """Tools > Screenshot Gallery: session gallery of this run's screenshots."""
+        ScreenshotGalleryDialog(self.root, self.device_manager,
+                                selected_device=self.selected_device or '',
+                                set_status=self._set_status,
+                                show_error=self._show_error)
+
+    def _show_dropbox_browser(self):
+        """Tools > DropBox Browser: read a device's DropBox crash/event logs."""
+        if not self._require_device():
+            return
+        DropboxBrowserDialog(self.root, self.selected_device,
+                             self.device_manager,
+                             set_status_callback=self._set_status,
+                             show_error_callback=self._show_error,
+                             require_device_callback=self._require_device)
 
     def _record_screen(self):
         """Tools > Record Screen: parameter dialog, then record, pull and open."""

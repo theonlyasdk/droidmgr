@@ -70,6 +70,19 @@ class _DeviceShellMixin:
         """Send an Android keyevent to the device."""
         return self.adb.send_keyevent(device_id, keycode)
 
+    def get_dir_sizes(self, device_id: str, path: str) -> Dict[str, int]:
+        """Best-effort per-subdirectory sizes in KB (see ADBManager.get_dir_sizes)."""
+        return self.adb.get_dir_sizes(device_id, path)
+
+    def get_device_free_space(self, device_id: str, path: str = '/sdcard/') -> Optional[int]:
+        """Available bytes on the storage holding path, best-effort (None on failure)."""
+        return self.adb.get_device_free_space(device_id, path)
+
+    def get_storage_usage(self, device_id: str,
+                          path: str = '/sdcard/') -> Optional[Dict[str, int]]:
+        """Best-effort {'total', 'free'} in KB (see ADBManager.get_storage_usage)."""
+        return self.adb.get_storage_usage(device_id, path)
+
     def send_text(self, device_id: str, text: str) -> bool:
         """Send text input to the device."""
         return self.adb.send_text(device_id, text)

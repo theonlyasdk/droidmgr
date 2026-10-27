@@ -4,7 +4,47 @@ import tkinter as tk
 from tkinter import ttk
 
 from .network_format import TABLE_HEIGHT
+from .network_export import TABLE_SLUGS, export_rows_to
 from .network_tables import _SortableTree
+
+
+def _traffic_row_tags(row):
+    """Wireshark-style coloring rules: heavy talkers stand out."""
+    total = row.get('total_bytes') or 0
+    if total > (1024 ** 3):
+        return ('very-heavy',)
+    if total > (100 * 1024 ** 2):
+        return ('heavy',)
+    return ()
+
+
+def _socket_row_tags(row):
+    """Color sockets the way Wireshark colors TCP states."""
+    state = (row.get('state') or '').upper()
+    if 'ESTABLISHED' in state:
+        return ('established',)
+    if 'LISTEN' in state:
+        return ('listening',)
+    if state.startswith('SYN') or 'CONNECTING' in state:
+        return ('opening',)
+    if any(mark in state for mark in ('CLOSE', 'FIN_WAIT', 'TIME_WAIT',
+                                      'LAST_ACK', 'CLOSING')):
+        return ('closing',)
+    return ()
+
+
+def _ping_row_tags(row):
+    """Red for unanswered hosts, amber for a degraded link."""
+    if row.get('error'):
+        return ('dropped',)
+    loss = (row.get('loss') or '')
+    text = str(loss).replace('%', '').strip()
+    if text.isdigit():
+        if int(text) >= 50:
+            return ('dropped',)
+        if int(text) > 0:
+            return ('degraded',)
+    return ()
 
 
 class NetworkPanelsMixin:
@@ -50,13 +90,21 @@ class NetworkPanelsMixin:
         self._cached_pings = []
 
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        # The notebook is the only vertically-growing region; everything above
+        # it keeps its natural height.
+        self.rowconfigure(3, weight=1)
+
+        self._filter_after = None
+        self._filter_applied = ''
+        self._busy_filter = False
 
         self._create_toolbar()
+        self._create_filter_bar()
         self._create_summary_cards()
         self._create_tables()
 
-        self.bind('<Destroy>', lambda event: self.stop_polling())
+        self.bind('<Destroy>', lambda event: (self._cancel_filter_after(),
+                                              self.stop_polling()))
 
         if auto_load and self.device_id:
             self.load()
@@ -64,7 +112,7 @@ class NetworkPanelsMixin:
     # --- layout ------------------------------------------------------------
 
     def _create_toolbar(self):
-        toolbar = ttk.Frame(self, padding=(4, 2, 4, 6))
+        toolbar = ttk.Frame(self, padding=(4, 2, 4, 2))
         toolbar.grid(row=0, column=0, sticky='ew')
 
         self.refresh_all_btn = ttk.Button(
@@ -73,7 +121,15 @@ class NetworkPanelsMixin:
 
         self.export_btn = ttk.Button(
             toolbar, text='Export Report...', command=self.export_report, width=15)
-        self.export_btn.pack(side=tk.LEFT, padx=(0, 10))
+        self.export_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.export_rows_btn = ttk.Button(
+            toolbar, text='Export Rows...', command=self.export_rows, width=14)
+        self.export_rows_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.capture_toggle = ttk.Button(
+            toolbar, text='Stop polling', command=self.toggle_capture, width=13)
+        self.capture_toggle.pack(side=tk.LEFT, padx=(0, 10))
 
         self.hide_sensitive_var = tk.BooleanVar(value=True)
         self.hide_sensitive_cb = ttk.Checkbutton(
@@ -84,9 +140,137 @@ class NetworkPanelsMixin:
         self.status_label = ttk.Label(toolbar, text='', foreground='gray')
         self.status_label.pack(side=tk.RIGHT, padx=4)
 
+    # --- display filter bar ------------------------------------------------
+
+    def _create_filter_bar(self):
+        """Wireshark's display filter: a live box above the packet list.
+
+        Space-separated terms are matched anywhere in each row without
+        re-querying the device. The entry carries Wireshark's tint: yellow
+        while unsaved, green when rows match, red when nothing does.
+        """
+        bar = ttk.Frame(self, padding=(4, 0, 4, 4))
+        bar.grid(row=1, column=0, sticky='ew')
+        bar.columnconfigure(1, weight=1)
+
+        ttk.Label(bar, text='Filter:',
+                  font=('Segoe UI', 9, 'bold')).grid(row=0, column=0, padx=(0, 6))
+        self.display_filter_var = tk.StringVar()
+        self.display_filter_entry = ttk.Entry(bar, textvariable=self.display_filter_var)
+        self.display_filter_entry.grid(row=0, column=1, sticky='ew')
+        self.display_filter_entry.bind('<Return>', self._on_filter_enter)
+        self.display_filter_entry.bind('<Escape>',
+                                       lambda event: self.display_filter_var.set(''))
+        self.display_filter_var.trace_add('write', self._on_filter_edited)
+
+        self.filter_status = tk.StringVar(value='')
+        ttk.Label(bar, textvariable=self.filter_status,
+                  foreground='gray').grid(row=0, column=2, sticky='w', padx=(10, 0))
+
+    def _current_filter_text(self):
+        return self.display_filter_var.get()
+
+    def _on_filter_enter(self, event=None):
+        self._filter_applied = None  # force a re-evaluation even of same text
+        self._apply_display_filter()
+        return 'break'
+
+    def _on_filter_edited(self, *_):
+        # Trace fires for programmatic sets in _clear_all too.
+        if self.display_filter_var.get() == self._filter_applied:
+            return
+        self._cancel_filter_after()
+        try:
+            self.display_filter_entry.config(background='#fff3cd')  # unsaved
+        except Exception:
+            pass
+        self._filter_after = self.after(220, self._apply_display_filter)
+
+    def _cancel_filter_after(self):
+        if getattr(self, '_filter_after', None):
+            try:
+                self.after_cancel(self._filter_after)
+            except Exception:
+                pass
+            self._filter_after = None
+
+    def _apply_display_filter(self):
+        self._filter_after = None
+        self._filter_applied = self.display_filter_var.get().strip()
+
+        tables = getattr(self, '_wire_tables', ())
+        for table in tables:
+            table.force_refill()
+
+        self._evaluate_filter_tint()
+        self._update_filter_status()
+
+    def _evaluate_filter_tint(self):
+        """Wireshark's tint: white (no filter), green (has matches), red (none)."""
+        tables = getattr(self, '_wire_tables', ())
+        populated = [t for t in tables if getattr(t, 'total', 0) > 0]
+        if not self._filter_applied or not populated:
+            tint = '#ffffff'   # no filter in force
+        elif all(t.shown == 0 for t in populated):
+            tint = '#ffd6d6'   # every table rejects it
+        else:
+            tint = '#d8f0d8'   # something matches somewhere
+
+        try:
+            self.display_filter_entry.config(background=tint)
+        except Exception:
+            pass
+
+    def _wire_table_for_tab(self):
+        """The table shown by the active notebook tab, or None."""
+        mapping = {
+            'Data usage': 'traffic_table',
+            'Active connections': 'socket_table',
+            'Routes': 'routes_table',
+            'Connectivity history': 'history_table',
+            'Network requests': 'request_table',
+            'Ping & Latency': 'ping_table',
+        }
+        try:
+            current = self.notebook.select()
+            name = self.notebook.tab(current, 'text')
+            return getattr(self, mapping.get(name, ''), None)
+        except Exception:
+            return None
+
+    def export_rows(self):
+        """Export the visible tab's captured rows to CSV or JSON, no re-query."""
+        table = self._wire_table_for_tab()
+        if table is None:
+            return
+        slug = 'rows'
+        for attr, candidate in TABLE_SLUGS.items():
+            if getattr(self, attr, None) is table:
+                slug = candidate
+        path = export_rows_to(self, table, slug)
+        if path and self.set_status:
+            self.set_status(
+                f'Exported {getattr(table, "total", 0)} rows to {path}')
+
+    def _update_filter_status(self):
+        """The 'N of M shown' counter for the visible tab, next to the box."""
+        table = self._wire_table_for_tab()
+        if table is None or getattr(table, 'total', 0) == 0:
+            self.filter_status.set('')
+            return
+        query = self._filter_applied
+        text = f'{table.shown} of {table.total} shown' if query \
+            else f'{table.total} rows'
+        self.filter_status.set(text)
+
+    def _refresh_filter_tint(self, shown=0, total=0):
+        """after_fill hook: freshly captured rows can flip the tint; no refill."""
+        self._evaluate_filter_tint()
+        self._update_filter_status()
+
     def _create_summary_cards(self):
         container = ttk.Frame(self)
-        container.grid(row=1, column=0, sticky='ew', padx=4, pady=(0, 6))
+        container.grid(row=2, column=0, sticky='ew', padx=4, pady=(0, 6))
         container.columnconfigure(0, weight=1, uniform='card')
         container.columnconfigure(1, weight=1, uniform='card')
         container.columnconfigure(2, weight=1, uniform='card')
@@ -107,10 +291,12 @@ class NetworkPanelsMixin:
             ('frequency', 'Frequency:'),
         )
         for r, (key, label) in enumerate(wifi_fields):
-            ttk.Label(wifi_frame, text=label, font=('Arial', 8, 'bold')).grid(
+            ttk.Label(wifi_frame, text=label,
+                      font=('Segoe UI', 9, 'bold')).grid(
                 row=r, column=0, sticky='nw', pady=1, padx=(0, 6))
             var = tk.StringVar(value='-')
-            ttk.Label(wifi_frame, textvariable=var, wraplength=180, justify=tk.LEFT).grid(
+            ttk.Label(wifi_frame, textvariable=var, font=('Consolas', 9),
+                      wraplength=180, justify=tk.LEFT).grid(
                 row=r, column=1, sticky='w', pady=1)
             self.wifi_vars[key] = var
 
@@ -128,10 +314,12 @@ class NetworkPanelsMixin:
             ('signal', 'Signal:'),
         )
         for r, (key, label) in enumerate(cell_fields):
-            ttk.Label(cell_frame, text=label, font=('Arial', 8, 'bold')).grid(
+            ttk.Label(cell_frame, text=label,
+                      font=('Segoe UI', 9, 'bold')).grid(
                 row=r, column=0, sticky='nw', pady=1, padx=(0, 6))
             var = tk.StringVar(value='-')
-            ttk.Label(cell_frame, textvariable=var, wraplength=180, justify=tk.LEFT).grid(
+            ttk.Label(cell_frame, textvariable=var, font=('Consolas', 9),
+                      wraplength=180, justify=tk.LEFT).grid(
                 row=r, column=1, sticky='w', pady=1)
             self.cell_vars[key] = var
 
@@ -150,10 +338,12 @@ class NetworkPanelsMixin:
             ('default_network', 'Default net:'),
         )
         for r, (key, label) in enumerate(ip_fields):
-            ttk.Label(ip_frame, text=label, font=('Arial', 8, 'bold')).grid(
+            ttk.Label(ip_frame, text=label,
+                      font=('Segoe UI', 9, 'bold')).grid(
                 row=r, column=0, sticky='nw', pady=1, padx=(0, 6))
             var = tk.StringVar(value='-')
-            ttk.Label(ip_frame, textvariable=var, wraplength=200, justify=tk.LEFT).grid(
+            ttk.Label(ip_frame, textvariable=var, font=('Consolas', 9),
+                      wraplength=200, justify=tk.LEFT).grid(
                 row=r, column=1, sticky='w', pady=1)
             self.ip_vars[key] = var
 
@@ -164,7 +354,7 @@ class NetworkPanelsMixin:
 
     def _create_tables(self):
         self.notebook = ttk.Notebook(self)
-        self.notebook.grid(row=2, column=0, sticky='nsew', padx=4, pady=2)
+        self.notebook.grid(row=3, column=0, sticky='nsew', padx=4, pady=2)
 
         # 1. Traffic: Data usage per app
         traffic = ttk.Frame(self.notebook, padding=6)
@@ -187,6 +377,8 @@ class NetworkPanelsMixin:
             default_sort='total',
             default_reverse=True,
             height=TABLE_HEIGHT,
+            empty_text='No data usage captured yet',
+            tag_fn=_traffic_row_tags,
         )
         self.traffic_table.pack(fill=tk.BOTH, expand=True)
         self.traffic_summary = ttk.Label(traffic, text='', foreground='gray')
@@ -213,6 +405,8 @@ class NetworkPanelsMixin:
                 'local': lambda row: f"{row.get('local')}:{row.get('local_port')}",
             },
             height=TABLE_HEIGHT,
+            empty_text='No connections captured yet',
+            tag_fn=_socket_row_tags,
         )
         self.socket_table.pack(fill=tk.BOTH, expand=True)
         self.socket_summary = ttk.Label(sockets, text='', foreground='gray')
@@ -244,6 +438,7 @@ class NetworkPanelsMixin:
             },
             default_sort='destination',
             height=TABLE_HEIGHT,
+            empty_text='No routes captured yet',
         )
         self.routes_table.pack(fill=tk.BOTH, expand=True)
         self.routes_summary = ttk.Label(routes, text='', foreground='gray')
@@ -266,6 +461,7 @@ class NetworkPanelsMixin:
                 'details': lambda r: r.get('details', ''),
             },
             height=TABLE_HEIGHT,
+            empty_text='No connectivity events captured yet',
         )
         self.history_table.pack(fill=tk.BOTH, expand=True)
         self.history_summary = ttk.Label(history, text='', foreground='gray')
@@ -293,6 +489,7 @@ class NetworkPanelsMixin:
                 'count': lambda row: row.get('count'),
             },
             height=TABLE_HEIGHT,
+            empty_text='No network requests captured yet',
         )
         self.request_table.pack(fill=tk.BOTH, expand=True)
         self.request_summary = ttk.Label(requests, text='', foreground='gray')
@@ -336,9 +533,20 @@ class NetworkPanelsMixin:
             ('jitter', 'Jitter', 75, 'e'),
             ('note', 'Result', 220, 'w'),
         ]
-        self.ping_table = _SortableTree(latency, columns)
+        self.ping_table = _SortableTree(
+            latency, columns,
+            empty_text='No ping results yet',
+            tag_fn=_ping_row_tags)
         self.ping_table.pack(fill=tk.BOTH, expand=True)
         self.notebook.add(latency, text='Ping & Latency')
+
+        # Everything above is one Wireshark "capture": one display filter and
+        # one counter drive all six lists.
+        self._wire_tables = (
+            self.traffic_table, self.socket_table, self.routes_table,
+            self.history_table, self.request_table, self.ping_table)
+        for table in self._wire_tables:
+            table.set_filter_fn(self._current_filter_text)
 
     def _add_table_controls(self, parent, command, name):
         controls = ttk.Frame(parent)

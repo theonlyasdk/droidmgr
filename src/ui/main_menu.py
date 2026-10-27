@@ -41,16 +41,21 @@ class _MenuMixin:
         device_menu.add_command(label="Start Mirroring", command=self._toggle_mirroring)
         self.mirror_menu_index = device_menu.index('end')
         device_menu.add_command(label="Take Screenshot", command=self._take_screenshot)
+        device_menu.add_command(label="Screenshot Gallery...", command=self._show_screenshot_gallery)
         device_menu.add_separator()
         device_menu.add_command(label="Connect Wirelessly...", command=self._show_connect_wireless_dialog)
+        device_menu.add_command(label="Wireless Mirror...", command=self._wireless_mirror)
         device_menu.add_command(label="Disconnect Wireless Device", command=self._disconnect_wireless_device)
         device_menu.add_separator()
         device_menu.add_command(label="Reboot", command=lambda: self._power_action('reboot'))
         device_menu.add_command(label="Reboot to Recovery", command=lambda: self._power_action('recovery'))
+        device_menu.add_command(label="Flash Recovery Image...", command=self._flash_recovery_image)
         device_menu.add_command(label="Reboot to Fastboot (Bootloader)", command=lambda: self._power_action('bootloader'))
         device_menu.add_command(label="Reboot from Fastboot to Android", command=self._fastboot_reboot)
         self.fastboot_reboot_menu_index = device_menu.index('end')
         device_menu.entryconfig(self.fastboot_reboot_menu_index, state=tk.DISABLED)
+        self.fastboot_flash_menu_index = device_menu.index('end')
+        device_menu.add_command(label="Apply Update From File...", command=self._apply_update_from_file)
         device_menu.add_command(label="Shut Down", command=lambda: self._power_action('shutdown'))
         device_menu.add_separator()
         device_menu.add_command(label="Check Root Access", command=self._check_root_access)
@@ -61,6 +66,7 @@ class _MenuMixin:
         device_menu.add_separator()
         device_menu.add_command(label="Generate LLM Report", command=self._generate_llm_report)
         device_menu.add_command(label="Collect Bug Report...", command=self._collect_bugreport)
+        device_menu.add_command(label="Crash & ANR Browser...", command=self._show_dropbox_browser)
 
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Tools", menu=tools_menu)
@@ -68,6 +74,9 @@ class _MenuMixin:
         tools_menu.add_command(label="Record Screen...", command=self._record_screen)
         tools_menu.add_separator()
         tools_menu.add_command(label="Port Forwarding...", command=self._show_forward_dialog)
+        tools_menu.add_command(label="Device Profiles...", command=self._show_device_profiles)
+        tools_menu.add_command(label="Macros...", command=self._show_macro_dialog)
+        tools_menu.add_command(label="Toggle Macro Recording", command=self._toggle_macro_recording)
 
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
@@ -88,7 +97,18 @@ class _MenuMixin:
 
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="Command Palette (Ctrl+K)",
+                              command=self._show_command_palette)
         help_menu.add_command(label="About", command=self._show_about)
+
+        def _open_palette(event):
+            self._show_command_palette()
+            return 'break'
+
+        # Capital variant covers Shift being held; members bind nothing else
+        # on Ctrl+K (checked).
+        self.root.bind_all('<Control-k>', _open_palette)
+        self.root.bind_all('<Control-K>', _open_palette)
 
     def _show_about(self):
         AboutDialog(self.root).show()

@@ -23,6 +23,7 @@ from .adb_files import _FilesMixin
 from .adb_backup import _BackupMixin
 from .adb_health import _HealthMixin
 from .adb_diag import _DiagMixin
+from .adb_dropbox import _DropboxMixin
 from .adb_report import _ReportMixin
 from .adb_network import _NetworkMixin
 from .adb_ping import _PingMixin
@@ -43,6 +44,7 @@ class ADBManager(
     _BackupMixin,
     _HealthMixin,
     _DiagMixin,
+    _DropboxMixin,
     _ReportMixin,
     _NetworkMixin,
     _PingMixin,

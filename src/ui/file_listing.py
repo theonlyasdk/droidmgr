@@ -192,6 +192,7 @@ class _FileListingMixin:
                     self._finish_loading()
                     self.is_current_path_writable = is_writable
                     is_same_dir = (path == getattr(self, '_last_rendered_path', None))
+                    self._reset_size_strip(path)
                     # Clear the list inside the main thread just before inserting to avoid duplicates and concurrency bugs
                     self._clear_list()
                     self.current_files = list(files)
@@ -223,6 +224,14 @@ class _FileListingMixin:
                         self._render_file_grid()
 
                     self._last_rendered_path = path
+                    self._remember_path(path)
+                    # Sum the byte sizes now listed; folder sizes arrive via du.
+                    file_bytes = 0
+                    for f in files:
+                        raw = f.get('size_raw')
+                        if not f['is_dir'] and raw and str(raw).isdigit():
+                            file_bytes += int(raw)
+                    self._start_dir_size_pass(seq, device_id, path, file_bytes)
                     self._set_status(f"Browsing {self.current_path}")
                     self._update_navigation_buttons()
                     self._update_selection_buttons()
@@ -319,4 +328,99 @@ class _FileListingMixin:
                          "without root, so access may still need approval on the "
                          "device screen.")
         return text
+
+    # -- best-effort storage usage bars ------------------------------------------
+
+    def _reset_size_strip(self, path):
+        """Show placeholders whenever the strip's numbers would be for a new path."""
+        if getattr(self, '_size_path', None) != path:
+            self._size_path = path
+            total_var = getattr(self, '_size_total_var', None)
+            free_var = getattr(self, '_size_free_var', None)
+            if total_var is not None:
+                total_var.set('Total: …')
+            if free_var is not None:
+                free_var.set('Free: …')
+            bar = getattr(self, '_storage_bar', None)
+            if bar is not None:
+                try:
+                    bar.set_usage(0)
+                except Exception:
+                    pass
+
+    def _start_dir_size_pass(self, seq, device_id, path, file_bytes):
+        """One background du/df pass after the listing lands.
+
+        Best-effort: failures just leave the numbers blank, never an error
+        dialog. du results are written into the folder rows' Size column
+        (list view); the total/free cards cover grid view.
+        """
+
+        def task():
+            try:
+                dir_sizes = self.device_manager.get_dir_sizes(device_id, path)
+                du_ok = True
+            except Exception:
+                dir_sizes, du_ok = {}, False
+            try:
+                usage = self.device_manager.get_storage_usage(device_id, path)
+            except Exception:
+                usage = None
+
+            def apply():
+                if seq != self._refresh_seq:
+                    return
+                if device_id != self.selected_device or path != self.current_path:
+                    return
+                try:
+                    for item_id in self.file_tree.get_children():
+                        info = self.files_data.get(item_id)
+                        if not info or not info.get('is_dir'):
+                            continue
+                        kb = dir_sizes.get(info.get('name'))
+                        if kb is None:
+                            continue
+                        size_text = self._format_bytes_display(kb * 1024)
+                        info['du_bytes'] = kb * 1024
+                        info['size'] = size_text
+                        try:
+                            self.file_tree.set(item_id, 'Size', size_text)
+                        except Exception:
+                            pass
+                    total_var = getattr(self, '_size_total_var', None)
+                    if total_var is not None:
+                        if du_ok:
+                            total = file_bytes + sum(dir_sizes.values()) * 1024
+                            total_var.set(f'Total: {self._format_bytes_display(total)}')
+                        else:
+                            total_var.set('Total: —')
+                    free_var = getattr(self, '_size_free_var', None)
+                    bar = getattr(self, '_storage_bar', None)
+                    if free_var is not None:
+                        if usage and usage.get('total'):
+                            free_bytes = usage['free'] * 1024
+                            total_bytes = usage['total'] * 1024
+                            pct_free = round(100 * usage['free'] / usage['total'])
+                            free_var.set(
+                                f'Free: {self._format_bytes_display(free_bytes)} of '
+                                f'{self._format_bytes_display(total_bytes)} '
+                                f'({pct_free}% free)')
+                            if bar is not None:
+                                try:
+                                    bar.set_usage(1.0 - usage['free'] / usage['total'])
+                                except Exception:
+                                    pass
+                        else:
+                            free_var.set('Free: —')
+                            if bar is not None:
+                                try:
+                                    bar.set_usage(0)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+
+            self.frame.after(0, apply)
+
+        threading.Thread(target=task, daemon=True).start()
 

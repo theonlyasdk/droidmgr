@@ -35,6 +35,7 @@ from .forward_dialog import ForwardDialog
 from .file_drop import enable_file_drop
 from .logcat_view import LogcatView
 from .shell_view import ShellView
+from .console_tab import ConsoleView
 from .network_inspector import NetworkInspector
 from .capture import take_screenshot, record_screen
 from .apk_extract import extract_apk
@@ -62,6 +63,8 @@ from .main_restore import _RestoreMixin
 from .main_tabs import _TabsMixin
 from .main_selection import _SelectionMixin
 from .main_menu import _MenuMixin
+from .main_profiles import _ProfilesMixin
+from .command_palette import _PaletteMixin
 from .main_utils import (_ProcessMemoryCounters, _get_process_memory_info,
     _kernel32, _MEMORY_LIMIT_BYTES)
 
@@ -80,6 +83,8 @@ class MainWindow(
     _TabsMixin,
     _SelectionMixin,
     _MenuMixin,
+    _ProfilesMixin,
+    _PaletteMixin,
 ):
     """Main window (shell + notebook); feature code lives in main_*.py."""
     
@@ -147,8 +152,11 @@ class MainWindow(
     
     def _create_ui(self):
         self._create_menu()
-        self._create_notebook()
+        # The statusbar is packed before the notebook: a later-packed widget is
+        # the first one Tk squeezes, so shrinking the window height could hide
+        # the status bar entirely when the notebook is packed first.
         self._create_statusbar()
+        self._create_notebook()
     
     
     def _create_notebook(self):
@@ -203,6 +211,17 @@ class MainWindow(
         )
         self.network_view.pack(fill=tk.BOTH, expand=True)
 
+        # Initialize Console (one-shot shell commands)
+        self.console_tab = ttk.Frame(self.notebook)
+        self.console_view = ConsoleView(
+            self.console_tab,
+            self.device_manager,
+            lambda: self.selected_device,
+            self._set_status,
+            self._show_error,
+            self._require_device
+        )
+
         # Initialize Misc / Developer Options Tab
         self.misc_tab = MiscTab(
             self.notebook,
@@ -220,7 +239,8 @@ class MainWindow(
             self.root,
             text="Ready",
             relief=tk.SUNKEN,
-            anchor=tk.W
+            anchor=tk.W,
+            padding=(6, 3)
         )
         self.statusbar.pack(side=tk.BOTTOM, fill=tk.X)
     
@@ -355,6 +375,10 @@ class MainWindow(
             pass
         try:
             self.shell_view.destroy()
+        except Exception:
+            pass
+        try:
+            self.console_view.destroy()
         except Exception:
             pass
         try:

@@ -12,6 +12,11 @@ from tkinter import ttk, messagebox, filedialog
 from typing import Dict, List, Optional
 from .dpi import scale_size
 
+# How many chunk extractions may run against the device at once. The adb calls
+# are independent child processes, so the device extracts several chunks in
+# parallel instead of strictly one after another.
+_ICON_WORKER_LIMIT = 3
+
 
 class _AppIconsMixin:
     """_AppIconsMixin for MainWindow (see main_window.py)."""
@@ -184,10 +189,12 @@ class _AppIconsMixin:
                 if p not in self._icon_pending_packages:
                     self._icon_pending_packages.append(p)
             self._app_icon_loading.update(to_fetch)
-
-        if not getattr(self, '_icon_worker_active', False):
-            self._icon_worker_active = True
-            threading.Thread(target=self._icon_loader_worker, daemon=True).start()
+            # Start enough workers to drain the pending list, up to the limit.
+            active = getattr(self, '_icon_worker_active', 0)
+            for _ in range(max(0, min(len(self._icon_pending_packages),
+                                      _ICON_WORKER_LIMIT) - active)):
+                self._icon_worker_active = active = active + 1
+                threading.Thread(target=self._icon_loader_worker, daemon=True).start()
 
     def _icon_loader_worker(self):
         dev_id = self.selected_device
@@ -196,7 +203,8 @@ class _AppIconsMixin:
         manager = getattr(self, 'device_manager', None)
         if not manager or not hasattr(manager, 'adb'):
             with self._icon_lock:
-                self._icon_worker_active = False
+                self._icon_worker_active = max(
+                    0, getattr(self, '_icon_worker_active', 0) - 1)
             return
 
         def is_cancelled():
@@ -217,7 +225,10 @@ class _AppIconsMixin:
                 with self._icon_lock:
                     if not self._icon_pending_packages:
                         break
-                    visible = set(self._visible_grid_packages()) if hasattr(self, '_visible_grid_packages') else set()
+                    # Snapshot, not a live query: get_visible_keys() talks to
+                    # Tk, which must stay on the main thread. _load_visible_
+                    # grid_icons/_on_grid_visible refresh this set.
+                    visible = getattr(self, '_icon_visible_snapshot', set())
                     vis_chunk = [p for p in self._icon_pending_packages if p in visible]
                     if vis_chunk:
                         chunk = vis_chunk[:40]
@@ -300,8 +311,13 @@ class _AppIconsMixin:
                         ))
         finally:
             with self._icon_lock:
-                self._icon_worker_active = False
-                if self._icon_pending_packages and not is_cancelled():
-                    self._icon_worker_active = True
+                self._icon_worker_active = max(
+                    0, getattr(self, '_icon_worker_active', 0) - 1)
+                # Respawn when chunks arrived while this worker was running,
+                # staying under the concurrent-worker limit.
+                if (self._icon_pending_packages
+                        and not is_cancelled()
+                        and self._icon_worker_active < _ICON_WORKER_LIMIT):
+                    self._icon_worker_active += 1
                     threading.Thread(target=self._icon_loader_worker, daemon=True).start()
 

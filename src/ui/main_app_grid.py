@@ -44,12 +44,16 @@ class _AppGridMixin:
         if not getattr(self, '_filtered_apps', None):
             return
         visible = self._visible_grid_packages()
+        # Workers read this snapshot instead of calling the Tk widget itself.
+        self._icon_visible_snapshot = set(visible)
         to_load = [p for p in visible if p not in self._app_icon_cache and p not in self._app_icon_loading]
         if to_load:
             self._load_app_icons_async(to_load)
 
     def _on_grid_visible(self, keys):
         if self.app_view_mode_var.get() == "grid" and self._is_apps_tab_visible():
+            # Full viewport of the moment; keeps worker priority in sync.
+            self._icon_visible_snapshot = set(keys)
             to_load = [p for p in keys
                        if p not in self._app_icon_cache and p not in self._app_icon_loading]
             if to_load:
@@ -116,6 +120,7 @@ class _AppGridMixin:
 
     def _refresh_apps(self):
         if not self.selected_device:
+            self._hide_apps_loading()
             return
         if self._app_icon_cache_device != self.selected_device:
             self._app_icon_cache.clear()
@@ -129,6 +134,7 @@ class _AppGridMixin:
         # Check device readiness before querying
         try:
             if not self.device_manager.is_device_ready(self.selected_device):
+                self._hide_apps_loading()
                 status = None
                 if hasattr(self.device_manager, 'get_device_status'):
                     status = self.device_manager.get_device_status(self.selected_device)
@@ -137,6 +143,7 @@ class _AppGridMixin:
                 for item in self.app_tree.get_children():
                     self.app_tree.delete(item)
                 if hasattr(self, 'app_grid'):
+                    self.app_grid.set_empty_text(f"Device is {status_str}")
                     self.app_grid.clear()
                 tag_text = f"[Device is {status_str}]"
                 self.app_tree.insert('', tk.END, values=(tag_text, "", "", ""))
@@ -148,6 +155,8 @@ class _AppGridMixin:
                 return
         except Exception:
             pass
+
+        self._show_apps_loading()
 
         selected_packages = set(self._get_selected_packages())
         yview = self.app_tree.yview()
@@ -168,6 +177,10 @@ class _AppGridMixin:
                     cur_sel = self.notebook.select()
                     if cur_sel and self.notebook.tab(cur_sel, 'text') != 'Applications':
                         return
+                    # First app row is about to be rendered: the bar goes away.
+                    self._hide_apps_loading()
+                    if hasattr(self, 'app_grid'):
+                        self.app_grid.set_empty_text("No applications found")
                     self._apps_data = apps_details
                     self._apply_app_filter(restore_selected=selected_packages, restore_yview=yview)
                     self._update_app_button_states()
@@ -175,10 +188,12 @@ class _AppGridMixin:
                 self.root.after(0, update)
             except (ADBDeviceOfflineError, ADBDeviceNotFoundError):
                 def handle_offline():
+                    self._hide_apps_loading()
                     self._apps_data = []
                     for item in self.app_tree.get_children():
                         self.app_tree.delete(item)
                     if hasattr(self, 'app_grid'):
+                        self.app_grid.set_empty_text("Device is offline")
                         self.app_grid.clear()
                     self.app_tree.insert('', tk.END, values=("[Device is offline]", "", "", ""))
                     if hasattr(self, 'app_count_label'):
@@ -192,10 +207,14 @@ class _AppGridMixin:
                 lower_msg = msg.lower()
                 if _is_offline_error(msg):
                     def handle_offline():
+                        self._hide_apps_loading()
                         self._apps_data = []
                         for item in self.app_tree.get_children():
                             self.app_tree.delete(item)
                         if hasattr(self, 'app_grid'):
+                            self.app_grid.set_empty_text(
+                                "Device is unauthorized" if "unauthorized" in lower_msg
+                                else "Device is offline")
                             self.app_grid.clear()
                         tag = "[Device is unauthorized]" if "unauthorized" in lower_msg else "[Device is offline]"
                         self.app_tree.insert('', tk.END, values=(tag, "", "", ""))
@@ -206,7 +225,10 @@ class _AppGridMixin:
                         self._set_status(f"Device '{self.selected_device}' is offline or disconnected.")
                     self.root.after(0, handle_offline)
                 else:
-                    self.root.after(0, lambda: self._show_error("App Refresh Error", msg))
+                    def handle_error():
+                        self._hide_apps_loading()
+                        self._show_error("App Refresh Error", msg)
+                    self.root.after(0, handle_error)
         
         threading.Thread(target=task, daemon=True).start()
 
