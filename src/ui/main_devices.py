@@ -77,7 +77,7 @@ class _DevicesTabMixin:
         self.connect_wireless_btn = ttk.Button(btn_frame, text="Connect Wirelessly...", command=self._show_connect_wireless_dialog)
         self.connect_wireless_btn.pack(side=tk.LEFT, padx=2)
 
-        # Tool version banner and 'Getting started' card sit above the device
+        # Tool version banner and 'Quick Tips' card sit above the device
         # list; both are packed from the refresh path only when they change.
         warning_style = ttk.Style(self.root)
         warning_style.configure('Warning.TFrame', background='#FFF3CD')
@@ -93,7 +93,7 @@ class _DevicesTabMixin:
         self._checklist_visible = False
         self._last_seen_devices = None
 
-        self.checklist_frame = ttk.LabelFrame(tab, text="Getting started")
+        self.checklist_frame = ttk.LabelFrame(tab, text="Quick Tips")
 
         return tab
 
@@ -398,32 +398,33 @@ class _DevicesTabMixin:
         if self._version_banner_frame is not None:
             self._version_banner_frame.pack_forget()
 
-    # ---- 'Getting started' checklist card --------------------------------
+    # ---- 'Quick Tips' card -----------------------------------------------
 
     def _update_setup_checklist(self):
-        """Rebuild the 'Getting started' card from the last refresh's data.
+        """Rebuild the 'Quick Tips' card from the last refresh's data.
 
         Every row comes from state the refresh already collected (the device
         list with its statuses, and the one-off tool version check); nothing
-        here queries a device. The card is packed only while it has rows, so
-        "all fine" carries no empty space, and identical row sets rebuild
-        nothing.
+        here queries a device. A row carries the buttons that act on what it
+        says, so the advice can be followed from the card itself. The card is
+        packed only while it has rows, so "all fine" carries no empty space,
+        and identical row sets rebuild nothing.
         """
         if getattr(self, '_closing', False):
             return
 
-        rows = []  # (text, button text or None, action or None)
+        rows = []  # (text, ((button text, action), ...), device ids it acts on)
 
         versions = getattr(self, '_tool_versions', None) or {}
         if versions and not versions.get('adb_ok'):
             rows.append(("adb was not found so the app cannot reach any device.",
-                         "Locate adb...", self._show_preferences))
+                         (("Locate adb...", self._show_preferences),), ()))
 
         devices = getattr(self, '_last_seen_devices', None)
         if devices is not None and not devices:
             rows.append(("No devices visible yet: plug the phone over USB, enable "
                          "USB debugging, and tap Trust/Allow on its screen.",
-                         "Refresh", self._refresh_devices))
+                         (("Refresh", self._refresh_devices),), ()))
 
         by_status = {}
         for device in devices or []:
@@ -431,12 +432,17 @@ class _DevicesTabMixin:
             if status and status != 'device':
                 by_status.setdefault(status, []).append(device)
         for status in sorted(by_status):
-            count = len(by_status[status])
+            group = by_status[status]
+            count = len(group)
+            device_ids = [device['id'] for device in group]
             subject = f"{count} devices sit" if count > 1 else "a device sits"
             rows.append((f"{subject} in '{status}' state — "
-                         f"{self._status_hint(status)}", None, None))
+                         f"{self._status_hint(status)}",
+                         self._status_actions(status, device_ids),
+                         tuple(device_ids)))
 
-        signature = tuple((row[0], row[1]) for row in rows)
+        signature = tuple((row[0], tuple(button[0] for button in row[1]), row[2])
+                          for row in rows)
         if signature == getattr(self, '_checklist_signature', None):
             return  # same rows as before; no rebuild, no reflow
         self._checklist_signature = signature
@@ -450,24 +456,62 @@ class _DevicesTabMixin:
         if status == 'offline':
             return "replug the cable or use Device menu > Reconnect ADB"
         if status == 'fastboot':
-            return "it is in fastboot mode by choice; Device menu > " \
-                   "Reboot from fastboot brings it back"
+            return "it is in fastboot mode by choice; either button restarts it"
+        if status == 'recovery':
+            return "it booted into recovery; the button returns it to Android"
         return "replug the cable; details are in the status bar"
+
+    def _status_actions(self, status, device_ids):
+        """The buttons offered beside a state's hint.
+
+        fastboot and recovery are the states the app can leave from the card:
+        both tools behind them can restart the device, so the way out sits one
+        click from the tip. Every other state is fixed on the phone or
+        elsewhere.
+        """
+        if status == 'fastboot':
+            return (("Reboot", lambda: self._quick_tip_restart(
+                        device_ids, self._fastboot_reboot)),
+                    ("Recovery", lambda: self._quick_tip_restart(
+                        device_ids, self._fastboot_reboot_recovery)))
+        if status == 'recovery':
+            return (("Reboot to Android", lambda: self._quick_tip_restart(
+                device_ids, self._recovery_reboot)),)
+        return ()
+
+    def _quick_tip_restart(self, device_ids, action):
+        """Run one restart action on the device a Quick Tips row describes.
+
+        A row covers every device in its state, so a single device is
+        unambiguous; with several, the selection says which one, and without a
+        selection the user is asked to pick rather than have one guessed.
+        """
+        if len(device_ids) == 1:
+            device_id = device_ids[0]
+        elif self.selected_device in device_ids:
+            device_id = self.selected_device
+        else:
+            self._set_status("Select the device to restart first")
+            return
+
+        action(device_id)
 
     def _rebuild_checklist(self, rows):
         """Replace the card's rows and pack the card only when it has any."""
         card = self.checklist_frame
         for child in card.winfo_children():
             child.destroy()
-        for text, button_text, action in rows:
+        for text, buttons, _ in rows:
             row = ttk.Frame(card)
             row.pack(fill=tk.X, padx=8, pady=3)
             label = ttk.Label(row, text=text, anchor='w', justify=tk.LEFT,
                               wraplength=scale_size(700, self.root))
             label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            if button_text:
+            # Packed right to left, so the first offered button is leftmost.
+            for button_text, action in reversed(buttons):
                 ttk.Button(row, text=button_text, command=action,
-                           width=12).pack(side=tk.RIGHT, padx=(8, 0), pady=1)
+                           width=max(12, len(button_text) + 2)).pack(
+                               side=tk.RIGHT, padx=(8, 0), pady=1)
         if rows:
             card.pack(fill=tk.X, padx=5, pady=0,
                       before=self._device_list_frame)

@@ -46,6 +46,7 @@ from .backup_dialog import BackupCancelToken, BackupOptionsDialog, BackupProgres
 from .taskbar_progress import TaskbarProgress
 from .apk_install_progress import APKInstallProgressDialog
 from .dpi import enable_dpi_awareness, setup_window_dpi, scale_size
+from .tile_assets import find_asset
 from .misc_tab import MiscTab
 from .tile_grid import TileGrid
 
@@ -92,6 +93,13 @@ class MainWindow(
         enable_dpi_awareness()
         self.root = tk.Tk()
         self.root.title("droidmgr - Android Device Manager")
+        icon_path = find_asset('droidmgr.png')
+        if icon_path:
+            try:
+                self._window_icon = tk.PhotoImage(file=icon_path)
+                self.root.iconphoto(True, self._window_icon)
+            except Exception:
+                pass
         setup_window_dpi(self.root, base_width=900, base_height=650, min_width=400, min_height=300)
         self.taskbar_progress = TaskbarProgress(self.root)
         

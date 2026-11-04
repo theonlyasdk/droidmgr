@@ -154,13 +154,26 @@ smoke-checked, with pointers to where it lives in the code.
   dismissable warning banner with both versions appears above the Devices
   tab's device list (`src/ui/main_devices.py`); matching versions stay
   silent.
-- **X4 – First-run checklist.** A "Getting started" card above the device
-  list, packed only when the last refresh's data says something needs
+- **X4 – First-run checklist ("Quick Tips").** A "Quick Tips" card above the
+  device list, packed only when the last refresh's data says something needs
   saying: adb missing (button -> the Preferences dialog's tool selection),
   no devices (plug in / USB debugging / approve RSA + Refresh), or devices
   in a non-ready state (unauthorized: approve the prompt; offline: replug /
-  Reconnect ADB; fastboot: neutral hint). It never queries the device — it
-  maps the data the refresh already collected.
+  Reconnect ADB; fastboot: the hint plus Reboot / Recovery buttons that
+  restart that device straight from the card). It never queries the device —
+  it maps the data the refresh already collected.
+- **Reboot from fastboot to recovery.** Device menu > "Reboot from
+  Fastboot to Recovery" (`fastboot_reboot_recovery` in
+  `src/core/adb_devices.py`, flow in `src/ui/main_mirror.py`) runs
+  `fastboot reboot recovery`: the device leaves fastboot mode into recovery
+  instead of Android, writing nothing. It is enabled only while the
+  selected device is a fastboot one, like the existing Android return.
+- **Reboot from recovery to Android.** Device menu > "Reboot from Recovery
+  to Android" (`_recovery_reboot` in `src/ui/main_mirror.py`) runs a plain
+  `adb reboot` on a device whose state is `recovery`, and is enabled only
+  for that state. The Quick Tips card offers both ways out as buttons: the
+  fastboot row gets Reboot / Recovery, the recovery row gets Reboot to
+  Android.
 - **M4 – Wireless mirror.** Device menu > "Wireless Mirror..." is the
   one-stop path for a device whose address is already known
   (`src/ui/wireless_mirror_dialog.py`): the last address is remembered per

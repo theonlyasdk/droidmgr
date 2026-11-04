@@ -75,7 +75,7 @@ def get_platform_info():
         return {
             'name': 'Windows',
             'extension': '.exe',
-            'icon': None,  # Add .ico file path if you have one
+            'icon': 'src/assets/droidmgr.ico',
             'separator': ';'
         }
     elif system == 'darwin':
@@ -89,7 +89,7 @@ def get_platform_info():
         return {
             'name': 'Linux',
             'extension': '',
-            'icon': None,  # Add .png file path if you have one
+            'icon': 'src/assets/droidmgr.png',
             'separator': ':'
         }
 

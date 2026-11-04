@@ -181,23 +181,34 @@ class _MirrorMixin:
         return serials
 
     def _update_fastboot_menu_state(self):
-        """Offer the way back only to a device fastboot can actually reach."""
+        """Offer each way out only to a device sitting in the state it leaves."""
         in_fastboot = (self.selected_device is not None
                        and self.selected_device in self._fastboot_devices)
-        self.device_menu.entryconfig(self.fastboot_reboot_menu_index,
-                                     state=tk.NORMAL if in_fastboot else tk.DISABLED)
+        for index in (self.fastboot_reboot_menu_index,
+                      self.fastboot_recovery_menu_index):
+            self.device_menu.entryconfig(index,
+                                         state=tk.NORMAL if in_fastboot
+                                         else tk.DISABLED)
+        in_recovery = any(
+            device.get('id') == self.selected_device
+            and (device.get('status') or '').lower() == 'recovery'
+            for device in (getattr(self, '_last_seen_devices', None) or []))
+        self.device_menu.entryconfig(self.recovery_reboot_menu_index,
+                                     state=tk.NORMAL if in_recovery
+                                     else tk.DISABLED)
         # Flashing is possible from both states: an adb device is rebooted to
         # the bootloader first, so it needs no fastboot-mode membership.
         self.device_menu.entryconfig(self.fastboot_flash_menu_index,
                                      state=tk.NORMAL if self.selected_device
                                      else tk.DISABLED)
 
-    def _fastboot_reboot(self):
+    def _fastboot_reboot(self, device_id=None):
         """Boot a fastboot-mode device back into Android, after confirming."""
-        if not self._require_device(require_ready=False):
-            return
+        if device_id is None:
+            if not self._require_device(require_ready=False):
+                return
+            device_id = self.selected_device
 
-        device_id = self.selected_device
         if not messagebox.askyesno(
                 'Reboot from Fastboot',
                 f"Reboot device '{device_id}' out of fastboot mode and back into "
@@ -219,9 +230,72 @@ class _MirrorMixin:
 
         threading.Thread(target=task, daemon=True).start()
 
-    def _on_fastboot_reboot_sent(self, device_id):
+    def _fastboot_reboot_recovery(self, device_id=None):
+        """Boot a fastboot-mode device into recovery, after confirming."""
+        if device_id is None:
+            if not self._require_device(require_ready=False):
+                return
+            device_id = self.selected_device
+
+        if not messagebox.askyesno(
+                'Reboot from Fastboot to Recovery',
+                f"Reboot device '{device_id}' out of fastboot mode and into "
+                "recovery?\n\nIt leaves fastboot mode and starts recovery instead "
+                "of Android. Nothing is written to the device.",
+                parent=self.root):
+            return
+
+        self._set_status(f"Rebooting {device_id} from fastboot into recovery...")
+
+        def task():
+            try:
+                self.device_manager.fastboot_reboot_recovery(device_id)
+            except Exception as e:
+                msg = str(e)
+                self.root.after(0, lambda: self._show_error('Fastboot Reboot Failed', msg))
+                return
+            self.root.after(0, lambda: self._on_fastboot_reboot_sent(
+                device_id, 'recovery'))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _on_fastboot_reboot_sent(self, device_id, target='Android'):
         self._refresh_devices()
-        self._set_status(f"{device_id} is rebooting from fastboot")
+        self._set_status(f"{device_id} is rebooting from fastboot into {target}")
+        for delay in _RECONNECT_POLL_DELAYS:
+            self.root.after(delay, self._refresh_devices)
+
+    def _recovery_reboot(self, device_id=None):
+        """Restart a device sitting in recovery back into Android, after confirming."""
+        if device_id is None:
+            if not self._require_device(require_ready=False):
+                return
+            device_id = self.selected_device
+
+        if not messagebox.askyesno(
+                'Reboot from Recovery',
+                f"Reboot device '{device_id}' out of recovery and back into "
+                "Android?\n\nIt starts the system normally. Nothing is written "
+                "to the device.",
+                parent=self.root):
+            return
+
+        self._set_status(f"Rebooting {device_id} from recovery...")
+
+        def task():
+            try:
+                self.device_manager.reboot_device(device_id)
+            except Exception as e:
+                msg = str(e)
+                self.root.after(0, lambda: self._show_error('Reboot Failed', msg))
+                return
+            self.root.after(0, lambda: self._on_recovery_reboot_sent(device_id))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _on_recovery_reboot_sent(self, device_id):
+        self._refresh_devices()
+        self._set_status(f"{device_id} is rebooting out of recovery into Android")
         for delay in _RECONNECT_POLL_DELAYS:
             self.root.after(delay, self._refresh_devices)
 

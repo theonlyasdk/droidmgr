@@ -211,6 +211,17 @@ class DeviceManager(_DeviceFilesMixin, _DeviceDiagMixin, _DeviceNetMixin,
         """
         return self.adb.fastboot_reboot(device_id)
 
+    def fastboot_reboot_recovery(self, device_id: str) -> str:
+        """Restart a fastboot-mode device into recovery instead of Android.
+
+        Args:
+            device_id: Device ID
+
+        Returns:
+            Output from the fastboot reboot recovery command
+        """
+        return self.adb.fastboot_reboot_recovery(device_id)
+
     def validate_flash_image(self, path: Optional[str],
                              partition: str = 'recovery') -> List[str]:
         """Reasons not to flash the image yet (fastboot missing, bad file...).

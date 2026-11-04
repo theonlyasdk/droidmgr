@@ -63,7 +63,7 @@ def get_platform_info() -> dict:
         return {
             "platform_tag": f"win-{arch}",
             "extension": ".exe",
-            "icon": None,
+            "icon": str(PROJECT_ROOT / "src" / "assets" / "droidmgr.ico"),
             "windowed": True,
         }
     elif system == "darwin":
@@ -77,7 +77,7 @@ def get_platform_info() -> dict:
         return {
             "platform_tag": f"linux-{arch}",
             "extension": "",
-            "icon": None,
+            "icon": str(PROJECT_ROOT / "src" / "assets" / "droidmgr.png"),
             "windowed": False,
         }
 

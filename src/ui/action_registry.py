@@ -25,6 +25,8 @@ ACTIONS = [
     ('Device', 'Reboot to Fastboot (Bootloader)', ('_power_action', 'bootloader'), True),
     ('Device', 'Shut Down', ('_power_action', 'shutdown'), True),
     ('Device', 'Reboot from Fastboot to Android', ('_fastboot_reboot',), True),
+    ('Device', 'Reboot from Fastboot to Recovery', ('_fastboot_reboot_recovery',), True),
+    ('Device', 'Reboot from Recovery to Android', ('_recovery_reboot',), True),
 
     # Mirroring & capture
     ('Mirror', 'Start / Stop Mirroring', ('_toggle_mirroring',), True),

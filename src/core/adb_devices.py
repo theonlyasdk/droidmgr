@@ -312,6 +312,32 @@ class _DevicesMixin:
                                             timeout=timeout, check=True)
         return stdout or stderr or f'{device_id} is rebooting'
 
+    def fastboot_reboot_recovery(self, device_id: str,
+                                 timeout: Optional[int] = 30) -> str:
+        """Restart a fastboot-mode device into recovery instead of Android.
+
+        The same hand-off as fastboot_reboot, one target further: the device
+        leaves fastboot mode and starts recovery, so no boot into the system
+        happens on the way. Nothing is written. fastboot is silent on success,
+        so an empty result is the expected one rather than a failure.
+        """
+        if not device_id or not device_id.strip():
+            raise ValueError("Device ID cannot be empty.")
+        self._require_fastboot()
+
+        known = self.get_fastboot_devices(timeout=timeout)
+        if device_id not in known:
+            raise ADBDeviceNotFoundError(
+                f"Device '{device_id}' is not in fastboot mode, so it cannot be "
+                f"rebooted from there. fastboot currently sees: "
+                f"{', '.join(known) if known else 'no devices'}."
+            )
+
+        stdout, stderr = self._run_fastboot(
+            ['-s', device_id, 'reboot', 'recovery'],
+            timeout=timeout, check=True)
+        return stdout or stderr or f'{device_id} is rebooting into recovery'
+
     def validate_flash_image(self, path: Optional[str],
                              partition: str = 'recovery') -> List[str]:
         """Collect everything that should stop a fastboot flash before it runs.
